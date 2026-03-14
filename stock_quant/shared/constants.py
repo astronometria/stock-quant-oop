@@ -1,0 +1,5 @@
+APP_NAME = "stock-quant-oop"
+DEFAULT_DB_FILENAME = "market.duckdb"
+DEFAULT_LOGS_DIRNAME = "logs"
+DEFAULT_DATA_DIRNAME = "data"
+DEFAULT_ENCODING = "utf-8"
