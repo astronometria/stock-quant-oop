@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-quant-oop"
+version = "0.1.0"
+description = "Object-oriented stock market data pipeline"
+authors = [
+    {name = "stock-quant-oop"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "duckdb>=0.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[tool.setuptools]
+packages = ["stock_quant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

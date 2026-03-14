@@ -1,35 +1,15 @@
-# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
 
-# Virtual env
+.env
 venv/
-.env/
-.envrc
+.venv/
 
-# Pytest
-.pytest_cache/
-.coverage
-
-# Logs
 logs/
-*.log
-
-# Data
 data/
 *.duckdb
-*.parquet
-*.csv
 
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Backup files
-*.bak
+.pytest_cache/
