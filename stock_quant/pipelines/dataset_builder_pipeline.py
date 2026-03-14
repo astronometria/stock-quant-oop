@@ -4,70 +4,179 @@ from datetime import datetime
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.app.services.dataset_version_service import DatasetVersionService
-from stock_quant.infrastructure.repositories.duckdb_dataset_builder_repository import DuckDbDatasetBuilderRepository
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.pipelines.base_pipeline import BasePipeline
-from stock_quant.research.datasets.dataset_builder import DatasetBuilder
 from stock_quant.shared.exceptions import PipelineError
 
 
 class BuildDatasetBuilderPipeline(BasePipeline):
     pipeline_name = "build_dataset_builder"
 
-    def __init__(self, repository: DuckDbDatasetBuilderRepository, dataset_name: str, dataset_version: str) -> None:
-        self.repository = repository
+    def __init__(
+        self,
+        repository=None,
+        uow: DuckDbUnitOfWork | None = None,
+        dataset_name: str = "research_dataset_v1",
+        dataset_version: str = "v1",
+    ) -> None:
+        if repository is not None:
+            self.uow = repository.uow
+            self.repository = repository
+        else:
+            self.uow = uow
+            self.repository = None
+
+        if self.uow is None:
+            raise ValueError("BuildDatasetBuilderPipeline requires repository or uow")
+
         self.dataset_name = dataset_name
         self.dataset_version = dataset_version
-        self.builder = DatasetBuilder()
         self.version_service = DatasetVersionService()
-        self._metrics: dict[str, int] = {}
-        self._rows_written = 0
+        self._dataset_rows = 0
+        self._version_rows = 0
+
+    @property
+    def con(self):
+        if self.uow.connection is None:
+            raise PipelineError("active DB connection is required")
+        return self.uow.connection
 
     def extract(self):
-        return {
-            "feature_rows": self.repository.load_research_features_rows(),
-            "return_label_rows": self.repository.load_return_labels_rows(),
-            "volatility_label_rows": self.repository.load_volatility_labels_rows(),
-        }
+        return None
 
     def transform(self, data):
-        dataset_rows, metrics = self.builder.build(
-            dataset_name=self.dataset_name,
-            dataset_version=self.dataset_version,
-            feature_rows=data["feature_rows"],
-            return_label_rows=data["return_label_rows"],
-            volatility_label_rows=data["volatility_label_rows"],
-        )
-        return {
-            "dataset_rows": dataset_rows,
-            "metrics": metrics,
-        }
+        return None
 
     def validate(self, data) -> None:
-        metrics = data["metrics"]
-        if not isinstance(metrics, dict):
-            raise PipelineError("metrics must be a dict")
-        if metrics.get("research_dataset_rows", 0) == 0:
-            raise PipelineError("no dataset rows built")
+        count = self.con.execute("SELECT COUNT(*) FROM research_features_daily").fetchone()[0]
+        if int(count) == 0:
+            raise PipelineError("no rows available in research_features_daily")
 
     def load(self, data) -> None:
-        written_dataset = self.repository.replace_research_dataset_daily(data["dataset_rows"])
+        con = self.con
 
-        max_as_of = max(row.as_of_date for row in data["dataset_rows"])
-        version_row = self.version_service.build_dataset_version(
-            dataset_name=self.dataset_name,
-            dataset_version=self.dataset_version,
-            as_of_date=str(max_as_of),
-            row_count=written_dataset,
+        con.execute("DELETE FROM research_dataset_daily")
+
+        con.execute(
+            """
+            INSERT INTO research_dataset_daily (
+                dataset_name,
+                dataset_version,
+                instrument_id,
+                company_id,
+                symbol,
+                as_of_date,
+                close_to_sma_20,
+                rsi_14,
+                revenue,
+                net_income,
+                net_margin,
+                debt_to_equity,
+                return_on_assets,
+                short_interest,
+                days_to_cover,
+                short_volume_ratio,
+                article_count_1d,
+                unique_cluster_count_1d,
+                avg_link_confidence,
+                fwd_return_1d,
+                fwd_return_5d,
+                fwd_return_20d,
+                direction_1d,
+                direction_5d,
+                direction_20d,
+                realized_vol_20d,
+                created_at
+            )
+            SELECT
+                ? AS dataset_name,
+                ? AS dataset_version,
+                f.instrument_id,
+                f.company_id,
+                f.symbol,
+                f.as_of_date,
+                f.close_to_sma_20,
+                f.rsi_14,
+                f.revenue,
+                f.net_income,
+                f.net_margin,
+                f.debt_to_equity,
+                f.return_on_assets,
+                f.short_interest,
+                f.days_to_cover,
+                f.short_volume_ratio,
+                f.article_count_1d,
+                f.unique_cluster_count_1d,
+                f.avg_link_confidence,
+                r.fwd_return_1d,
+                r.fwd_return_5d,
+                r.fwd_return_20d,
+                r.direction_1d,
+                r.direction_5d,
+                r.direction_20d,
+                v.realized_vol_20d,
+                CURRENT_TIMESTAMP AS created_at
+            FROM research_features_daily f
+            LEFT JOIN return_labels_daily r
+              ON f.instrument_id = r.instrument_id
+             AND f.as_of_date = r.as_of_date
+            LEFT JOIN volatility_labels_daily v
+              ON f.instrument_id = v.instrument_id
+             AND f.as_of_date = v.as_of_date
+            """,
+            [self.dataset_name, self.dataset_version],
         )
-        written_version = self.repository.insert_dataset_version(version_row)
 
-        self._rows_written = written_dataset + written_version
-        self._metrics = dict(data["metrics"])
-        self._metrics["written_dataset_rows"] = written_dataset
-        self._metrics["written_dataset_version"] = written_version
+        self._dataset_rows = int(
+            con.execute("SELECT COUNT(*) FROM research_dataset_daily").fetchone()[0]
+        )
+
+        max_as_of = con.execute(
+            "SELECT MAX(as_of_date) FROM research_dataset_daily"
+        ).fetchone()[0]
+
+        if self.repository is not None:
+            version_row = self.version_service.build_dataset_version(
+                dataset_name=self.dataset_name,
+                dataset_version=self.dataset_version,
+                as_of_date=str(max_as_of),
+                row_count=self._dataset_rows,
+            )
+            self._version_rows = int(self.repository.insert_dataset_version(version_row))
+        else:
+            con.execute(
+                """
+                INSERT INTO dataset_versions (
+                    dataset_name,
+                    dataset_version,
+                    universe_name,
+                    as_of_date,
+                    feature_run_id,
+                    label_run_id,
+                    row_count,
+                    config_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    self.dataset_name,
+                    self.dataset_version,
+                    "default",
+                    max_as_of,
+                    None,
+                    None,
+                    self._dataset_rows,
+                    "{}",
+                    datetime.utcnow(),
+                ],
+            )
+            self._version_rows = 1
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
-        result.rows_read = int(self._metrics.get("research_dataset_rows", 0))
-        result.rows_written = self._rows_written
-        result.metrics.update(self._metrics)
+        result.rows_read = self._dataset_rows
+        result.rows_written = self._dataset_rows + self._version_rows
+        result.metrics["research_dataset_rows"] = self._dataset_rows
+        result.metrics["written_dataset_rows"] = self._dataset_rows
+        result.metrics["written_dataset_version"] = self._version_rows
         return result
