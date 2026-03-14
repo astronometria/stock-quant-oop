@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import duckdb
 
@@ -23,7 +24,7 @@ def safe_scalar(con: duckdb.DuckDBPyConnection, sql: str):
 
 def main() -> int:
     args = parse_args()
-    db_path = str(__import__("pathlib").Path(args.db_path).expanduser().resolve())
+    db_path = str(Path(args.db_path).expanduser().resolve())
     con = duckdb.connect(db_path)
 
     status = {
@@ -34,6 +35,8 @@ def main() -> int:
             "market_universe_included": safe_scalar(con, "SELECT COUNT(*) FROM market_universe WHERE include_in_universe = TRUE"),
             "market_universe_conflicts": safe_scalar(con, "SELECT COUNT(*) FROM market_universe_conflicts"),
             "symbol_reference": safe_scalar(con, "SELECT COUNT(*) FROM symbol_reference"),
+            "price_source_daily_raw_all": safe_scalar(con, "SELECT COUNT(*) FROM price_source_daily_raw_all"),
+            "price_source_daily_raw_yahoo": safe_scalar(con, "SELECT COUNT(*) FROM price_source_daily_raw_yahoo"),
             "price_source_daily_raw": safe_scalar(con, "SELECT COUNT(*) FROM price_source_daily_raw"),
             "price_history": safe_scalar(con, "SELECT COUNT(*) FROM price_history"),
             "price_latest": safe_scalar(con, "SELECT COUNT(*) FROM price_latest"),
@@ -57,6 +60,28 @@ def main() -> int:
                 """
                 SELECT COALESCE(string_agg(symbol, ', ' ORDER BY symbol), '')
                 FROM price_latest
+                """
+            ).fetchone()[0],
+            "bronze_price_symbols": con.execute(
+                """
+                SELECT COALESCE(string_agg(symbol, ', ' ORDER BY symbol), '')
+                FROM (
+                    SELECT DISTINCT symbol
+                    FROM price_source_daily_raw_all
+                    ORDER BY symbol
+                    LIMIT 20
+                )
+                """
+            ).fetchone()[0],
+            "yahoo_price_symbols": con.execute(
+                """
+                SELECT COALESCE(string_agg(symbol, ', ' ORDER BY symbol), '')
+                FROM (
+                    SELECT DISTINCT symbol
+                    FROM price_source_daily_raw_yahoo
+                    ORDER BY symbol
+                    LIMIT 20
+                )
                 """
             ).fetchone()[0],
             "finra_latest_symbols": con.execute(

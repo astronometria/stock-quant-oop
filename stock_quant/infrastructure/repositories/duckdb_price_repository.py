@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
 from stock_quant.domain.ports.repositories import PriceRepositoryPort
-from stock_quant.infrastructure.db.table_names import MARKET_UNIVERSE, PRICE_HISTORY, PRICE_LATEST, PRICE_SOURCE_DAILY_RAW
+from stock_quant.infrastructure.db.table_names import (
+    MARKET_UNIVERSE,
+    PRICE_HISTORY,
+    PRICE_LATEST,
+    PRICE_SOURCE_DAILY_RAW,
+)
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
@@ -16,6 +21,8 @@ class DuckDbPriceRepository(PriceRepositoryPort):
         if self.uow.connection is None:
             raise RepositoryError("active DB connection is required")
         return self.uow.connection
+
+    # --- Legacy interface kept for compatibility/tests if needed ---
 
     def load_raw_price_bars(self) -> list[RawPriceBar]:
         try:
@@ -66,6 +73,7 @@ class DuckDbPriceRepository(PriceRepositoryPort):
     def replace_price_history(self, entries: list[PriceBar]) -> int:
         try:
             self.con.execute(f"DELETE FROM {PRICE_HISTORY}")
+
             if not entries:
                 return 0
 
@@ -83,6 +91,7 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                 )
                 for e in entries
             ]
+
             self.con.executemany(
                 f"""
                 INSERT INTO {PRICE_HISTORY} (
@@ -104,9 +113,128 @@ class DuckDbPriceRepository(PriceRepositoryPort):
         except Exception as exc:
             raise RepositoryError(f"failed to replace price_history: {exc}") from exc
 
+    # --- SQL-first fast path for production-sized loads ---
+
+    def count_raw_price_bars(self) -> int:
+        try:
+            return int(
+                self.con.execute(
+                    f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW}"
+                ).fetchone()[0]
+            )
+        except Exception as exc:
+            raise RepositoryError(f"failed to count raw price bars: {exc}") from exc
+
+    def count_included_symbols(self) -> int:
+        try:
+            return int(
+                self.con.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {MARKET_UNIVERSE}
+                    WHERE include_in_universe = TRUE
+                    """
+                ).fetchone()[0]
+            )
+        except Exception as exc:
+            raise RepositoryError(f"failed to count included symbols: {exc}") from exc
+
+    def count_skipped_not_in_universe(self) -> int:
+        try:
+            return int(
+                self.con.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {PRICE_SOURCE_DAILY_RAW} r
+                    LEFT JOIN {MARKET_UNIVERSE} mu
+                        ON r.symbol = mu.symbol
+                       AND mu.include_in_universe = TRUE
+                    WHERE mu.symbol IS NULL
+                    """
+                ).fetchone()[0]
+            )
+        except Exception as exc:
+            raise RepositoryError(f"failed to count skipped_not_in_universe: {exc}") from exc
+
+    def count_skipped_invalid_on_included_symbols(self) -> int:
+        try:
+            return int(
+                self.con.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {PRICE_SOURCE_DAILY_RAW} r
+                    INNER JOIN {MARKET_UNIVERSE} mu
+                        ON r.symbol = mu.symbol
+                       AND mu.include_in_universe = TRUE
+                    WHERE
+                        r.price_date IS NULL
+                        OR r.close IS NULL
+                        OR COALESCE(r.open, r.close) < 0
+                        OR COALESCE(r.high, r.close) < 0
+                        OR COALESCE(r.low, r.close) < 0
+                        OR r.close < 0
+                        OR COALESCE(r.volume, 0) < 0
+                        OR COALESCE(r.high, r.close) < COALESCE(r.low, r.close)
+                    """
+                ).fetchone()[0]
+            )
+        except Exception as exc:
+            raise RepositoryError(f"failed to count skipped_invalid: {exc}") from exc
+
+    def replace_price_history_from_raw_sql(self) -> int:
+        try:
+            self.con.execute(f"DELETE FROM {PRICE_HISTORY}")
+
+            self.con.execute(
+                f"""
+                INSERT INTO {PRICE_HISTORY} (
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    source_name,
+                    ingested_at
+                )
+                SELECT
+                    r.symbol,
+                    r.price_date,
+                    CAST(COALESCE(r.open, r.close) AS DOUBLE) AS open,
+                    CAST(COALESCE(r.high, r.close) AS DOUBLE) AS high,
+                    CAST(COALESCE(r.low, r.close) AS DOUBLE) AS low,
+                    CAST(r.close AS DOUBLE) AS close,
+                    CAST(COALESCE(r.volume, 0) AS BIGINT) AS volume,
+                    r.source_name,
+                    CURRENT_TIMESTAMP AS ingested_at
+                FROM {PRICE_SOURCE_DAILY_RAW} r
+                INNER JOIN {MARKET_UNIVERSE} mu
+                    ON r.symbol = mu.symbol
+                   AND mu.include_in_universe = TRUE
+                WHERE
+                    r.price_date IS NOT NULL
+                    AND r.close IS NOT NULL
+                    AND COALESCE(r.open, r.close) >= 0
+                    AND COALESCE(r.high, r.close) >= 0
+                    AND COALESCE(r.low, r.close) >= 0
+                    AND r.close >= 0
+                    AND COALESCE(r.volume, 0) >= 0
+                    AND COALESCE(r.high, r.close) >= COALESCE(r.low, r.close)
+                """
+            )
+
+            count = self.con.execute(
+                f"SELECT COUNT(*) FROM {PRICE_HISTORY}"
+            ).fetchone()[0]
+            return int(count)
+        except Exception as exc:
+            raise RepositoryError(f"failed to replace price_history from raw SQL: {exc}") from exc
+
     def rebuild_price_latest(self) -> int:
         try:
             self.con.execute(f"DELETE FROM {PRICE_LATEST}")
+
             self.con.execute(
                 f"""
                 INSERT INTO {PRICE_LATEST} (
@@ -134,7 +262,10 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                    AND ph.price_date = latest.max_price_date
                 """
             )
-            count = self.con.execute(f"SELECT COUNT(*) FROM {PRICE_LATEST}").fetchone()[0]
+
+            count = self.con.execute(
+                f"SELECT COUNT(*) FROM {PRICE_LATEST}"
+            ).fetchone()[0]
             return int(count)
         except Exception as exc:
             raise RepositoryError(f"failed to rebuild price_latest: {exc}") from exc

@@ -13,6 +13,8 @@ from stock_quant.infrastructure.db.table_names import (
     PRICE_HISTORY,
     PRICE_LATEST,
     PRICE_SOURCE_DAILY_RAW,
+    PRICE_SOURCE_DAILY_RAW_ALL,
+    PRICE_SOURCE_DAILY_RAW_YAHOO,
     SYMBOL_REFERENCE,
     SYMBOL_REFERENCE_SOURCE_RAW,
 )
@@ -34,7 +36,9 @@ class SchemaManager:
         try:
             self._drop_tables_if_requested(drop_existing=drop_existing)
             self._create_symbol_reference_source_raw()
+            self._create_price_source_daily_raw_all()
             self._create_price_source_daily_raw()
+            self._create_price_source_daily_raw_yahoo()
             self._create_finra_short_interest_source_raw()
             self._create_news_source_raw()
             self._create_market_universe()
@@ -53,7 +57,9 @@ class SchemaManager:
     def validate(self) -> None:
         required_tables = [
             SYMBOL_REFERENCE_SOURCE_RAW,
+            PRICE_SOURCE_DAILY_RAW_ALL,
             PRICE_SOURCE_DAILY_RAW,
+            PRICE_SOURCE_DAILY_RAW_YAHOO,
             FINRA_SHORT_INTEREST_SOURCE_RAW,
             NEWS_SOURCE_RAW,
             MARKET_UNIVERSE,
@@ -93,7 +99,9 @@ class SchemaManager:
             MARKET_UNIVERSE_CONFLICTS,
             MARKET_UNIVERSE,
             FINRA_SHORT_INTEREST_SOURCE_RAW,
+            PRICE_SOURCE_DAILY_RAW_YAHOO,
             PRICE_SOURCE_DAILY_RAW,
+            PRICE_SOURCE_DAILY_RAW_ALL,
             SYMBOL_REFERENCE_SOURCE_RAW,
         ]:
             self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -114,6 +122,26 @@ class SchemaManager:
             """
         )
 
+    def _create_price_source_daily_raw_all(self) -> None:
+        self.con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {PRICE_SOURCE_DAILY_RAW_ALL} (
+                symbol VARCHAR,
+                price_date DATE,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT,
+                source_name VARCHAR,
+                source_path VARCHAR,
+                asset_class VARCHAR,
+                venue_group VARCHAR,
+                ingested_at TIMESTAMP
+            )
+            """
+        )
+
     def _create_price_source_daily_raw(self) -> None:
         self.con.execute(
             f"""
@@ -127,6 +155,23 @@ class SchemaManager:
                 volume BIGINT,
                 source_name VARCHAR,
                 ingested_at TIMESTAMP
+            )
+            """
+        )
+
+    def _create_price_source_daily_raw_yahoo(self) -> None:
+        self.con.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {PRICE_SOURCE_DAILY_RAW_YAHOO} (
+                symbol VARCHAR,
+                price_date DATE,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume BIGINT,
+                source_name VARCHAR,
+                fetched_at TIMESTAMP
             )
             """
         )
