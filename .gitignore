@@ -14,15 +14,4 @@ data/
 
 .pytest_cache/
 
-# backups
 *.bak
-
-# exports
-exports/
-
-# runtime logs
-log.txt
-
-# python cache
-__pycache__/
-*.py[cod]
