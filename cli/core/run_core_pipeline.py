@@ -2,15 +2,12 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
 from pathlib import Path
 
-try:
-    from tqdm import tqdm
-except Exception:
-    def tqdm(iterable, **kwargs):
-        return iterable
+from stock_quant.app.orchestrators.core_pipeline_orchestrator import (
+    CorePipelineOrchestrator,
+    CorePipelineStep,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,153 +98,149 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_command(
-    project_root: Path,
-    relative_script: str,
-    db_path: str | None,
-    verbose: bool,
-    extra_args: list[str] | None = None,
-) -> list[str]:
-    cmd = [sys.executable, str(project_root / relative_script)]
-    if db_path:
-        cmd.extend(["--db-path", db_path])
-    if verbose:
-        cmd.append("--verbose")
-    if extra_args:
-        cmd.extend(extra_args)
-    return cmd
-
-
-def script_exists(project_root: Path, relative_script: str) -> bool:
-    return (project_root / relative_script).is_file()
-
-
 def main() -> int:
     args = parse_args()
     project_root = Path(args.project_root).expanduser().resolve()
 
-    steps: list[tuple[str, str, list[str]]] = []
+    orchestrator = CorePipelineOrchestrator(
+        project_root=project_root,
+        db_path=args.db_path,
+        verbose=args.verbose,
+    )
+
+    steps: list[CorePipelineStep] = []
 
     steps.append(
-        (
-            "init_market_db",
-            "cli/init_market_db.py",
-            ["--drop-existing"] if args.drop_existing else [],
+        CorePipelineStep(
+            name="init_market_db",
+            relative_script="cli/init_market_db.py",
+            extra_args=["--drop-existing"] if args.drop_existing else [],
         )
     )
 
-    if not args.skip_symbol_load and script_exists(project_root, "cli/load_symbol_reference_source_raw.py"):
+    if not args.skip_symbol_load and orchestrator.script_exists("cli/load_symbol_reference_source_raw.py"):
         symbol_load_args: list[str] = []
         if args.truncate_raw:
             symbol_load_args.append("--truncate")
         steps.append(
-            (
-                "load_symbol_reference_source_raw",
-                "cli/load_symbol_reference_source_raw.py",
-                symbol_load_args,
+            CorePipelineStep(
+                name="load_symbol_reference_source_raw",
+                relative_script="cli/load_symbol_reference_source_raw.py",
+                extra_args=symbol_load_args,
             )
         )
 
     if not args.skip_universe:
-        steps.append(("build_market_universe", "cli/build_market_universe.py", []))
+        steps.append(
+            CorePipelineStep(
+                name="build_market_universe",
+                relative_script="cli/build_market_universe.py",
+            )
+        )
 
     if not args.skip_symbol_reference:
-        steps.append(("build_symbol_reference", "cli/build_symbol_reference.py", []))
+        steps.append(
+            CorePipelineStep(
+                name="build_symbol_reference",
+                relative_script="cli/build_symbol_reference.py",
+            )
+        )
 
     if not args.skip_price_load:
-        if script_exists(project_root, "cli/load_price_source_daily_raw_all_from_stooq_zip.py"):
+        if orchestrator.script_exists("cli/load_price_source_daily_raw_all_from_stooq_zip.py"):
             raw_all_args: list[str] = []
             if args.truncate_raw:
                 raw_all_args.append("--truncate")
             steps.append(
-                (
-                    "load_price_source_daily_raw_all_from_stooq_zip",
-                    "cli/load_price_source_daily_raw_all_from_stooq_zip.py",
-                    raw_all_args,
+                CorePipelineStep(
+                    name="load_price_source_daily_raw_all_from_stooq_zip",
+                    relative_script="cli/load_price_source_daily_raw_all_from_stooq_zip.py",
+                    extra_args=raw_all_args,
                 )
             )
 
-        if script_exists(project_root, "cli/fetch_price_source_daily_raw_yahoo.py"):
+        if orchestrator.script_exists("cli/fetch_price_source_daily_raw_yahoo.py"):
             yahoo_args: list[str] = []
             if args.truncate_raw:
                 yahoo_args.append("--truncate")
             steps.append(
-                (
-                    "fetch_price_source_daily_raw_yahoo",
-                    "cli/fetch_price_source_daily_raw_yahoo.py",
-                    yahoo_args,
+                CorePipelineStep(
+                    name="fetch_price_source_daily_raw_yahoo",
+                    relative_script="cli/fetch_price_source_daily_raw_yahoo.py",
+                    extra_args=yahoo_args,
                 )
             )
 
-        if script_exists(project_root, "cli/filter_price_source_daily_raw_from_all.py"):
+        if orchestrator.script_exists("cli/filter_price_source_daily_raw_from_all.py"):
             filter_args: list[str] = []
             if args.truncate_raw:
                 filter_args.append("--truncate")
             steps.append(
-                (
-                    "filter_price_source_daily_raw_from_all",
-                    "cli/filter_price_source_daily_raw_from_all.py",
-                    filter_args,
+                CorePipelineStep(
+                    name="filter_price_source_daily_raw_from_all",
+                    relative_script="cli/filter_price_source_daily_raw_from_all.py",
+                    extra_args=filter_args,
                 )
             )
 
     if not args.skip_prices:
-        steps.append(("build_prices", "cli/build_prices.py", []))
+        steps.append(
+            CorePipelineStep(
+                name="build_prices",
+                relative_script="cli/build_prices.py",
+            )
+        )
 
-    if not args.skip_finra_load and script_exists(project_root, "cli/load_finra_short_interest_source_raw.py"):
+    if not args.skip_finra_load and orchestrator.script_exists("cli/load_finra_short_interest_source_raw.py"):
         finra_load_args: list[str] = []
         if args.truncate_raw:
             finra_load_args.append("--truncate")
         steps.append(
-            (
-                "load_finra_short_interest_source_raw",
-                "cli/load_finra_short_interest_source_raw.py",
-                finra_load_args,
+            CorePipelineStep(
+                name="load_finra_short_interest_source_raw",
+                relative_script="cli/load_finra_short_interest_source_raw.py",
+                extra_args=finra_load_args,
             )
         )
 
     if not args.skip_finra:
         steps.append(
-            (
-                "build_finra_short_interest",
-                "cli/build_finra_short_interest.py",
-                ["--source-market", args.source_market],
+            CorePipelineStep(
+                name="build_finra_short_interest",
+                relative_script="cli/build_finra_short_interest.py",
+                extra_args=["--source-market", args.source_market],
             )
         )
 
-    if not args.skip_news_load and script_exists(project_root, "cli/load_news_source_raw.py"):
+    if not args.skip_news_load and orchestrator.script_exists("cli/load_news_source_raw.py"):
         news_load_args: list[str] = []
         if args.truncate_raw:
             news_load_args.append("--truncate")
-        steps.append(("load_news_source_raw", "cli/load_news_source_raw.py", news_load_args))
+        steps.append(
+            CorePipelineStep(
+                name="load_news_source_raw",
+                relative_script="cli/load_news_source_raw.py",
+                extra_args=news_load_args,
+            )
+        )
 
     if not args.skip_news_raw:
-        steps.append(("build_news_raw", "cli/build_news_raw.py", []))
+        steps.append(
+            CorePipelineStep(
+                name="build_news_raw",
+                relative_script="cli/build_news_raw.py",
+            )
+        )
 
     if not args.skip_news_candidates:
-        steps.append(("build_news_symbol_candidates", "cli/build_news_symbol_candidates.py", []))
-
-    if not steps:
-        print("No pipeline steps selected.")
-        return 0
-
-    for step_name, relative_script, extra_args in tqdm(steps, desc="core-pipeline", unit="step"):
-        cmd = build_command(
-            project_root=project_root,
-            relative_script=relative_script,
-            db_path=args.db_path,
-            verbose=args.verbose,
-            extra_args=extra_args,
+        steps.append(
+            CorePipelineStep(
+                name="build_news_symbol_candidates",
+                relative_script="cli/build_news_symbol_candidates.py",
+            )
         )
-        print(f"\n===== RUN {step_name} =====")
-        print(" ".join(cmd))
-        completed = subprocess.run(cmd, cwd=project_root)
-        if completed.returncode != 0:
-            print(f"\nFAILED at step: {step_name} (exit={completed.returncode})")
-            return completed.returncode
 
-    print("\n===== CORE PIPELINE DONE =====")
-    return 0
+    return orchestrator.run_steps(steps)
 
 
 if __name__ == "__main__":
