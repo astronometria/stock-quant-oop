@@ -1,50 +1,119 @@
 from __future__ import annotations
 
-from stock_quant.app.dto.pipeline_result import PipelineResult
-from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import date
+from typing import Any
+
+from stock_quant.app.services.price_ingestion_service import PriceIngestionService
+from stock_quant.infrastructure.providers.prices.historical_price_provider import HistoricalPriceProvider
+from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
 from stock_quant.pipelines.base_pipeline import BasePipeline
-from stock_quant.shared.exceptions import PipelineError
 
 
+@dataclass(slots=True)
 class BuildPricesPipeline(BasePipeline):
-    pipeline_name = "build_prices"
+    repository: Any
+    service: PriceIngestionService
+    mode: str = "daily"
+    symbols: list[str] | None = None
+    as_of: date | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    historical_provider: HistoricalPriceProvider | None = None
+    daily_provider: YfinancePriceProvider | None = None
 
-    def __init__(self, repository: DuckDbPriceRepository) -> None:
-        self.repository = repository
-        self._metrics: dict[str, int] = {}
-        self._rows_written = 0
-        self._latest_rows = 0
+    @property
+    def pipeline_name(self) -> str:
+        return "build_prices"
 
-    def extract(self):
-        raw_bars = self.repository.count_raw_price_bars()
-        allowed_symbols = self.repository.count_included_symbols()
-        skipped_not_in_universe = self.repository.count_skipped_not_in_universe()
-        skipped_invalid = self.repository.count_skipped_invalid_on_included_symbols()
+    def extract(self) -> Iterable[Mapping[str, Any]]:
+        symbols = self.symbols or self._load_symbols_from_repository()
 
+        if self.mode == "backfill":
+            if self.historical_provider is None:
+                raise ValueError("historical_provider is required for mode=backfill")
+            return self.historical_provider.fetch_history(
+                symbols=symbols,
+                start_date=self.start_date,
+                end_date=self.end_date,
+            )
+
+        if self.daily_provider is None:
+            raise ValueError("daily_provider is required for mode=daily")
+
+        return self.daily_provider.fetch_daily_prices(
+            symbols=symbols,
+            as_of=self.as_of,
+        )
+
+    def transform(self, data: Iterable[Mapping[str, Any]]) -> Any:
+        materialized = list(data)
+        frame = self.service.build_price_frame(materialized)
+        summary = self.service.summarize_frame(frame, rows_read=len(materialized))
         return {
-            "raw_bars": raw_bars,
-            "allowed_symbols": allowed_symbols,
-            "skipped_not_in_universe": skipped_not_in_universe,
-            "skipped_invalid": skipped_invalid,
+            "frame": frame,
+            "summary": summary,
         }
 
-    def transform(self, data):
-        return data
+    def load(self, data: Any) -> dict[str, Any]:
+        frame = data["frame"]
+        summary = data["summary"]
 
-    def validate(self, data) -> None:
-        if int(data.get("raw_bars", 0)) == 0:
-            raise PipelineError("no raw price bars available in price_source_daily_raw")
+        if frame.empty:
+            return {
+                "rows_read": summary.rows_read,
+                "rows_written": 0,
+                "rows_skipped": summary.rows_invalid,
+                "warnings": ["no valid price rows to load"],
+                "metrics": {
+                    "mode": self.mode,
+                    "symbols_count": summary.symbols_count,
+                    "min_price_date": str(summary.min_price_date) if summary.min_price_date else None,
+                    "max_price_date": str(summary.max_price_date) if summary.max_price_date else None,
+                    "latest_rows": 0,
+                },
+            }
 
-    def load(self, data) -> None:
-        self._rows_written = self.repository.replace_price_history_from_raw_sql()
-        self._latest_rows = self.repository.rebuild_price_latest()
+        if hasattr(self.repository, "upsert_price_history"):
+            rows_written = int(self.repository.upsert_price_history(frame))
+        elif hasattr(self.repository, "write_price_history"):
+            rows_written = int(self.repository.write_price_history(frame))
+        elif hasattr(self.repository, "write_history"):
+            rows_written = int(self.repository.write_history(frame))
+        else:
+            raise AttributeError(
+                "price repository must implement upsert_price_history(frame), "
+                "write_price_history(frame) or write_history(frame)"
+            )
 
-        self._metrics = dict(data)
-        self._metrics["accepted_bars"] = self._rows_written
+        latest_rows = 0
+        if hasattr(self.repository, "refresh_price_latest"):
+            latest_rows = int(self.repository.refresh_price_latest())
+        elif hasattr(self.repository, "rebuild_price_latest"):
+            latest_rows = int(self.repository.rebuild_price_latest())
+        elif hasattr(self.repository, "write_price_latest_from_history"):
+            latest_rows = int(self.repository.write_price_latest_from_history())
 
-    def finalize(self, result: PipelineResult) -> PipelineResult:
-        result.rows_read = int(self._metrics.get("raw_bars", 0))
-        result.rows_written = self._rows_written
-        result.metrics.update(self._metrics)
-        result.metrics["latest_rows"] = self._latest_rows
-        return result
+        return {
+            "rows_read": summary.rows_read,
+            "rows_written": rows_written,
+            "rows_skipped": summary.rows_invalid,
+            "warnings": [],
+            "metrics": {
+                "mode": self.mode,
+                "symbols_count": summary.symbols_count,
+                "latest_rows": latest_rows,
+                "min_price_date": str(summary.min_price_date) if summary.min_price_date else None,
+                "max_price_date": str(summary.max_price_date) if summary.max_price_date else None,
+            },
+        }
+
+    def _load_symbols_from_repository(self) -> list[str]:
+        if hasattr(self.repository, "list_allowed_symbols"):
+            return list(self.repository.list_allowed_symbols())
+        if hasattr(self.repository, "get_allowed_symbols"):
+            return list(self.repository.get_allowed_symbols())
+        raise AttributeError(
+            "price repository must implement list_allowed_symbols() or get_allowed_symbols()"
+        )

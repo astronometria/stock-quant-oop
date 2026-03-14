@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
+import pandas as pd
+
 from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
 from stock_quant.domain.ports.repositories import PriceRepositoryPort
 from stock_quant.infrastructure.db.table_names import (
@@ -22,7 +26,9 @@ class DuckDbPriceRepository(PriceRepositoryPort):
             raise RepositoryError("active DB connection is required")
         return self.uow.connection
 
-    # --- Legacy interface kept for compatibility/tests if needed ---
+    # -------------------------------------------------------------------------
+    # Read APIs
+    # -------------------------------------------------------------------------
 
     def load_raw_price_bars(self) -> list[RawPriceBar]:
         try:
@@ -41,6 +47,7 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                 ORDER BY symbol, price_date
                 """
             ).fetchall()
+
             return [
                 RawPriceBar(
                     symbol=row[0],
@@ -64,11 +71,22 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                 SELECT symbol
                 FROM {MARKET_UNIVERSE}
                 WHERE include_in_universe = TRUE
+                ORDER BY symbol
                 """
             ).fetchall()
             return {row[0] for row in rows}
         except Exception as exc:
             raise RepositoryError(f"failed to load included symbols: {exc}") from exc
+
+    def list_allowed_symbols(self) -> list[str]:
+        return sorted(self.load_included_symbols())
+
+    def get_allowed_symbols(self) -> list[str]:
+        return self.list_allowed_symbols()
+
+    # -------------------------------------------------------------------------
+    # Legacy entity-based writes
+    # -------------------------------------------------------------------------
 
     def replace_price_history(self, entries: list[PriceBar]) -> int:
         try:
@@ -113,7 +131,87 @@ class DuckDbPriceRepository(PriceRepositoryPort):
         except Exception as exc:
             raise RepositoryError(f"failed to replace price_history: {exc}") from exc
 
-    # --- SQL-first fast path for production-sized loads ---
+    # -------------------------------------------------------------------------
+    # DataFrame-based OOP write path
+    # -------------------------------------------------------------------------
+
+    def upsert_price_history(self, frame: pd.DataFrame) -> int:
+        try:
+            if frame.empty:
+                return 0
+
+            working = frame.copy()
+            working = working.loc[
+                :,
+                [
+                    "symbol",
+                    "price_date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "source_name",
+                    "ingested_at",
+                ],
+            ].reset_index(drop=True)
+
+            self.con.register("price_upsert_stage", working)
+
+            self.con.execute(
+                f"""
+                DELETE FROM {PRICE_HISTORY} h
+                USING price_upsert_stage s
+                WHERE h.symbol = s.symbol
+                  AND h.price_date = s.price_date
+                """
+            )
+
+            self.con.execute(
+                f"""
+                INSERT INTO {PRICE_HISTORY} (
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    source_name,
+                    ingested_at
+                )
+                SELECT
+                    symbol,
+                    price_date,
+                    CAST(open AS DOUBLE),
+                    CAST(high AS DOUBLE),
+                    CAST(low AS DOUBLE),
+                    CAST(close AS DOUBLE),
+                    CAST(volume AS BIGINT),
+                    source_name,
+                    ingested_at
+                FROM price_upsert_stage
+                """
+            )
+
+            self.con.unregister("price_upsert_stage")
+            return int(len(working))
+        except Exception as exc:
+            try:
+                self.con.unregister("price_upsert_stage")
+            except Exception:
+                pass
+            raise RepositoryError(f"failed to upsert price_history: {exc}") from exc
+
+    def write_price_history(self, frame: pd.DataFrame) -> int:
+        return self.upsert_price_history(frame)
+
+    def write_history(self, frame: pd.DataFrame) -> int:
+        return self.upsert_price_history(frame)
+
+    # -------------------------------------------------------------------------
+    # SQL-first fast path kept for compatibility
+    # -------------------------------------------------------------------------
 
     def count_raw_price_bars(self) -> int:
         try:
@@ -147,8 +245,8 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                     SELECT COUNT(*)
                     FROM {PRICE_SOURCE_DAILY_RAW} r
                     LEFT JOIN {MARKET_UNIVERSE} mu
-                        ON r.symbol = mu.symbol
-                       AND mu.include_in_universe = TRUE
+                      ON r.symbol = mu.symbol
+                     AND mu.include_in_universe = TRUE
                     WHERE mu.symbol IS NULL
                     """
                 ).fetchone()[0]
@@ -164,8 +262,8 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                     SELECT COUNT(*)
                     FROM {PRICE_SOURCE_DAILY_RAW} r
                     INNER JOIN {MARKET_UNIVERSE} mu
-                        ON r.symbol = mu.symbol
-                       AND mu.include_in_universe = TRUE
+                      ON r.symbol = mu.symbol
+                     AND mu.include_in_universe = TRUE
                     WHERE
                         r.price_date IS NULL
                         OR r.close IS NULL
@@ -210,8 +308,8 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                     CURRENT_TIMESTAMP AS ingested_at
                 FROM {PRICE_SOURCE_DAILY_RAW} r
                 INNER JOIN {MARKET_UNIVERSE} mu
-                    ON r.symbol = mu.symbol
-                   AND mu.include_in_universe = TRUE
+                  ON r.symbol = mu.symbol
+                 AND mu.include_in_universe = TRUE
                 WHERE
                     r.price_date IS NOT NULL
                     AND r.close IS NOT NULL
@@ -230,6 +328,10 @@ class DuckDbPriceRepository(PriceRepositoryPort):
             return int(count)
         except Exception as exc:
             raise RepositoryError(f"failed to replace price_history from raw SQL: {exc}") from exc
+
+    # -------------------------------------------------------------------------
+    # Latest table maintenance
+    # -------------------------------------------------------------------------
 
     def rebuild_price_latest(self) -> int:
         try:
@@ -258,8 +360,8 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                     FROM {PRICE_HISTORY}
                     GROUP BY symbol
                 ) latest
-                    ON ph.symbol = latest.symbol
-                   AND ph.price_date = latest.max_price_date
+                  ON ph.symbol = latest.symbol
+                 AND ph.price_date = latest.max_price_date
                 """
             )
 
@@ -269,3 +371,6 @@ class DuckDbPriceRepository(PriceRepositoryPort):
             return int(count)
         except Exception as exc:
             raise RepositoryError(f"failed to rebuild price_latest: {exc}") from exc
+
+    def refresh_price_latest(self) -> int:
+        return self.rebuild_price_latest()
