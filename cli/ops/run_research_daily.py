@@ -30,24 +30,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _stringify_command(command: list[object]) -> list[str]:
+    return [str(part) for part in command]
+
+
 def run_and_log_step(
-    project_root: Path,
-    db_path: str,
-    command: list[str],
+    db_path: Path,
+    command: list[object],
     pipeline_name: str,
     config_payload: dict,
 ) -> int:
     capture = SubprocessJsonCaptureService()
     payload_builder = PipelineRunService()
 
-    completed = subprocess.run(command, text=True, capture_output=True)
+    command_str = _stringify_command(command)
+    completed = subprocess.run(command_str, text=True, capture_output=True)
+
     stdout = completed.stdout or ""
     stderr = completed.stderr or ""
 
     if stdout:
-        print(stdout, end="")
+        print(stdout, end="", flush=True)
     if stderr:
-        print(stderr, end="", file=sys.stderr)
+        print(stderr, end="", file=sys.stderr, flush=True)
 
     result_json = capture.extract_last_json_object(stdout)
     if result_json is None:
@@ -83,50 +88,53 @@ def main() -> int:
     config.ensure_directories()
 
     project_root = Path(config.project_root)
-    db_path = config.db_path
-    python = sys.executable
+    db_path = Path(config.db_path).expanduser().resolve()
+    python = str(sys.executable)
 
     if not args.skip_cleanup:
-        cleanup_cmd = [
+        cleanup_cmd: list[object] = [
             python,
             str(project_root / "cli" / "core" / "cleanup_research_runs.py"),
-            "--db-path", db_path,
+            "--db-path", str(db_path),
             "--dataset-name", args.dataset_name,
             "--dataset-version", args.dataset_version,
             "--experiment-name", args.experiment_name,
             "--backtest-name", args.backtest_name,
             "--llm-run-name", args.llm_run_name,
         ]
+        cleanup_cmd_str = _stringify_command(cleanup_cmd)
         if args.verbose:
-            print("===== RUN cleanup_research_runs =====")
-            print(" ".join(cleanup_cmd))
-        cleanup_rc = subprocess.run(cleanup_cmd).returncode
+            print("===== RUN cleanup_research_runs =====", flush=True)
+            print(" ".join(cleanup_cmd_str), flush=True)
+        cleanup_rc = subprocess.run(cleanup_cmd_str).returncode
         if cleanup_rc != 0:
             return cleanup_rc
 
-    llm_cmd = [
+    llm_cmd: list[object] = [
         python,
         str(project_root / "cli" / "core" / "register_llm_run.py"),
-        "--db-path", db_path,
+        "--db-path", str(db_path),
         "--run-name", args.llm_run_name,
         "--model-name", args.model_name,
         "--prompt-version", args.prompt_version,
     ]
     if args.verbose:
         llm_cmd.append("--verbose")
-        print("===== RUN register_llm_run =====")
-        print(" ".join(llm_cmd))
-    llm_rc = subprocess.run(llm_cmd).returncode
+    llm_cmd_str = _stringify_command(llm_cmd)
+    if args.verbose:
+        print("===== RUN register_llm_run =====", flush=True)
+        print(" ".join(llm_cmd_str), flush=True)
+    llm_rc = subprocess.run(llm_cmd_str).returncode
     if llm_rc != 0:
         return llm_rc
 
-    steps = [
+    steps: list[tuple[str, list[object], dict]] = [
         (
             "build_feature_engine",
             [
                 python,
                 str(project_root / "cli" / "core" / "build_feature_engine.py"),
-                "--db-path", db_path,
+                "--db-path", str(db_path),
             ] + (["--verbose"] if args.verbose else []),
             {"mode": "daily"},
         ),
@@ -135,7 +143,7 @@ def main() -> int:
             [
                 python,
                 str(project_root / "cli" / "core" / "build_label_engine.py"),
-                "--db-path", db_path,
+                "--db-path", str(db_path),
             ] + (["--verbose"] if args.verbose else []),
             {"mode": "daily"},
         ),
@@ -144,7 +152,7 @@ def main() -> int:
             [
                 python,
                 str(project_root / "cli" / "core" / "build_dataset_builder.py"),
-                "--db-path", db_path,
+                "--db-path", str(db_path),
                 "--dataset-name", args.dataset_name,
                 "--dataset-version", args.dataset_version,
             ] + (["--verbose"] if args.verbose else []),
@@ -155,7 +163,7 @@ def main() -> int:
             [
                 python,
                 str(project_root / "cli" / "core" / "build_backtest.py"),
-                "--db-path", db_path,
+                "--db-path", str(db_path),
                 "--dataset-name", args.dataset_name,
                 "--dataset-version", args.dataset_version,
                 "--experiment-name", args.experiment_name,
@@ -172,20 +180,20 @@ def main() -> int:
     ]
 
     for pipeline_name, command, config_payload in steps:
-        print(f"===== RUN {pipeline_name} =====")
-        print(" ".join(command))
+        command_str = _stringify_command(command)
+        print(f"===== RUN {pipeline_name} =====", flush=True)
+        print(" ".join(command_str), flush=True)
         rc = run_and_log_step(
-            project_root=project_root,
             db_path=db_path,
             command=command,
             pipeline_name=pipeline_name,
             config_payload=config_payload,
         )
         if rc != 0:
-            print(f"FAILED at step: {pipeline_name} (exit={rc})")
+            print(f"FAILED at step: {pipeline_name} (exit={rc})", flush=True)
             return rc
 
-    print("===== DAILY RESEARCH PIPELINE DONE =====")
+    print("===== DAILY RESEARCH PIPELINE DONE =====", flush=True)
     return 0
 
 
