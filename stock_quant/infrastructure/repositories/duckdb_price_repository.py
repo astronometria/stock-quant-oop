@@ -1,22 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from datetime import datetime
+from typing import Any
 
-import pandas as pd
-
-from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
-from stock_quant.domain.ports.repositories import PriceRepositoryPort
-from stock_quant.infrastructure.db.table_names import (
-    MARKET_UNIVERSE,
-    PRICE_HISTORY,
-    PRICE_LATEST,
-    PRICE_SOURCE_DAILY_RAW,
-)
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
-class DuckDbPriceRepository(PriceRepositoryPort):
+class DuckDbPriceRepository:
     def __init__(self, uow: DuckDbUnitOfWork) -> None:
         self.uow = uow
 
@@ -26,14 +17,18 @@ class DuckDbPriceRepository(PriceRepositoryPort):
             raise RepositoryError("active DB connection is required")
         return self.uow.connection
 
-    # -------------------------------------------------------------------------
-    # Read APIs
-    # -------------------------------------------------------------------------
+    def load_price_source_daily_raw_rows(self) -> list[dict[str, Any]]:
+        """
+        Read canonical daily raw prices without filtering by the current universe.
 
-    def load_raw_price_bars(self) -> list[RawPriceBar]:
+        Important:
+        - No join to market_universe
+        - No WHERE include_in_universe = TRUE
+        - Historical raw tables must stay historically complete
+        """
         try:
             rows = self.con.execute(
-                f"""
+                """
                 SELECT
                     symbol,
                     price_date,
@@ -42,77 +37,108 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                     low,
                     close,
                     volume,
-                    source_name
-                FROM {PRICE_SOURCE_DAILY_RAW}
+                    source_name,
+                    ingested_at
+                FROM price_source_daily_raw
                 ORDER BY symbol, price_date
                 """
             ).fetchall()
 
             return [
-                RawPriceBar(
-                    symbol=row[0],
-                    price_date=row[1],
-                    open=row[2],
-                    high=row[3],
-                    low=row[4],
-                    close=row[5],
-                    volume=row[6],
-                    source_name=row[7] or "unknown_source",
-                )
+                {
+                    "symbol": row[0],
+                    "price_date": row[1],
+                    "open": row[2],
+                    "high": row[3],
+                    "low": row[4],
+                    "close": row[5],
+                    "volume": row[6],
+                    "source_name": row[7],
+                    "ingested_at": row[8],
+                }
                 for row in rows
             ]
         except Exception as exc:
-            raise RepositoryError(f"failed to load raw price bars: {exc}") from exc
+            raise RepositoryError(f"failed to load price_source_daily_raw rows: {exc}") from exc
 
-    def load_included_symbols(self) -> set[str]:
+    def load_price_source_daily_raw_all_rows(self) -> list[dict[str, Any]]:
+        """
+        Read the fully staged raw-all table without current-universe filtering.
+
+        This table is useful for diagnostics / source arbitration and must not
+        depend on the current market_universe snapshot.
+        """
         try:
             rows = self.con.execute(
-                f"""
-                SELECT symbol
-                FROM {MARKET_UNIVERSE}
-                WHERE include_in_universe = TRUE
-                ORDER BY symbol
+                """
+                SELECT
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    source_name,
+                    source_path,
+                    asset_class,
+                    venue_group,
+                    ingested_at
+                FROM price_source_daily_raw_all
+                ORDER BY symbol, price_date, source_name
                 """
             ).fetchall()
-            return {row[0] for row in rows}
+
+            return [
+                {
+                    "symbol": row[0],
+                    "price_date": row[1],
+                    "open": row[2],
+                    "high": row[3],
+                    "low": row[4],
+                    "close": row[5],
+                    "volume": row[6],
+                    "source_name": row[7],
+                    "source_path": row[8],
+                    "asset_class": row[9],
+                    "venue_group": row[10],
+                    "ingested_at": row[11],
+                }
+                for row in rows
+            ]
         except Exception as exc:
-            raise RepositoryError(f"failed to load included symbols: {exc}") from exc
+            raise RepositoryError(f"failed to load price_source_daily_raw_all rows: {exc}") from exc
 
-    def list_allowed_symbols(self) -> list[str]:
-        return sorted(self.load_included_symbols())
+    def replace_price_history(self, rows: list[dict[str, Any]]) -> int:
+        """
+        Replace canonical price_history from already prepared rows.
 
-    def get_allowed_symbols(self) -> list[str]:
-        return self.list_allowed_symbols()
-
-    # -------------------------------------------------------------------------
-    # Legacy entity-based writes
-    # -------------------------------------------------------------------------
-
-    def replace_price_history(self, entries: list[PriceBar]) -> int:
+        This remains a historical table and should not be scoped by the current
+        universe membership.
+        """
         try:
-            self.con.execute(f"DELETE FROM {PRICE_HISTORY}")
-
-            if not entries:
+            self.con.execute("DELETE FROM price_history")
+            if not rows:
                 return 0
 
-            rows = [
+            payload = [
                 (
-                    e.symbol,
-                    e.price_date,
-                    e.open,
-                    e.high,
-                    e.low,
-                    e.close,
-                    e.volume,
-                    e.source_name,
-                    e.ingested_at,
+                    row.get("symbol"),
+                    row.get("price_date"),
+                    row.get("open"),
+                    row.get("high"),
+                    row.get("low"),
+                    row.get("close"),
+                    row.get("volume"),
+                    row.get("source_name"),
+                    row.get("ingested_at") or datetime.utcnow(),
                 )
-                for e in entries
+                for row in rows
             ]
 
             self.con.executemany(
-                f"""
-                INSERT INTO {PRICE_HISTORY} (
+                """
+                INSERT INTO price_history (
                     symbol,
                     price_date,
                     open,
@@ -125,221 +151,39 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                rows,
+                payload,
             )
-            return len(rows)
+            return len(payload)
         except Exception as exc:
             raise RepositoryError(f"failed to replace price_history: {exc}") from exc
 
-    # -------------------------------------------------------------------------
-    # DataFrame-based OOP write path
-    # -------------------------------------------------------------------------
+    def replace_price_latest(self, rows: list[dict[str, Any]]) -> int:
+        """
+        Replace latest-price snapshot.
 
-    def upsert_price_history(self, frame: pd.DataFrame) -> int:
+        This snapshot may later be filtered by active universe elsewhere, but the
+        repository itself should not impose current-universe survivorship bias.
+        """
         try:
-            if frame.empty:
+            self.con.execute("DELETE FROM price_latest")
+            if not rows:
                 return 0
 
-            working = frame.copy()
-            working = working.loc[
-                :,
-                [
-                    "symbol",
-                    "price_date",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "source_name",
-                    "ingested_at",
-                ],
-            ].reset_index(drop=True)
-
-            self.con.register("price_upsert_stage", working)
-
-            self.con.execute(
-                f"""
-                DELETE FROM {PRICE_HISTORY} h
-                USING price_upsert_stage s
-                WHERE h.symbol = s.symbol
-                  AND h.price_date = s.price_date
-                """
-            )
-
-            self.con.execute(
-                f"""
-                INSERT INTO {PRICE_HISTORY} (
-                    symbol,
-                    price_date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    source_name,
-                    ingested_at
+            payload = [
+                (
+                    row.get("symbol"),
+                    row.get("latest_price_date"),
+                    row.get("close"),
+                    row.get("volume"),
+                    row.get("source_name"),
+                    row.get("updated_at") or datetime.utcnow(),
                 )
-                SELECT
-                    symbol,
-                    price_date,
-                    CAST(open AS DOUBLE),
-                    CAST(high AS DOUBLE),
-                    CAST(low AS DOUBLE),
-                    CAST(close AS DOUBLE),
-                    CAST(volume AS BIGINT),
-                    source_name,
-                    ingested_at
-                FROM price_upsert_stage
+                for row in rows
+            ]
+
+            self.con.executemany(
                 """
-            )
-
-            self.con.unregister("price_upsert_stage")
-            return int(len(working))
-        except Exception as exc:
-            try:
-                self.con.unregister("price_upsert_stage")
-            except Exception:
-                pass
-            raise RepositoryError(f"failed to upsert price_history: {exc}") from exc
-
-    def write_price_history(self, frame: pd.DataFrame) -> int:
-        return self.upsert_price_history(frame)
-
-    def write_history(self, frame: pd.DataFrame) -> int:
-        return self.upsert_price_history(frame)
-
-    # -------------------------------------------------------------------------
-    # SQL-first fast path kept for compatibility
-    # -------------------------------------------------------------------------
-
-    def count_raw_price_bars(self) -> int:
-        try:
-            return int(
-                self.con.execute(
-                    f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW}"
-                ).fetchone()[0]
-            )
-        except Exception as exc:
-            raise RepositoryError(f"failed to count raw price bars: {exc}") from exc
-
-    def count_included_symbols(self) -> int:
-        try:
-            return int(
-                self.con.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM {MARKET_UNIVERSE}
-                    WHERE include_in_universe = TRUE
-                    """
-                ).fetchone()[0]
-            )
-        except Exception as exc:
-            raise RepositoryError(f"failed to count included symbols: {exc}") from exc
-
-    def count_skipped_not_in_universe(self) -> int:
-        try:
-            return int(
-                self.con.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM {PRICE_SOURCE_DAILY_RAW} r
-                    LEFT JOIN {MARKET_UNIVERSE} mu
-                      ON r.symbol = mu.symbol
-                     AND mu.include_in_universe = TRUE
-                    WHERE mu.symbol IS NULL
-                    """
-                ).fetchone()[0]
-            )
-        except Exception as exc:
-            raise RepositoryError(f"failed to count skipped_not_in_universe: {exc}") from exc
-
-    def count_skipped_invalid_on_included_symbols(self) -> int:
-        try:
-            return int(
-                self.con.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM {PRICE_SOURCE_DAILY_RAW} r
-                    INNER JOIN {MARKET_UNIVERSE} mu
-                      ON r.symbol = mu.symbol
-                     AND mu.include_in_universe = TRUE
-                    WHERE
-                        r.price_date IS NULL
-                        OR r.close IS NULL
-                        OR COALESCE(r.open, r.close) < 0
-                        OR COALESCE(r.high, r.close) < 0
-                        OR COALESCE(r.low, r.close) < 0
-                        OR r.close < 0
-                        OR COALESCE(r.volume, 0) < 0
-                        OR COALESCE(r.high, r.close) < COALESCE(r.low, r.close)
-                    """
-                ).fetchone()[0]
-            )
-        except Exception as exc:
-            raise RepositoryError(f"failed to count skipped_invalid: {exc}") from exc
-
-    def replace_price_history_from_raw_sql(self) -> int:
-        try:
-            self.con.execute(f"DELETE FROM {PRICE_HISTORY}")
-
-            self.con.execute(
-                f"""
-                INSERT INTO {PRICE_HISTORY} (
-                    symbol,
-                    price_date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    source_name,
-                    ingested_at
-                )
-                SELECT
-                    r.symbol,
-                    r.price_date,
-                    CAST(COALESCE(r.open, r.close) AS DOUBLE) AS open,
-                    CAST(COALESCE(r.high, r.close) AS DOUBLE) AS high,
-                    CAST(COALESCE(r.low, r.close) AS DOUBLE) AS low,
-                    CAST(r.close AS DOUBLE) AS close,
-                    CAST(COALESCE(r.volume, 0) AS BIGINT) AS volume,
-                    r.source_name,
-                    CURRENT_TIMESTAMP AS ingested_at
-                FROM {PRICE_SOURCE_DAILY_RAW} r
-                INNER JOIN {MARKET_UNIVERSE} mu
-                  ON r.symbol = mu.symbol
-                 AND mu.include_in_universe = TRUE
-                WHERE
-                    r.price_date IS NOT NULL
-                    AND r.close IS NOT NULL
-                    AND COALESCE(r.open, r.close) >= 0
-                    AND COALESCE(r.high, r.close) >= 0
-                    AND COALESCE(r.low, r.close) >= 0
-                    AND r.close >= 0
-                    AND COALESCE(r.volume, 0) >= 0
-                    AND COALESCE(r.high, r.close) >= COALESCE(r.low, r.close)
-                """
-            )
-
-            count = self.con.execute(
-                f"SELECT COUNT(*) FROM {PRICE_HISTORY}"
-            ).fetchone()[0]
-            return int(count)
-        except Exception as exc:
-            raise RepositoryError(f"failed to replace price_history from raw SQL: {exc}") from exc
-
-    # -------------------------------------------------------------------------
-    # Latest table maintenance
-    # -------------------------------------------------------------------------
-
-    def rebuild_price_latest(self) -> int:
-        try:
-            self.con.execute(f"DELETE FROM {PRICE_LATEST}")
-
-            self.con.execute(
-                f"""
-                INSERT INTO {PRICE_LATEST} (
+                INSERT INTO price_latest (
                     symbol,
                     latest_price_date,
                     close,
@@ -347,30 +191,10 @@ class DuckDbPriceRepository(PriceRepositoryPort):
                     source_name,
                     updated_at
                 )
-                SELECT
-                    ph.symbol,
-                    ph.price_date AS latest_price_date,
-                    ph.close,
-                    ph.volume,
-                    ph.source_name,
-                    CURRENT_TIMESTAMP
-                FROM {PRICE_HISTORY} ph
-                INNER JOIN (
-                    SELECT symbol, MAX(price_date) AS max_price_date
-                    FROM {PRICE_HISTORY}
-                    GROUP BY symbol
-                ) latest
-                  ON ph.symbol = latest.symbol
-                 AND ph.price_date = latest.max_price_date
-                """
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                payload,
             )
-
-            count = self.con.execute(
-                f"SELECT COUNT(*) FROM {PRICE_LATEST}"
-            ).fetchone()[0]
-            return int(count)
+            return len(payload)
         except Exception as exc:
-            raise RepositoryError(f"failed to rebuild price_latest: {exc}") from exc
-
-    def refresh_price_latest(self) -> int:
-        return self.rebuild_price_latest()
+            raise RepositoryError(f"failed to replace price_latest: {exc}") from exc

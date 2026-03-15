@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from stock_quant.domain.entities.short_interest import RawShortInterestRecord, ShortInterestRecord, ShortInterestSourceFile
+from stock_quant.domain.entities.short_interest import (
+    RawShortInterestRecord,
+    ShortInterestRecord,
+    ShortInterestSourceFile,
+)
 from stock_quant.domain.ports.repositories import ShortInterestRepositoryPort
 from stock_quant.infrastructure.db.table_names import (
     FINRA_SHORT_INTEREST_HISTORY,
     FINRA_SHORT_INTEREST_LATEST,
     FINRA_SHORT_INTEREST_SOURCE_RAW,
     FINRA_SHORT_INTEREST_SOURCES,
-    MARKET_UNIVERSE,
 )
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
@@ -61,17 +64,31 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
             raise RepositoryError(f"failed to load raw short interest records: {exc}") from exc
 
     def load_included_symbols(self) -> set[str]:
+        """
+        Historical-safe symbol probe.
+
+        Important:
+        - Must not depend on current market_universe membership
+        - Must not filter on include_in_universe = TRUE
+        - Returns symbols known by identifier history / master data only
+        """
         try:
             rows = self.con.execute(
-                f"""
-                SELECT symbol
-                FROM {MARKET_UNIVERSE}
-                WHERE include_in_universe = TRUE
+                """
+                SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                FROM (
+                    SELECT symbol FROM ticker_history
+                    UNION
+                    SELECT symbol FROM instrument_master
+                ) t
+                WHERE symbol IS NOT NULL
+                  AND TRIM(symbol) <> ''
+                ORDER BY symbol
                 """
             ).fetchall()
             return {row[0] for row in rows}
         except Exception as exc:
-            raise RepositoryError(f"failed to load included symbols: {exc}") from exc
+            raise RepositoryError(f"failed to load known symbols: {exc}") from exc
 
     def replace_short_interest_history(self, entries: list[ShortInterestRecord]) -> int:
         try:

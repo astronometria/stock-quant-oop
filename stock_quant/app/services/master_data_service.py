@@ -1,176 +1,230 @@
 from __future__ import annotations
 
-import hashlib
-from datetime import datetime
-from typing import Any
-
-from stock_quant.domain.entities.company import CompanyMaster
-from stock_quant.domain.entities.instrument import InstrumentMaster
-from stock_quant.domain.entities.ticker_history import IdentifierMapEntry, TickerHistoryEntry
-
 
 class MasterDataService:
-    def build(
-        self,
-        market_universe_rows: list[dict[str, Any]],
-        symbol_reference_rows: list[dict[str, Any]],
-    ) -> tuple[list[CompanyMaster], list[InstrumentMaster], list[TickerHistoryEntry], list[IdentifierMapEntry], dict[str, int]]:
-        companies: dict[str, CompanyMaster] = {}
-        instruments: dict[str, InstrumentMaster] = {}
-        ticker_history: list[TickerHistoryEntry] = []
-        identifier_map: list[IdentifierMapEntry] = []
+    def __init__(self, uow) -> None:
+        self.uow = uow
 
-        symbol_ref_by_symbol: dict[str, dict[str, Any]] = {}
-        for row in symbol_reference_rows:
-            symbol = str(row.get("symbol", "")).strip().upper()
-            if symbol:
-                symbol_ref_by_symbol[symbol] = row
+    @property
+    def con(self):
+        if self.uow.connection is None:
+            raise RuntimeError("active DB connection is required")
+        return self.uow.connection
 
-        for row in market_universe_rows:
-            symbol = str(row.get("symbol", "")).strip().upper()
-            if not symbol:
-                continue
+    def rebuild_master_from_price_history(self) -> dict[str, int]:
+        con = self.con
 
-            company_name = self._first_non_empty(
-                row.get("company_name"),
-                symbol_ref_by_symbol.get(symbol, {}).get("company_name"),
-            )
-            cik = self._first_non_empty(
-                row.get("cik"),
-                symbol_ref_by_symbol.get(symbol, {}).get("cik"),
-            )
-            exchange = self._first_non_empty(
-                row.get("exchange_normalized"),
-                row.get("exchange_raw"),
-                symbol_ref_by_symbol.get(symbol, {}).get("exchange"),
-            )
-            security_type = self._first_non_empty(row.get("security_type"), "UNKNOWN")
-            valid_from = row.get("as_of_date")
-
-            company_id = self._build_company_id(cik=cik, company_name=company_name, symbol=symbol)
-            instrument_id = self._build_instrument_id(symbol=symbol, exchange=exchange, security_type=security_type)
-
-            if company_id not in companies:
-                companies[company_id] = CompanyMaster(
-                    company_id=company_id,
-                    company_name=company_name,
-                    cik=cik,
-                    issuer_name_normalized=self._normalize_company_name(company_name),
-                    country_code="US",
-                    created_at=datetime.utcnow(),
-                )
-
-            if instrument_id not in instruments:
-                instruments[instrument_id] = InstrumentMaster(
-                    instrument_id=instrument_id,
-                    company_id=company_id,
-                    symbol=symbol,
-                    exchange=exchange,
-                    security_type=security_type,
-                    share_class=None,
-                    is_active=bool(row.get("include_in_universe", True)),
-                    created_at=datetime.utcnow(),
-                )
-
-            ticker_history.append(
-                TickerHistoryEntry(
-                    instrument_id=instrument_id,
-                    symbol=symbol,
-                    exchange=exchange,
-                    valid_from=valid_from,
-                    valid_to=None,
-                    is_current=True,
-                    created_at=datetime.utcnow(),
-                )
-            )
-
-            identifier_map.append(
-                IdentifierMapEntry(
-                    instrument_id=instrument_id,
-                    company_id=company_id,
-                    identifier_type="ticker",
-                    identifier_value=symbol,
-                    is_primary=True,
-                    created_at=datetime.utcnow(),
-                )
-            )
-
-            if cik:
-                identifier_map.append(
-                    IdentifierMapEntry(
-                        instrument_id=instrument_id,
-                        company_id=company_id,
-                        identifier_type="cik",
-                        identifier_value=str(cik),
-                        is_primary=True,
-                        created_at=datetime.utcnow(),
-                    )
-                )
-
-        ticker_history = self._dedupe_ticker_history(ticker_history)
-        identifier_map = self._dedupe_identifier_map(identifier_map)
-
-        metrics = {
-            "market_universe_rows": len(market_universe_rows),
-            "symbol_reference_rows": len(symbol_reference_rows),
-            "company_master_rows": len(companies),
-            "instrument_master_rows": len(instruments),
-            "ticker_history_rows": len(ticker_history),
-            "identifier_map_rows": len(identifier_map),
-        }
-
-        return (
-            list(companies.values()),
-            list(instruments.values()),
-            ticker_history,
-            identifier_map,
-            metrics,
+        price_symbol_count = int(
+            con.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM price_bars_adjusted"
+            ).fetchone()[0]
         )
 
-    def _build_company_id(self, *, cik: str | None, company_name: str | None, symbol: str) -> str:
-        if cik:
-            return f"COMP:{str(cik).strip()}"
-        key = f"{self._normalize_company_name(company_name)}|{symbol}"
-        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-        return f"COMP:HASH:{digest}"
+        con.execute("DROP TABLE IF EXISTS tmp_old_instrument_master")
+        con.execute("DROP TABLE IF EXISTS tmp_old_ticker_history")
+        con.execute("DROP TABLE IF EXISTS tmp_price_symbol_bounds")
 
-    def _build_instrument_id(self, *, symbol: str, exchange: str | None, security_type: str | None) -> str:
-        key = f"{symbol}|{exchange or 'UNKNOWN'}|{security_type or 'UNKNOWN'}"
-        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-        return f"INST:{digest}"
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_old_instrument_master AS
+            SELECT *
+            FROM instrument_master
+            """
+        )
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_old_ticker_history AS
+            SELECT *
+            FROM ticker_history
+            """
+        )
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_price_symbol_bounds AS
+            SELECT
+                p.symbol,
+                p.instrument_id,
+                MIN(p.bar_date) AS min_bar_date,
+                MAX(p.bar_date) AS max_bar_date
+            FROM price_bars_adjusted p
+            GROUP BY p.symbol, p.instrument_id
+            """
+        )
 
-    def _normalize_company_name(self, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return " ".join(str(value).strip().upper().split())
+        con.execute("DELETE FROM instrument_identifier_map")
+        con.execute("DELETE FROM ticker_history")
+        con.execute("DELETE FROM instrument_master")
 
-    def _first_non_empty(self, *values: Any) -> str | None:
-        for value in values:
-            if value is None:
-                continue
-            text = str(value).strip()
-            if text:
-                return text
-        return None
+        # 1) Instruments pilotés par les ids historiques déjà présents dans les prix
+        con.execute(
+            """
+            INSERT INTO instrument_master (
+                instrument_id,
+                company_id,
+                symbol,
+                exchange,
+                security_type,
+                share_class,
+                is_active,
+                created_at
+            )
+            SELECT
+                b.instrument_id,
+                o.company_id,
+                b.symbol,
+                COALESCE(o.exchange, t.exchange),
+                COALESCE(o.security_type, 'COMMON_STOCK'),
+                o.share_class,
+                TRUE AS is_active,
+                CURRENT_TIMESTAMP AS created_at
+            FROM tmp_price_symbol_bounds b
+            LEFT JOIN tmp_old_instrument_master o
+                ON o.symbol = b.symbol
+            LEFT JOIN tmp_old_ticker_history t
+                ON t.symbol = b.symbol
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY b.symbol, b.instrument_id
+                ORDER BY
+                    CASE WHEN o.instrument_id IS NOT NULL THEN 0 ELSE 1 END,
+                    CASE WHEN t.instrument_id IS NOT NULL THEN 0 ELSE 1 END
+            ) = 1
+            """
+        )
 
-    def _dedupe_ticker_history(self, rows: list[TickerHistoryEntry]) -> list[TickerHistoryEntry]:
-        seen: set[tuple[str, str, str | None, object]] = set()
-        out: list[TickerHistoryEntry] = []
-        for row in rows:
-            key = (row.instrument_id, row.symbol, row.exchange, row.valid_from)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(row)
-        return out
+        # 2) Conserver les anciens symboles non présents dans les prix
+        con.execute(
+            """
+            INSERT INTO instrument_master (
+                instrument_id,
+                company_id,
+                symbol,
+                exchange,
+                security_type,
+                share_class,
+                is_active,
+                created_at
+            )
+            SELECT
+                o.instrument_id,
+                o.company_id,
+                o.symbol,
+                o.exchange,
+                o.security_type,
+                o.share_class,
+                o.is_active,
+                CURRENT_TIMESTAMP AS created_at
+            FROM tmp_old_instrument_master o
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM tmp_price_symbol_bounds b
+                WHERE b.symbol = o.symbol
+            )
+            """
+        )
 
-    def _dedupe_identifier_map(self, rows: list[IdentifierMapEntry]) -> list[IdentifierMapEntry]:
-        seen: set[tuple[str, str, str]] = set()
-        out: list[IdentifierMapEntry] = []
-        for row in rows:
-            key = (row.instrument_id, row.identifier_type, row.identifier_value)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(row)
-        return out
+        # 3) Ticker history PIT à partir de l'historique prix
+        con.execute(
+            """
+            INSERT INTO ticker_history (
+                instrument_id,
+                symbol,
+                exchange,
+                valid_from,
+                valid_to,
+                is_current,
+                created_at
+            )
+            SELECT
+                b.instrument_id,
+                b.symbol,
+                COALESCE(
+                    im.exchange,
+                    o.exchange,
+                    t.exchange
+                ) AS exchange,
+                b.min_bar_date AS valid_from,
+                NULL AS valid_to,
+                TRUE AS is_current,
+                CURRENT_TIMESTAMP AS created_at
+            FROM tmp_price_symbol_bounds b
+            LEFT JOIN instrument_master im
+                ON im.instrument_id = b.instrument_id
+            LEFT JOIN tmp_old_instrument_master o
+                ON o.symbol = b.symbol
+            LEFT JOIN tmp_old_ticker_history t
+                ON t.symbol = b.symbol
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY b.symbol, b.instrument_id
+                ORDER BY
+                    CASE WHEN im.instrument_id IS NOT NULL THEN 0 ELSE 1 END,
+                    CASE WHEN o.instrument_id IS NOT NULL THEN 0 ELSE 1 END,
+                    CASE WHEN t.instrument_id IS NOT NULL THEN 0 ELSE 1 END
+            ) = 1
+            """
+        )
+
+        # 4) Conserver les anciens ticker_history pour les symboles hors historique prix
+        con.execute(
+            """
+            INSERT INTO ticker_history (
+                instrument_id,
+                symbol,
+                exchange,
+                valid_from,
+                valid_to,
+                is_current,
+                created_at
+            )
+            SELECT
+                t.instrument_id,
+                t.symbol,
+                t.exchange,
+                t.valid_from,
+                t.valid_to,
+                t.is_current,
+                CURRENT_TIMESTAMP AS created_at
+            FROM tmp_old_ticker_history t
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM tmp_price_symbol_bounds b
+                WHERE b.symbol = t.symbol
+            )
+            """
+        )
+
+        # 5) Recréer une map ticker minimale cohérente avec les ids reconstruits
+        con.execute(
+            """
+            INSERT INTO instrument_identifier_map (
+                instrument_id,
+                identifier_type,
+                identifier_value,
+                is_primary,
+                created_at
+            )
+            SELECT
+                instrument_id,
+                'ticker' AS identifier_type,
+                symbol AS identifier_value,
+                TRUE AS is_primary,
+                CURRENT_TIMESTAMP AS created_at
+            FROM instrument_master
+            """
+        )
+
+        instrument_master_rows = int(
+            con.execute("SELECT COUNT(*) FROM instrument_master").fetchone()[0]
+        )
+        ticker_history_rows = int(
+            con.execute("SELECT COUNT(*) FROM ticker_history").fetchone()[0]
+        )
+        identifier_map_rows = int(
+            con.execute("SELECT COUNT(*) FROM instrument_identifier_map").fetchone()[0]
+        )
+
+        return {
+            "price_symbol_count": price_symbol_count,
+            "instrument_master_rows": instrument_master_rows,
+            "ticker_history_rows": ticker_history_rows,
+            "identifier_map_rows": identifier_map_rows,
+        }

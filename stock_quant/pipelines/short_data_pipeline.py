@@ -58,16 +58,23 @@ class BuildShortDataPipeline(BasePipeline):
         con.execute("DELETE FROM daily_short_volume_history")
         con.execute("DELETE FROM short_features_daily")
 
-        con.execute("DROP TABLE IF EXISTS tmp_symbol_map")
+        con.execute("DROP TABLE IF EXISTS tmp_ticker_map")
         con.execute(
             """
-            CREATE TEMP TABLE tmp_symbol_map AS
+            CREATE TEMP TABLE tmp_ticker_map AS
             SELECT
-                UPPER(TRIM(symbol)) AS symbol_key,
-                instrument_id,
-                company_id,
-                symbol
-            FROM instrument_master
+                UPPER(TRIM(th.symbol)) AS symbol_key,
+                th.symbol,
+                th.instrument_id,
+                im.company_id,
+                th.valid_from,
+                COALESCE(th.valid_to, DATE '9999-12-31') AS valid_to,
+                th.is_current
+            FROM ticker_history th
+            LEFT JOIN instrument_master im
+              ON th.instrument_id = im.instrument_id
+            WHERE th.symbol IS NOT NULL
+              AND TRIM(th.symbol) <> ''
             """
         )
 
@@ -75,25 +82,45 @@ class BuildShortDataPipeline(BasePipeline):
         con.execute(
             """
             CREATE TEMP TABLE tmp_short_interest_base AS
-            SELECT
-                sm.instrument_id,
-                sm.company_id,
-                sm.symbol,
-                r.settlement_date,
-                CAST(r.short_interest AS DOUBLE) AS short_interest,
-                CAST(r.previous_short_interest AS DOUBLE) AS previous_short_interest,
-                CAST(r.avg_daily_volume AS DOUBLE) AS avg_daily_volume,
-                CASE
-                    WHEN r.avg_daily_volume IS NOT NULL
+            WITH ranked AS (
+                SELECT
+                    m.instrument_id,
+                    m.company_id,
+                    COALESCE(m.symbol, UPPER(TRIM(r.symbol))) AS symbol,
+                    r.settlement_date,
+                    CAST(r.short_interest AS DOUBLE) AS short_interest,
+                    CAST(r.previous_short_interest AS DOUBLE) AS previous_short_interest,
+                    CAST(r.avg_daily_volume AS DOUBLE) AS avg_daily_volume,
+                    CASE
+                        WHEN r.avg_daily_volume IS NOT NULL
                          AND r.avg_daily_volume <> 0
                          AND r.short_interest IS NOT NULL
-                    THEN CAST(r.short_interest AS DOUBLE) / CAST(r.avg_daily_volume AS DOUBLE)
-                    ELSE NULL
-                END AS days_to_cover,
-                COALESCE(r.source_file, 'finra_short_interest') AS source_name
-            FROM finra_short_interest_source_raw r
-            INNER JOIN tmp_symbol_map sm
-              ON UPPER(TRIM(r.symbol)) = sm.symbol_key
+                        THEN CAST(r.short_interest AS DOUBLE) / CAST(r.avg_daily_volume AS DOUBLE)
+                        ELSE NULL
+                    END AS days_to_cover,
+                    COALESCE(r.source_file, 'finra_short_interest') AS source_name,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(r.symbol)), r.settlement_date, COALESCE(r.source_file, 'finra_short_interest')
+                        ORDER BY m.valid_from DESC NULLS LAST, m.is_current DESC
+                    ) AS rn
+                FROM finra_short_interest_source_raw r
+                LEFT JOIN tmp_ticker_map m
+                  ON UPPER(TRIM(r.symbol)) = m.symbol_key
+                 AND r.settlement_date >= m.valid_from
+                 AND r.settlement_date <= m.valid_to
+            )
+            SELECT
+                instrument_id,
+                company_id,
+                symbol,
+                settlement_date,
+                short_interest,
+                previous_short_interest,
+                avg_daily_volume,
+                days_to_cover,
+                source_name
+            FROM ranked
+            WHERE rn = 1
             """
         )
 
@@ -129,29 +156,58 @@ class BuildShortDataPipeline(BasePipeline):
         short_interest_history_rows = int(
             con.execute("SELECT COUNT(*) FROM short_interest_history").fetchone()[0]
         )
+        pit_short_interest_mapped_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM tmp_short_interest_base WHERE instrument_id IS NOT NULL"
+            ).fetchone()[0]
+        )
+        unmapped_short_interest_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM tmp_short_interest_base WHERE instrument_id IS NULL"
+            ).fetchone()[0]
+        )
 
         con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_base")
         con.execute(
             """
             CREATE TEMP TABLE tmp_daily_short_volume_base AS
-            SELECT
-                sm.instrument_id,
-                sm.company_id,
-                sm.symbol,
-                r.trade_date,
-                CAST(r.short_volume AS DOUBLE) AS short_volume,
-                CAST(r.total_volume AS DOUBLE) AS total_volume,
-                CASE
-                    WHEN r.total_volume IS NOT NULL
+            WITH ranked AS (
+                SELECT
+                    m.instrument_id,
+                    m.company_id,
+                    COALESCE(m.symbol, UPPER(TRIM(r.symbol))) AS symbol,
+                    r.trade_date,
+                    CAST(r.short_volume AS DOUBLE) AS short_volume,
+                    CAST(r.total_volume AS DOUBLE) AS total_volume,
+                    CASE
+                        WHEN r.total_volume IS NOT NULL
                          AND r.total_volume <> 0
                          AND r.short_volume IS NOT NULL
-                    THEN CAST(r.short_volume AS DOUBLE) / CAST(r.total_volume AS DOUBLE)
-                    ELSE NULL
-                END AS short_volume_ratio,
-                COALESCE(r.source_name, 'finra') AS source_name
-            FROM finra_daily_short_volume_source_raw r
-            INNER JOIN tmp_symbol_map sm
-              ON UPPER(TRIM(r.symbol)) = sm.symbol_key
+                        THEN CAST(r.short_volume AS DOUBLE) / CAST(r.total_volume AS DOUBLE)
+                        ELSE NULL
+                    END AS short_volume_ratio,
+                    COALESCE(r.source_name, 'finra') AS source_name,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(r.symbol)), r.trade_date, COALESCE(r.source_name, 'finra')
+                        ORDER BY m.valid_from DESC NULLS LAST, m.is_current DESC
+                    ) AS rn
+                FROM finra_daily_short_volume_source_raw r
+                LEFT JOIN tmp_ticker_map m
+                  ON UPPER(TRIM(r.symbol)) = m.symbol_key
+                 AND r.trade_date >= m.valid_from
+                 AND r.trade_date <= m.valid_to
+            )
+            SELECT
+                instrument_id,
+                company_id,
+                symbol,
+                trade_date,
+                short_volume,
+                total_volume,
+                short_volume_ratio,
+                source_name
+            FROM ranked
+            WHERE rn = 1
             """
         )
 
@@ -185,6 +241,16 @@ class BuildShortDataPipeline(BasePipeline):
         daily_short_volume_history_rows = int(
             con.execute("SELECT COUNT(*) FROM daily_short_volume_history").fetchone()[0]
         )
+        pit_daily_short_volume_mapped_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM tmp_daily_short_volume_base WHERE instrument_id IS NOT NULL"
+            ).fetchone()[0]
+        )
+        unmapped_daily_short_volume_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM tmp_daily_short_volume_base WHERE instrument_id IS NULL"
+            ).fetchone()[0]
+        )
 
         con.execute(
             """
@@ -216,7 +282,7 @@ class BuildShortDataPipeline(BasePipeline):
                 d.short_volume_ratio,
                 CASE
                     WHEN s.short_interest IS NOT NULL
-                         AND s.previous_short_interest IS NOT NULL
+                     AND s.previous_short_interest IS NOT NULL
                     THEN s.short_interest - s.previous_short_interest
                     ELSE NULL
                 END AS short_interest_change,
@@ -224,8 +290,11 @@ class BuildShortDataPipeline(BasePipeline):
                 CURRENT_TIMESTAMP AS created_at
             FROM tmp_daily_short_volume_base d
             FULL OUTER JOIN tmp_short_interest_base s
-              ON d.instrument_id = s.instrument_id
-             AND d.trade_date = s.settlement_date
+              ON d.trade_date = s.settlement_date
+             AND (
+                    (d.instrument_id IS NOT NULL AND s.instrument_id IS NOT NULL AND d.instrument_id = s.instrument_id)
+                 OR (d.instrument_id IS NULL AND s.instrument_id IS NULL AND d.symbol = s.symbol)
+                 )
             """
         )
 
@@ -244,6 +313,10 @@ class BuildShortDataPipeline(BasePipeline):
             "short_interest_history_rows": short_interest_history_rows,
             "daily_short_volume_history_rows": daily_short_volume_history_rows,
             "short_feature_rows": short_feature_rows,
+            "pit_short_interest_mapped_rows": pit_short_interest_mapped_rows,
+            "pit_daily_short_volume_mapped_rows": pit_daily_short_volume_mapped_rows,
+            "unmapped_short_interest_rows": unmapped_short_interest_rows,
+            "unmapped_daily_short_volume_rows": unmapped_daily_short_volume_rows,
             "written_short_interest": short_interest_history_rows,
             "written_daily_short_volume": daily_short_volume_history_rows,
             "written_short_features": short_feature_rows,
