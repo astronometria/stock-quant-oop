@@ -15,11 +15,11 @@ except Exception:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the daily price refresh pipeline: Yahoo fetch -> effective rebuild -> incremental build -> status."
+        description="Run the daily price refresh pipeline directly through the new incremental OOP build_prices flow."
     )
     parser.add_argument(
         "--project-root",
-        default=str(Path(__file__).resolve().parents[1]),
+        default=str(Path(__file__).resolve().parents[2]),
         help="Project root directory.",
     )
     parser.add_argument(
@@ -28,27 +28,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional DuckDB path passed to child steps.",
     )
     parser.add_argument(
-        "--max-symbols",
-        type=int,
+        "--symbol",
+        action="append",
+        dest="symbols",
+        default=[],
+        help="Optional symbol filter. Repeat for multiple symbols.",
+    )
+    parser.add_argument(
+        "--as-of",
         default=None,
-        help="Optional limit for Yahoo fetch, useful for testing.",
+        help="Optional single target date (YYYY-MM-DD).",
     )
     parser.add_argument(
-        "--sleep",
-        type=float,
-        default=0.5,
-        help="Sleep between Yahoo requests.",
+        "--start-date",
+        default=None,
+        help="Optional start date (YYYY-MM-DD).",
     )
     parser.add_argument(
-        "--retries",
-        type=int,
-        default=3,
-        help="Yahoo fetch retries per symbol.",
-    )
-    parser.add_argument(
-        "--truncate-effective",
-        action="store_true",
-        help="Delete existing effective staging rows before rebuilding.",
+        "--end-date",
+        default=None,
+        help="Optional end date (YYYY-MM-DD).",
     )
     parser.add_argument(
         "--verbose",
@@ -79,34 +78,26 @@ def main() -> None:
 
     steps: list[tuple[str, list[str]]] = []
 
-    fetch_cmd = build_base_command(
-        project_root,
-        "fetch_price_source_daily_raw_yahoo.py",
-        args.db_path,
-        args.verbose,
-    )
-    if args.max_symbols is not None:
-        fetch_cmd.extend(["--max-symbols", str(args.max_symbols)])
-    fetch_cmd.extend(["--sleep", str(args.sleep), "--retries", str(args.retries)])
-    steps.append(("fetch_price_source_daily_raw_yahoo", fetch_cmd))
-
-    rebuild_cmd = build_base_command(
-        project_root,
-        "rebuild_price_source_daily_raw_effective.py",
-        args.db_path,
-        args.verbose,
-    )
-    if args.truncate_effective:
-        rebuild_cmd.append("--truncate")
-    steps.append(("rebuild_price_source_daily_raw_effective", rebuild_cmd))
-
     build_cmd = build_base_command(
         project_root,
         "build_prices.py",
         args.db_path,
         args.verbose,
     )
-    steps.append(("build_prices", build_cmd))
+    build_cmd.extend(["--mode", "daily"])
+
+    for symbol in args.symbols:
+        build_cmd.extend(["--symbol", symbol])
+
+    if args.as_of:
+        build_cmd.extend(["--as-of", args.as_of])
+    else:
+        if args.start_date:
+            build_cmd.extend(["--start-date", args.start_date])
+        if args.end_date:
+            build_cmd.extend(["--end-date", args.end_date])
+
+    steps.append(("build_prices_daily_incremental", build_cmd))
 
     status_cmd = build_base_command(
         project_root,

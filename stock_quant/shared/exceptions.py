@@ -22,5 +22,9 @@ class ProviderError(StockQuantError):
     """Raised when a data provider fails."""
 
 
+class ServiceError(StockQuantError):
+    """Raised when an application service fails."""
+
+
 class ValidationError(StockQuantError):
     """Raised when validation fails."""

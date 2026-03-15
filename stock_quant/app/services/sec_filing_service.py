@@ -14,15 +14,26 @@ class SecFilingService:
         cik_company_map: dict[str, str],
     ) -> tuple[list[SecFiling], dict[str, int]]:
         filings: list[SecFiling] = []
+        seen_filing_ids: set[str] = set()
+        skipped_missing_keys = 0
+        matched_company_ids = 0
 
         for row in raw_index_rows:
             cik = str(row.get("cik", "")).strip().zfill(10)
             accession_number = str(row.get("accession_number", "")).strip()
+
             if not cik or not accession_number:
+                skipped_missing_keys += 1
                 continue
 
             filing_id = self._build_filing_id(cik=cik, accession_number=accession_number)
+            if filing_id in seen_filing_ids:
+                continue
+            seen_filing_ids.add(filing_id)
+
             company_id = cik_company_map.get(cik)
+            if company_id:
+                matched_company_ids += 1
 
             accepted_at = row.get("accepted_at")
             available_at = accepted_at or datetime.utcnow()
@@ -39,15 +50,16 @@ class SecFilingService:
                     filing_url=row.get("filing_url"),
                     primary_document=row.get("primary_document"),
                     available_at=available_at,
-                    source_name="sec",
+                    source_name=str(row.get("source_name", "sec")).strip() or "sec",
                     created_at=datetime.utcnow(),
                 )
             )
 
         metrics = {
             "raw_index_rows": len(raw_index_rows),
-            "sec_filing_rows": len(filings),
-            "matched_company_ids": sum(1 for row in filings if row.company_id),
+            "sec_filing_rows_built": len(filings),
+            "matched_company_ids": matched_company_ids,
+            "skipped_missing_keys": skipped_missing_keys,
         }
         return filings, metrics
 

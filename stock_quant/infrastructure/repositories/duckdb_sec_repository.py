@@ -19,47 +19,119 @@ class DuckDbSecRepository:
         return self.uow.connection
 
     def replace_sec_filing_raw_index(self, rows: list[dict[str, Any]]) -> int:
+        return self.upsert_sec_filing_raw_index(rows)
+
+    def upsert_sec_filing_raw_index(self, rows: list[dict[str, Any]]) -> int:
         try:
-            self.con.execute("DELETE FROM sec_filing_raw_index")
             if not rows:
                 return 0
 
             payload = [
                 (
-                    row.get("cik"),
+                    str(row.get("cik")).strip().zfill(10) if row.get("cik") is not None else None,
                     row.get("company_name"),
                     row.get("form_type"),
                     row.get("filing_date"),
                     row.get("accepted_at"),
-                    row.get("accession_number"),
+                    str(row.get("accession_number")).strip() if row.get("accession_number") is not None else None,
                     row.get("primary_document"),
                     row.get("filing_url"),
                     row.get("source_name", "sec"),
                     row.get("ingested_at", datetime.utcnow()),
                 )
                 for row in rows
+                if row.get("accession_number")
             ]
-            self.con.executemany(
+            if not payload:
+                return 0
+
+            self.con.execute(
                 """
-                INSERT INTO sec_filing_raw_index (
-                    cik,
-                    company_name,
-                    form_type,
-                    filing_date,
-                    accepted_at,
-                    accession_number,
-                    primary_document,
-                    filing_url,
-                    source_name,
-                    ingested_at
+                CREATE TEMP TABLE tmp_sec_filing_raw_index_stage (
+                    cik VARCHAR,
+                    company_name VARCHAR,
+                    form_type VARCHAR,
+                    filing_date DATE,
+                    accepted_at TIMESTAMP,
+                    accession_number VARCHAR,
+                    primary_document VARCHAR,
+                    filing_url VARCHAR,
+                    source_name VARCHAR,
+                    ingested_at TIMESTAMP
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                payload,
+                """
             )
+            try:
+                self.con.executemany(
+                    """
+                    INSERT INTO tmp_sec_filing_raw_index_stage (
+                        cik,
+                        company_name,
+                        form_type,
+                        filing_date,
+                        accepted_at,
+                        accession_number,
+                        primary_document,
+                        filing_url,
+                        source_name,
+                        ingested_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+
+                self.con.execute(
+                    """
+                    DELETE FROM sec_filing_raw_index AS target
+                    USING tmp_sec_filing_raw_index_stage AS stage
+                    WHERE target.accession_number = stage.accession_number
+                    """
+                )
+
+                self.con.execute(
+                    """
+                    INSERT INTO sec_filing_raw_index (
+                        cik,
+                        company_name,
+                        form_type,
+                        filing_date,
+                        accepted_at,
+                        accession_number,
+                        primary_document,
+                        filing_url,
+                        source_name,
+                        ingested_at
+                    )
+                    SELECT
+                        cik,
+                        company_name,
+                        form_type,
+                        filing_date,
+                        accepted_at,
+                        accession_number,
+                        primary_document,
+                        filing_url,
+                        source_name,
+                        ingested_at
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY accession_number
+                                ORDER BY accepted_at DESC NULLS LAST, ingested_at DESC NULLS LAST
+                            ) AS rn
+                        FROM tmp_sec_filing_raw_index_stage
+                    ) x
+                    WHERE rn = 1
+                    """
+                )
+            finally:
+                self.con.execute("DROP TABLE IF EXISTS tmp_sec_filing_raw_index_stage")
+
             return len(payload)
         except Exception as exc:
-            raise RepositoryError(f"failed to replace sec_filing_raw_index: {exc}") from exc
+            raise RepositoryError(f"failed to upsert sec_filing_raw_index: {exc}") from exc
 
     def load_sec_filing_raw_index_rows(self) -> list[dict[str, Any]]:
         try:
@@ -110,8 +182,10 @@ class DuckDbSecRepository:
             raise RepositoryError(f"failed to load cik company map: {exc}") from exc
 
     def replace_sec_filing(self, rows: list[SecFiling]) -> int:
+        return self.upsert_sec_filing(rows)
+
+    def upsert_sec_filing(self, rows: list[SecFiling]) -> int:
         try:
-            self.con.execute("DELETE FROM sec_filing")
             if not rows:
                 return 0
 
@@ -131,27 +205,104 @@ class DuckDbSecRepository:
                     row.created_at or datetime.utcnow(),
                 )
                 for row in rows
+                if row.filing_id and row.accession_number
             ]
-            self.con.executemany(
+            if not payload:
+                return 0
+
+            self.con.execute(
                 """
-                INSERT INTO sec_filing (
-                    filing_id,
-                    company_id,
-                    cik,
-                    form_type,
-                    filing_date,
-                    accepted_at,
-                    accession_number,
-                    filing_url,
-                    primary_document,
-                    available_at,
-                    source_name,
-                    created_at
+                CREATE TEMP TABLE tmp_sec_filing_stage (
+                    filing_id VARCHAR,
+                    company_id VARCHAR,
+                    cik VARCHAR,
+                    form_type VARCHAR,
+                    filing_date DATE,
+                    accepted_at TIMESTAMP,
+                    accession_number VARCHAR,
+                    filing_url VARCHAR,
+                    primary_document VARCHAR,
+                    available_at TIMESTAMP,
+                    source_name VARCHAR,
+                    created_at TIMESTAMP
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                payload,
+                """
             )
+            try:
+                self.con.executemany(
+                    """
+                    INSERT INTO tmp_sec_filing_stage (
+                        filing_id,
+                        company_id,
+                        cik,
+                        form_type,
+                        filing_date,
+                        accepted_at,
+                        accession_number,
+                        filing_url,
+                        primary_document,
+                        available_at,
+                        source_name,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+
+                self.con.execute(
+                    """
+                    DELETE FROM sec_filing AS target
+                    USING tmp_sec_filing_stage AS stage
+                    WHERE target.filing_id = stage.filing_id
+                       OR target.accession_number = stage.accession_number
+                    """
+                )
+
+                self.con.execute(
+                    """
+                    INSERT INTO sec_filing (
+                        filing_id,
+                        company_id,
+                        cik,
+                        form_type,
+                        filing_date,
+                        accepted_at,
+                        accession_number,
+                        filing_url,
+                        primary_document,
+                        available_at,
+                        source_name,
+                        created_at
+                    )
+                    SELECT
+                        filing_id,
+                        company_id,
+                        cik,
+                        form_type,
+                        filing_date,
+                        accepted_at,
+                        accession_number,
+                        filing_url,
+                        primary_document,
+                        available_at,
+                        source_name,
+                        created_at
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY filing_id
+                                ORDER BY accepted_at DESC NULLS LAST, available_at DESC NULLS LAST, created_at DESC NULLS LAST
+                            ) AS rn
+                        FROM tmp_sec_filing_stage
+                    ) x
+                    WHERE rn = 1
+                    """
+                )
+            finally:
+                self.con.execute("DROP TABLE IF EXISTS tmp_sec_filing_stage")
+
             return len(payload)
         except Exception as exc:
-            raise RepositoryError(f"failed to replace sec_filing: {exc}") from exc
+            raise RepositoryError(f"failed to upsert sec_filing: {exc}") from exc

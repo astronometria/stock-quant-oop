@@ -7,6 +7,16 @@ from stock_quant.shared.exceptions import RepositoryError
 
 
 class DuckDbPriceRepository:
+    """
+    Incremental DuckDB repository for canonical price storage.
+
+    Design goals:
+    - no full-table delete on price_history
+    - backward compatible with current DB schema
+    - forward compatible with instrument_id/company_id columns
+    - symbol-based fallback while migrating toward instrument-based history
+    """
+
     def __init__(self, uow: DuckDbUnitOfWork) -> None:
         self.uow = uow
 
@@ -18,92 +28,114 @@ class DuckDbPriceRepository:
 
     def list_allowed_symbols(self) -> list[str]:
         try:
-            rows = self.con.execute(
-                """
-                SELECT DISTINCT symbol
-                FROM market_universe
-                WHERE include_in_universe = TRUE
-                ORDER BY symbol
-                """
-            ).fetchall()
-            return [row[0] for row in rows]
+            tables = self._list_tables()
+
+            if "market_universe" in tables:
+                rows = self.con.execute(
+                    """
+                    SELECT DISTINCT symbol
+                    FROM market_universe
+                    WHERE include_in_universe = TRUE
+                      AND symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+                return [str(row[0]).strip().upper() for row in rows]
+
+            if "universe_membership_history" in tables:
+                rows = self.con.execute(
+                    """
+                    SELECT DISTINCT symbol
+                    FROM universe_membership_history
+                    WHERE membership_status IN ('included', 'active', 'eligible')
+                      AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+                      AND symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+                return [str(row[0]).strip().upper() for row in rows]
+
+            raise RepositoryError("no supported universe table found")
         except Exception as exc:
             raise RepositoryError(f"failed to list allowed symbols: {exc}") from exc
 
     def upsert_price_history(self, frame) -> int:
         try:
-            self.con.execute("DELETE FROM price_history")
-
             if frame is None or frame.empty:
                 return 0
 
-            self.con.register("tmp_price_history_frame", frame)
+            self.con.register("tmp_price_history_input_frame", frame)
             try:
-                self.con.execute(
-                    """
-                    INSERT INTO price_history (
-                        symbol,
-                        price_date,
-                        open,
-                        high,
-                        low,
-                        close,
-                        volume,
-                        source_name,
-                        ingested_at
-                    )
-                    SELECT
-                        symbol,
-                        CAST(price_date AS DATE),
-                        CAST(open AS DOUBLE),
-                        CAST(high AS DOUBLE),
-                        CAST(low AS DOUBLE),
-                        CAST(close AS DOUBLE),
-                        CAST(volume AS BIGINT),
-                        source_name,
-                        CAST(ingested_at AS TIMESTAMP)
-                    FROM tmp_price_history_frame
-                    """
-                )
-                written = int(self.con.execute("SELECT COUNT(*) FROM price_history").fetchone()[0])
+                self._create_stage_table()
+                self._delete_replaced_price_history_rows()
+                written = self._insert_price_history_from_stage()
             finally:
-                self.con.unregister("tmp_price_history_frame")
+                self._safe_unregister("tmp_price_history_input_frame")
+                self._drop_temp_table("tmp_price_history_stage")
 
-            return written
+            return int(written)
         except Exception as exc:
             raise RepositoryError(f"failed to upsert price_history: {exc}") from exc
 
-    def refresh_price_latest(self) -> int:
+    def refresh_price_latest(self, symbols: list[str] | None = None) -> int:
         try:
-            self.con.execute("DELETE FROM price_latest")
-            self.con.execute(
-                """
-                INSERT INTO price_latest (
-                    symbol,
-                    latest_price_date,
-                    close,
-                    volume,
-                    source_name,
-                    updated_at
+            latest_columns = self._table_columns("price_latest")
+            history_columns = self._table_columns("price_history")
+            if not latest_columns:
+                raise RepositoryError("price_latest table is missing")
+            if not history_columns:
+                raise RepositoryError("price_history table is missing")
+
+            if symbols:
+                normalized_symbols = sorted(
+                    {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
                 )
-                SELECT
-                    h.symbol,
-                    h.price_date AS latest_price_date,
-                    h.close,
-                    h.volume,
-                    h.source_name,
-                    CURRENT_TIMESTAMP AS updated_at
-                FROM price_history h
-                INNER JOIN (
-                    SELECT symbol, MAX(price_date) AS max_price_date
-                    FROM price_history
-                    GROUP BY symbol
-                ) latest
-                    ON h.symbol = latest.symbol
-                   AND h.price_date = latest.max_price_date
-                """
-            )
-            return int(self.con.execute("SELECT COUNT(*) FROM price_latest").fetchone()[0])
+                if not normalized_symbols:
+                    return self._count_rows("price_latest")
+
+                self.con.execute("CREATE TEMP TABLE tmp_price_latest_symbols(symbol VARCHAR)")
+                try:
+                    values_sql = ", ".join(["(?)"] * len(normalized_symbols))
+                    self.con.execute(
+                        f"INSERT INTO tmp_price_latest_symbols VALUES {values_sql}",
+                        normalized_symbols,
+                    )
+
+                    self.con.execute(
+                        """
+                        DELETE FROM price_latest
+                        WHERE UPPER(TRIM(symbol)) IN (
+                            SELECT UPPER(TRIM(symbol))
+                            FROM tmp_price_latest_symbols
+                        )
+                        """
+                    )
+
+                    insert_sql = self._build_price_latest_insert_sql(
+                        latest_columns=latest_columns,
+                        history_columns=history_columns,
+                        symbol_filter_sql="""
+                            WHERE UPPER(TRIM(h.symbol)) IN (
+                                SELECT UPPER(TRIM(symbol))
+                                FROM tmp_price_latest_symbols
+                            )
+                        """,
+                    )
+                    self.con.execute(insert_sql)
+                finally:
+                    self._drop_temp_table("tmp_price_latest_symbols")
+            else:
+                self.con.execute("DELETE FROM price_latest")
+                insert_sql = self._build_price_latest_insert_sql(
+                    latest_columns=latest_columns,
+                    history_columns=history_columns,
+                    symbol_filter_sql="",
+                )
+                self.con.execute(insert_sql)
+
+            return self._count_rows("price_latest")
         except Exception as exc:
             raise RepositoryError(f"failed to refresh price_latest: {exc}") from exc
 
@@ -184,3 +216,228 @@ class DuckDbPriceRepository:
             ]
         except Exception as exc:
             raise RepositoryError(f"failed to load price_source_daily_raw_all rows: {exc}") from exc
+
+    def _create_stage_table(self) -> None:
+        price_history_columns = self._table_columns("price_history")
+        if not price_history_columns:
+            raise RepositoryError("price_history table is missing")
+
+        instrument_master_columns = self._table_columns("instrument_master")
+        has_instrument_master = bool(instrument_master_columns)
+
+        join_sql = ""
+        select_instrument_sql = "CAST(NULL AS VARCHAR) AS instrument_id,"
+        select_company_sql = "CAST(NULL AS VARCHAR) AS company_id,"
+
+        if has_instrument_master:
+            select_instrument_sql = "im.instrument_id AS instrument_id,"
+            if "company_id" in instrument_master_columns:
+                select_company_sql = "im.company_id AS company_id,"
+            else:
+                select_company_sql = "CAST(NULL AS VARCHAR) AS company_id,"
+
+            join_sql = """
+                LEFT JOIN instrument_master im
+                  ON UPPER(TRIM(src.symbol)) = UPPER(TRIM(im.symbol))
+            """
+
+        self.con.execute(
+            f"""
+            CREATE TEMP TABLE tmp_price_history_stage AS
+            WITH src AS (
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    CAST(price_date AS DATE) AS price_date,
+                    CAST(open AS DOUBLE) AS open,
+                    CAST(high AS DOUBLE) AS high,
+                    CAST(low AS DOUBLE) AS low,
+                    CAST(close AS DOUBLE) AS close,
+                    CAST(volume AS BIGINT) AS volume,
+                    CAST(source_name AS VARCHAR) AS source_name,
+                    CAST(ingested_at AS TIMESTAMP) AS ingested_at
+                FROM tmp_price_history_input_frame
+                WHERE symbol IS NOT NULL
+                  AND TRIM(symbol) <> ''
+                  AND price_date IS NOT NULL
+            ),
+            dedup AS (
+                SELECT *
+                FROM (
+                    SELECT
+                        src.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY src.symbol, src.price_date
+                            ORDER BY src.ingested_at DESC NULLS LAST, src.source_name DESC
+                        ) AS rn
+                    FROM src
+                ) x
+                WHERE rn = 1
+            )
+            SELECT
+                {select_instrument_sql}
+                {select_company_sql}
+                d.symbol,
+                d.price_date,
+                d.open,
+                d.high,
+                d.low,
+                d.close,
+                d.volume,
+                d.source_name,
+                COALESCE(d.ingested_at, CURRENT_TIMESTAMP) AS ingested_at
+            FROM dedup d
+            {join_sql.replace('src.', 'd.')}
+            """
+        )
+
+    def _delete_replaced_price_history_rows(self) -> None:
+        columns = self._table_columns("price_history")
+
+        if "instrument_id" in columns:
+            self.con.execute(
+                """
+                DELETE FROM price_history AS target
+                USING tmp_price_history_stage AS stage
+                WHERE target.price_date = stage.price_date
+                  AND (
+                        (
+                            target.instrument_id IS NOT NULL
+                            AND stage.instrument_id IS NOT NULL
+                            AND target.instrument_id = stage.instrument_id
+                        )
+                        OR (
+                            (target.instrument_id IS NULL OR stage.instrument_id IS NULL)
+                            AND UPPER(TRIM(target.symbol)) = UPPER(TRIM(stage.symbol))
+                        )
+                  )
+                """
+            )
+            return
+
+        self.con.execute(
+            """
+            DELETE FROM price_history AS target
+            USING tmp_price_history_stage AS stage
+            WHERE target.price_date = stage.price_date
+              AND UPPER(TRIM(target.symbol)) = UPPER(TRIM(stage.symbol))
+            """
+        )
+
+    def _insert_price_history_from_stage(self) -> int:
+        target_columns = self._table_columns("price_history")
+        if not target_columns:
+            raise RepositoryError("price_history table is missing")
+
+        insert_columns: list[str] = []
+        select_columns: list[str] = []
+
+        for name in [
+            "instrument_id",
+            "company_id",
+            "symbol",
+            "price_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "source_name",
+            "ingested_at",
+        ]:
+            if name in target_columns:
+                insert_columns.append(name)
+                select_columns.append(name)
+
+        if not insert_columns:
+            raise RepositoryError("price_history has no supported columns")
+
+        self.con.execute(
+            f"""
+            INSERT INTO price_history ({", ".join(insert_columns)})
+            SELECT {", ".join(select_columns)}
+            FROM tmp_price_history_stage
+            """
+        )
+        return self._count_rows("tmp_price_history_stage")
+
+    def _build_price_latest_insert_sql(
+        self,
+        latest_columns: set[str],
+        history_columns: set[str],
+        symbol_filter_sql: str,
+    ) -> str:
+        insert_columns: list[str] = []
+        select_columns: list[str] = []
+
+        mapping = [
+            ("instrument_id", "h.instrument_id", "instrument_id" in history_columns),
+            ("company_id", "h.company_id", "company_id" in history_columns),
+            ("symbol", "h.symbol", "symbol" in history_columns),
+            ("latest_price_date", "h.price_date", "price_date" in history_columns),
+            ("close", "h.close", "close" in history_columns),
+            ("volume", "h.volume", "volume" in history_columns),
+            ("source_name", "h.source_name", "source_name" in history_columns),
+            ("updated_at", "CURRENT_TIMESTAMP", True),
+        ]
+
+        for target_name, expr, allowed in mapping:
+            if target_name in latest_columns and allowed:
+                insert_columns.append(target_name)
+                select_columns.append(expr)
+
+        if not insert_columns:
+            raise RepositoryError("price_latest has no supported columns")
+
+        partition_expr = "h.symbol"
+        if "instrument_id" in history_columns:
+            partition_expr = "COALESCE(h.instrument_id, h.symbol)"
+
+        return f"""
+            INSERT INTO price_latest ({", ".join(insert_columns)})
+            WITH ranked AS (
+                SELECT
+                    h.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY {partition_expr}
+                        ORDER BY h.price_date DESC, h.ingested_at DESC NULLS LAST
+                    ) AS rn
+                FROM price_history h
+                {symbol_filter_sql}
+            )
+            SELECT
+                {", ".join(select_columns)}
+            FROM ranked h
+            WHERE h.rn = 1
+        """
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        try:
+            rows = self.con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+            return {row[1] for row in rows}
+        except Exception:
+            return set()
+
+    def _list_tables(self) -> set[str]:
+        rows = self.con.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'main'
+            """
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def _count_rows(self, table_name: str) -> int:
+        return int(self.con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+    def _drop_temp_table(self, table_name: str) -> None:
+        try:
+            self.con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        except Exception:
+            pass
+
+    def _safe_unregister(self, name: str) -> None:
+        try:
+            self.con.unregister(name)
+        except Exception:
+            pass

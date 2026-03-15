@@ -40,7 +40,7 @@ class BuildSecFilingPipeline(BasePipeline):
 
     def load(self, data) -> None:
         filings, metrics = data
-        self._rows_written = self.repository.replace_sec_filing(filings)
+        self._rows_written = self.repository.upsert_sec_filing(filings)
         self._metrics = dict(metrics)
         self._metrics["written_sec_filing"] = self._rows_written
 

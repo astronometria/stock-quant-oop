@@ -91,17 +91,28 @@ class DuckDbFundamentalsRepository:
             raise RepositoryError(f"failed to load sec_fact_normalized rows: {exc}") from exc
 
     def replace_fundamental_snapshot_quarterly(self, rows: list[FundamentalSnapshot]) -> int:
-        return self._replace_snapshot_table("fundamental_snapshot_quarterly", rows)
+        return self.upsert_fundamental_snapshot_quarterly(rows)
 
     def replace_fundamental_snapshot_annual(self, rows: list[FundamentalSnapshot]) -> int:
-        return self._replace_snapshot_table("fundamental_snapshot_annual", rows)
+        return self.upsert_fundamental_snapshot_annual(rows)
 
     def replace_fundamental_ttm(self, rows: list[FundamentalSnapshot]) -> int:
-        return self._replace_snapshot_table("fundamental_ttm", rows)
+        return self.upsert_fundamental_ttm(rows)
 
     def replace_fundamental_features_daily(self, rows: list[FundamentalFeatureDaily]) -> int:
+        return self.upsert_fundamental_features_daily(rows)
+
+    def upsert_fundamental_snapshot_quarterly(self, rows: list[FundamentalSnapshot]) -> int:
+        return self._upsert_snapshot_table("fundamental_snapshot_quarterly", rows)
+
+    def upsert_fundamental_snapshot_annual(self, rows: list[FundamentalSnapshot]) -> int:
+        return self._upsert_snapshot_table("fundamental_snapshot_annual", rows)
+
+    def upsert_fundamental_ttm(self, rows: list[FundamentalSnapshot]) -> int:
+        return self._upsert_snapshot_table("fundamental_ttm", rows)
+
+    def upsert_fundamental_features_daily(self, rows: list[FundamentalFeatureDaily]) -> int:
         try:
-            self.con.execute("DELETE FROM fundamental_features_daily")
             if not rows:
                 return 0
 
@@ -124,37 +135,122 @@ class DuckDbFundamentalsRepository:
                     row.created_at or datetime.utcnow(),
                 )
                 for row in rows
+                if row.company_id and row.as_of_date is not None
             ]
-            self.con.executemany(
+            if not payload:
+                return 0
+
+            self.con.execute(
                 """
-                INSERT INTO fundamental_features_daily (
-                    company_id,
-                    as_of_date,
-                    period_type,
-                    revenue,
-                    net_income,
-                    assets,
-                    liabilities,
-                    equity,
-                    operating_cash_flow,
-                    shares_outstanding,
-                    net_margin,
-                    debt_to_equity,
-                    return_on_assets,
-                    source_name,
-                    created_at
+                CREATE TEMP TABLE tmp_fundamental_features_daily_stage (
+                    company_id VARCHAR,
+                    as_of_date DATE,
+                    period_type VARCHAR,
+                    revenue DOUBLE,
+                    net_income DOUBLE,
+                    assets DOUBLE,
+                    liabilities DOUBLE,
+                    equity DOUBLE,
+                    operating_cash_flow DOUBLE,
+                    shares_outstanding DOUBLE,
+                    net_margin DOUBLE,
+                    debt_to_equity DOUBLE,
+                    return_on_assets DOUBLE,
+                    source_name VARCHAR,
+                    created_at TIMESTAMP
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                payload,
+                """
             )
+            try:
+                self.con.executemany(
+                    """
+                    INSERT INTO tmp_fundamental_features_daily_stage (
+                        company_id,
+                        as_of_date,
+                        period_type,
+                        revenue,
+                        net_income,
+                        assets,
+                        liabilities,
+                        equity,
+                        operating_cash_flow,
+                        shares_outstanding,
+                        net_margin,
+                        debt_to_equity,
+                        return_on_assets,
+                        source_name,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+
+                self.con.execute(
+                    """
+                    DELETE FROM fundamental_features_daily AS target
+                    USING tmp_fundamental_features_daily_stage AS stage
+                    WHERE target.company_id = stage.company_id
+                      AND target.as_of_date = stage.as_of_date
+                    """
+                )
+
+                self.con.execute(
+                    """
+                    INSERT INTO fundamental_features_daily (
+                        company_id,
+                        as_of_date,
+                        period_type,
+                        revenue,
+                        net_income,
+                        assets,
+                        liabilities,
+                        equity,
+                        operating_cash_flow,
+                        shares_outstanding,
+                        net_margin,
+                        debt_to_equity,
+                        return_on_assets,
+                        source_name,
+                        created_at
+                    )
+                    SELECT
+                        company_id,
+                        as_of_date,
+                        period_type,
+                        revenue,
+                        net_income,
+                        assets,
+                        liabilities,
+                        equity,
+                        operating_cash_flow,
+                        shares_outstanding,
+                        net_margin,
+                        debt_to_equity,
+                        return_on_assets,
+                        source_name,
+                        created_at
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY company_id, as_of_date
+                                ORDER BY created_at DESC NULLS LAST
+                            ) AS rn
+                        FROM tmp_fundamental_features_daily_stage
+                    ) x
+                    WHERE rn = 1
+                    """
+                )
+            finally:
+                self.con.execute("DROP TABLE IF EXISTS tmp_fundamental_features_daily_stage")
+
             return len(payload)
         except Exception as exc:
-            raise RepositoryError(f"failed to replace fundamental_features_daily: {exc}") from exc
+            raise RepositoryError(f"failed to upsert fundamental_features_daily: {exc}") from exc
 
-    def _replace_snapshot_table(self, table_name: str, rows: list[FundamentalSnapshot]) -> int:
+    def _upsert_snapshot_table(self, table_name: str, rows: list[FundamentalSnapshot]) -> int:
         try:
-            self.con.execute(f"DELETE FROM {table_name}")
             if not rows:
                 return 0
 
@@ -176,29 +272,113 @@ class DuckDbFundamentalsRepository:
                     row.created_at or datetime.utcnow(),
                 )
                 for row in rows
+                if row.company_id and row.period_end_date is not None
             ]
-            self.con.executemany(
+            if not payload:
+                return 0
+
+            stage_table = f"tmp_{table_name}_stage"
+            self.con.execute(
                 f"""
-                INSERT INTO {table_name} (
-                    company_id,
-                    cik,
-                    period_type,
-                    period_end_date,
-                    available_at,
-                    revenue,
-                    net_income,
-                    assets,
-                    liabilities,
-                    equity,
-                    operating_cash_flow,
-                    shares_outstanding,
-                    source_name,
-                    created_at
+                CREATE TEMP TABLE {stage_table} (
+                    company_id VARCHAR,
+                    cik VARCHAR,
+                    period_type VARCHAR,
+                    period_end_date DATE,
+                    available_at TIMESTAMP,
+                    revenue DOUBLE,
+                    net_income DOUBLE,
+                    assets DOUBLE,
+                    liabilities DOUBLE,
+                    equity DOUBLE,
+                    operating_cash_flow DOUBLE,
+                    shares_outstanding DOUBLE,
+                    source_name VARCHAR,
+                    created_at TIMESTAMP
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                payload,
+                """
             )
+            try:
+                self.con.executemany(
+                    f"""
+                    INSERT INTO {stage_table} (
+                        company_id,
+                        cik,
+                        period_type,
+                        period_end_date,
+                        available_at,
+                        revenue,
+                        net_income,
+                        assets,
+                        liabilities,
+                        equity,
+                        operating_cash_flow,
+                        shares_outstanding,
+                        source_name,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    payload,
+                )
+
+                self.con.execute(
+                    f"""
+                    DELETE FROM {table_name} AS target
+                    USING {stage_table} AS stage
+                    WHERE target.company_id = stage.company_id
+                      AND target.period_end_date = stage.period_end_date
+                    """
+                )
+
+                self.con.execute(
+                    f"""
+                    INSERT INTO {table_name} (
+                        company_id,
+                        cik,
+                        period_type,
+                        period_end_date,
+                        available_at,
+                        revenue,
+                        net_income,
+                        assets,
+                        liabilities,
+                        equity,
+                        operating_cash_flow,
+                        shares_outstanding,
+                        source_name,
+                        created_at
+                    )
+                    SELECT
+                        company_id,
+                        cik,
+                        period_type,
+                        period_end_date,
+                        available_at,
+                        revenue,
+                        net_income,
+                        assets,
+                        liabilities,
+                        equity,
+                        operating_cash_flow,
+                        shares_outstanding,
+                        source_name,
+                        created_at
+                    FROM (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY company_id, period_end_date
+                                ORDER BY available_at DESC NULLS LAST, created_at DESC NULLS LAST
+                            ) AS rn
+                        FROM {stage_table}
+                    ) x
+                    WHERE rn = 1
+                    """
+                )
+            finally:
+                self.con.execute(f"DROP TABLE IF EXISTS {stage_table}")
+
             return len(payload)
         except Exception as exc:
-            raise RepositoryError(f"failed to replace {table_name}: {exc}") from exc
+            raise RepositoryError(f"failed to upsert {table_name}: {exc}") from exc

@@ -11,6 +11,7 @@ from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManag
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_short_data_repository import DuckDbShortDataRepository
 from stock_quant.pipelines.short_data_pipeline import BuildShortDataPipeline
+from stock_quant.shared.exceptions import PipelineError
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +31,8 @@ def main() -> int:
         print(f"[build_short_data] db_path={config.db_path}")
 
     session_factory = DuckDbSessionFactory(config.db_path)
+
+    # Pass 1: ensure schemas exist/evolve
     with DuckDbUnitOfWork(session_factory) as uow:
         master_schema = MasterDataSchemaManager(uow)
         master_schema.initialize()
@@ -37,6 +40,8 @@ def main() -> int:
         short_schema = ShortDataSchemaManager(uow)
         short_schema.initialize()
 
+    # Pass 2: run the pipeline on a fresh connection
+    with DuckDbUnitOfWork(session_factory) as uow:
         repository = DuckDbShortDataRepository(uow)
         pipeline = BuildShortDataPipeline(repository=repository)
         result = pipeline.run()
@@ -46,4 +51,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except PipelineError as exc:
+        print(json.dumps({"status": "FAILED", "error": str(exc)}, indent=2, sort_keys=True))
+        raise SystemExit(1)
