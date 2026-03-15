@@ -25,6 +25,7 @@ class BuildFeatureEnginePipeline(BasePipeline):
         self._short_interest_pit_matches = 0
         self._short_volume_day_matches = 0
         self._news_day_matches = 0
+        self._research_universe_rows = 0
 
     @property
     def con(self):
@@ -39,9 +40,23 @@ class BuildFeatureEnginePipeline(BasePipeline):
         return None
 
     def validate(self, data) -> None:
-        count = self.con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0]
-        if int(count) == 0:
+        adjusted_count = int(
+            self.con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0]
+        )
+        if adjusted_count == 0:
             raise PipelineError("no rows available in price_bars_adjusted")
+
+        included_universe_count = int(
+            self.con.execute(
+                """
+                SELECT COUNT(*)
+                FROM research_universe
+                WHERE include_in_research_universe = TRUE
+                """
+            ).fetchone()[0]
+        )
+        if included_universe_count == 0:
+            raise PipelineError("no included rows available in research_universe")
 
     def load(self, data) -> None:
         con = self.con
@@ -50,6 +65,7 @@ class BuildFeatureEnginePipeline(BasePipeline):
         con.execute("DELETE FROM research_features_daily")
 
         for table_name in [
+            "tmp_research_universe_symbols",
             "tmp_price_base",
             "tmp_price_calendar",
             "tmp_technical_features",
@@ -61,6 +77,19 @@ class BuildFeatureEnginePipeline(BasePipeline):
 
         con.execute(
             """
+            CREATE TEMP TABLE tmp_research_universe_symbols AS
+            SELECT DISTINCT symbol
+            FROM research_universe
+            WHERE include_in_research_universe = TRUE
+            """
+        )
+
+        self._research_universe_rows = int(
+            con.execute("SELECT COUNT(*) FROM tmp_research_universe_symbols").fetchone()[0]
+        )
+
+        con.execute(
+            """
             CREATE TEMP TABLE tmp_price_base AS
             SELECT
                 p.instrument_id,
@@ -69,6 +98,8 @@ class BuildFeatureEnginePipeline(BasePipeline):
                 p.bar_date AS as_of_date,
                 CAST(p.adj_close AS DOUBLE) AS adj_close
             FROM price_bars_adjusted p
+            INNER JOIN tmp_research_universe_symbols ru
+              ON UPPER(TRIM(p.symbol)) = UPPER(TRIM(ru.symbol))
             LEFT JOIN instrument_master im
               ON p.instrument_id = im.instrument_id
             ORDER BY p.instrument_id, p.bar_date
@@ -417,6 +448,7 @@ class BuildFeatureEnginePipeline(BasePipeline):
     def finalize(self, result: PipelineResult) -> PipelineResult:
         result.rows_read = self._input_price_rows
         result.rows_written = self._technical_rows + self._research_rows
+        result.metrics["research_universe_rows"] = self._research_universe_rows
         result.metrics["input_price_rows"] = self._input_price_rows
         result.metrics["technical_feature_rows"] = self._technical_rows
         result.metrics["research_feature_rows"] = self._research_rows

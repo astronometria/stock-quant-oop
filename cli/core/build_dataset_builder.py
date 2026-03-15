@@ -10,6 +10,7 @@ from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFa
 from stock_quant.infrastructure.db.feature_engine_schema import FeatureEngineSchemaManager
 from stock_quant.infrastructure.db.label_engine_schema import LabelEngineSchemaManager
 from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
+from stock_quant.infrastructure.db.research_universe_schema import ResearchUniverseSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.pipelines.dataset_builder_pipeline import BuildDatasetBuilderPipeline
 
@@ -40,6 +41,7 @@ def main() -> int:
         FeatureEngineSchemaManager(uow).initialize()
         LabelEngineSchemaManager(uow).initialize()
         DatasetBuilderSchemaManager(uow).initialize()
+        ResearchUniverseSchemaManager(uow).initialize()
 
         pipeline = BuildDatasetBuilderPipeline(
             uow=uow,

@@ -36,6 +36,7 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         self._rows_read = 0
         self._dataset_rows = 0
         self._version_rows = 0
+        self._research_universe_rows = 0
 
     @property
     def con(self):
@@ -50,11 +51,31 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         return None
 
     def validate(self, data) -> None:
+        included_universe_count = int(
+            self.con.execute(
+                """
+                SELECT COUNT(*)
+                FROM research_universe
+                WHERE include_in_research_universe = TRUE
+                """
+            ).fetchone()[0]
+        )
+        if included_universe_count == 0:
+            raise PipelineError("no included rows available in research_universe")
+
         self._rows_read = int(
-            self.con.execute("SELECT COUNT(*) FROM research_features_daily").fetchone()[0]
+            self.con.execute(
+                """
+                SELECT COUNT(*)
+                FROM research_features_daily f
+                INNER JOIN research_universe ru
+                  ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
+                WHERE ru.include_in_research_universe = TRUE
+                """
+            ).fetchone()[0]
         )
         if self._rows_read == 0:
-            raise PipelineError("no rows available in research_features_daily")
+            raise PipelineError("no filtered rows available in research_features_daily")
 
     def load(self, data) -> None:
         con = self.con
@@ -75,7 +96,22 @@ class BuildDatasetBuilderPipeline(BasePipeline):
             [self.dataset_name, self.dataset_version],
         )
 
+        con.execute("DROP TABLE IF EXISTS tmp_research_universe_symbols")
         con.execute("DROP TABLE IF EXISTS tmp_dataset_joined")
+
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_research_universe_symbols AS
+            SELECT DISTINCT symbol
+            FROM research_universe
+            WHERE include_in_research_universe = TRUE
+            """
+        )
+
+        self._research_universe_rows = int(
+            con.execute("SELECT COUNT(*) FROM tmp_research_universe_symbols").fetchone()[0]
+        )
+
         con.execute(
             """
             CREATE TEMP TABLE tmp_dataset_joined AS
@@ -108,6 +144,8 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 v.realized_vol_20d,
                 CURRENT_TIMESTAMP AS created_at
             FROM research_features_daily f
+            INNER JOIN tmp_research_universe_symbols ru
+              ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
             LEFT JOIN return_labels_daily r
               ON f.instrument_id = r.instrument_id
              AND f.as_of_date = r.as_of_date
@@ -231,7 +269,7 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 [
                     self.dataset_name,
                     self.dataset_version,
-                    "default",
+                    "research_universe_conservative_v1",
                     max_as_of,
                     None,
                     None,
@@ -247,6 +285,7 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         result.rows_written = self._dataset_rows + self._version_rows
         result.metrics["dataset_name"] = self.dataset_name
         result.metrics["dataset_version"] = self.dataset_version
+        result.metrics["research_universe_rows"] = self._research_universe_rows
         result.metrics["dataset_rows"] = self._dataset_rows
         result.metrics["written_dataset_rows"] = self._dataset_rows
         result.metrics["written_dataset_version"] = self._version_rows

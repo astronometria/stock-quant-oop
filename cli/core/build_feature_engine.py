@@ -10,6 +10,7 @@ from stock_quant.infrastructure.db.feature_engine_schema import FeatureEngineSch
 from stock_quant.infrastructure.db.fundamentals_schema import FundamentalsSchemaManager
 from stock_quant.infrastructure.db.news_intelligence_schema import NewsIntelligenceSchemaManager
 from stock_quant.infrastructure.db.prices_research_schema import PricesResearchSchemaManager
+from stock_quant.infrastructure.db.research_universe_schema import ResearchUniverseSchemaManager
 from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_feature_engine_repository import DuckDbFeatureEngineRepository
@@ -39,6 +40,7 @@ def main() -> int:
         ShortDataSchemaManager(uow).initialize()
         NewsIntelligenceSchemaManager(uow).initialize()
         FeatureEngineSchemaManager(uow).initialize()
+        ResearchUniverseSchemaManager(uow).initialize()
 
         repository = DuckDbFeatureEngineRepository(uow)
         pipeline = BuildFeatureEnginePipeline(repository=repository)
