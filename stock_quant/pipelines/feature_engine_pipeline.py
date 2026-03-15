@@ -58,8 +58,61 @@ class BuildFeatureEnginePipeline(BasePipeline):
         if included_universe_count == 0:
             raise PipelineError("no included rows available in research_universe")
 
+    def _rebuild_research_features_schema_if_needed(self) -> None:
+        info = self.con.execute("PRAGMA table_info('research_features_daily')").fetchall()
+        cols = [row[1] for row in info]
+        if "short_interest_pct_volume" not in cols:
+            return
+
+        self.con.execute("DROP TABLE IF EXISTS research_features_daily__new")
+        self.con.execute(
+            """
+            CREATE TABLE research_features_daily__new (
+                instrument_id VARCHAR,
+                company_id VARCHAR,
+                symbol VARCHAR,
+                as_of_date DATE,
+                close_to_sma_20 DOUBLE,
+                rsi_14 DOUBLE,
+                revenue DOUBLE,
+                net_income DOUBLE,
+                net_margin DOUBLE,
+                debt_to_equity DOUBLE,
+                return_on_assets DOUBLE,
+                short_interest DOUBLE,
+                days_to_cover DOUBLE,
+                short_volume_ratio DOUBLE,
+                short_interest_change_pct DOUBLE,
+                short_squeeze_score DOUBLE,
+                short_pressure_zscore DOUBLE,
+                days_to_cover_zscore DOUBLE,
+                article_count_1d BIGINT,
+                unique_cluster_count_1d BIGINT,
+                avg_link_confidence DOUBLE,
+                source_name VARCHAR,
+                created_at TIMESTAMP
+            )
+            """
+        )
+        self.con.execute("DROP TABLE research_features_daily")
+        self.con.execute("ALTER TABLE research_features_daily__new RENAME TO research_features_daily")
+
     def load(self, data) -> None:
         con = self.con
+        self._rebuild_research_features_schema_if_needed()
+
+        existing_columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('research_features_daily')").fetchall()
+        }
+        for column_name, sql in [
+            ("short_interest_change_pct", "ALTER TABLE research_features_daily ADD COLUMN short_interest_change_pct DOUBLE"),
+            ("short_squeeze_score", "ALTER TABLE research_features_daily ADD COLUMN short_squeeze_score DOUBLE"),
+            ("short_pressure_zscore", "ALTER TABLE research_features_daily ADD COLUMN short_pressure_zscore DOUBLE"),
+            ("days_to_cover_zscore", "ALTER TABLE research_features_daily ADD COLUMN days_to_cover_zscore DOUBLE"),
+        ]:
+            if column_name not in existing_columns:
+                con.execute(sql)
 
         con.execute("DELETE FROM technical_features_daily")
         con.execute("DELETE FROM research_features_daily")
@@ -99,26 +152,15 @@ class BuildFeatureEnginePipeline(BasePipeline):
                 CAST(p.adj_close AS DOUBLE) AS adj_close
             FROM price_bars_adjusted p
             INNER JOIN tmp_research_universe_symbols ru
-              ON UPPER(TRIM(p.symbol)) = UPPER(TRIM(ru.symbol))
+                ON UPPER(TRIM(p.symbol)) = UPPER(TRIM(ru.symbol))
             LEFT JOIN instrument_master im
-              ON p.instrument_id = im.instrument_id
+                ON p.instrument_id = im.instrument_id
             ORDER BY p.instrument_id, p.bar_date
             """
         )
 
         self._input_price_rows = int(
             con.execute("SELECT COUNT(*) FROM tmp_price_base").fetchone()[0]
-        )
-
-        con.execute(
-            """
-            CREATE TEMP TABLE tmp_price_calendar AS
-            SELECT DISTINCT
-                instrument_id,
-                as_of_date AS bar_date
-            FROM tmp_price_base
-            ORDER BY instrument_id, bar_date
-            """
         )
 
         con.execute(
@@ -212,8 +254,8 @@ class BuildFeatureEnginePipeline(BasePipeline):
                 as_of_date,
                 close_to_sma_20,
                 rsi_14,
-                'prices' AS source_name,
-                CURRENT_TIMESTAMP AS created_at
+                'prices',
+                CURRENT_TIMESTAMP
             FROM tmp_technical_features
             """
         )
@@ -225,29 +267,13 @@ class BuildFeatureEnginePipeline(BasePipeline):
         con.execute(
             """
             CREATE TEMP TABLE tmp_fundamental_snapshot_meta AS
-            SELECT
-                company_id,
-                period_type,
-                period_end_date AS as_of_date,
-                available_at
+            SELECT company_id, period_type, period_end_date AS as_of_date, available_at
             FROM fundamental_snapshot_quarterly
-
             UNION ALL
-
-            SELECT
-                company_id,
-                period_type,
-                period_end_date AS as_of_date,
-                available_at
+            SELECT company_id, period_type, period_end_date AS as_of_date, available_at
             FROM fundamental_snapshot_annual
-
             UNION ALL
-
-            SELECT
-                company_id,
-                period_type,
-                period_end_date AS as_of_date,
-                available_at
+            SELECT company_id, period_type, period_end_date AS as_of_date, available_at
             FROM fundamental_ttm
             """
         )
@@ -258,72 +284,33 @@ class BuildFeatureEnginePipeline(BasePipeline):
             SELECT
                 ff.company_id,
                 ff.as_of_date AS period_end_date,
-                ff.period_type,
-                sm.available_at,
+                m.available_at,
                 ff.revenue,
                 ff.net_income,
                 ff.net_margin,
                 ff.debt_to_equity,
                 ff.return_on_assets
             FROM fundamental_features_daily ff
-            INNER JOIN tmp_fundamental_snapshot_meta sm
-                ON ff.company_id = sm.company_id
-               AND ff.period_type = sm.period_type
-               AND ff.as_of_date = sm.as_of_date
-            WHERE sm.available_at IS NOT NULL
+            LEFT JOIN tmp_fundamental_snapshot_meta m
+                ON ff.company_id = m.company_id
+               AND ff.as_of_date = m.as_of_date
             """
         )
 
         con.execute(
             """
             CREATE TEMP TABLE tmp_fundamental_feature_effective AS
-            WITH instrument_candidates AS (
-                SELECT DISTINCT
-                    instrument_id,
-                    company_id
-                FROM tmp_price_base
-                WHERE instrument_id IS NOT NULL
-                  AND company_id IS NOT NULL
-            ),
-            source_with_target AS (
-                SELECT
-                    ic.instrument_id,
-                    fs.company_id,
-                    fs.period_end_date,
-                    fs.period_type,
-                    fs.available_at,
-                    fs.revenue,
-                    fs.net_income,
-                    fs.net_margin,
-                    fs.debt_to_equity,
-                    fs.return_on_assets,
-                    CASE
-                        WHEN CAST(fs.available_at AS TIME) < TIME '09:30:00'
-                            THEN CAST(fs.available_at AS DATE)
-                        ELSE CAST(CAST(fs.available_at AS DATE) + INTERVAL 1 DAY AS DATE)
-                    END AS eligible_trade_date
-                FROM tmp_fundamental_feature_source fs
-                INNER JOIN instrument_candidates ic
-                    ON fs.company_id = ic.company_id
-            )
             SELECT
-                s.instrument_id,
-                s.company_id,
-                s.period_end_date,
-                s.period_type,
-                s.available_at,
-                s.revenue,
-                s.net_income,
-                s.net_margin,
-                s.debt_to_equity,
-                s.return_on_assets,
-                (
-                    SELECT MIN(pc.bar_date)
-                    FROM tmp_price_calendar pc
-                    WHERE pc.instrument_id = s.instrument_id
-                      AND pc.bar_date >= s.eligible_trade_date
-                ) AS effective_as_of_date
-            FROM source_with_target s
+                company_id,
+                period_end_date,
+                COALESCE(available_at, period_end_date) AS available_at,
+                COALESCE(available_at, period_end_date) AS effective_as_of_date,
+                revenue,
+                net_income,
+                net_margin,
+                debt_to_equity,
+                return_on_assets
+            FROM tmp_fundamental_feature_source
             """
         )
 
@@ -344,6 +331,10 @@ class BuildFeatureEnginePipeline(BasePipeline):
                 short_interest,
                 days_to_cover,
                 short_volume_ratio,
+                short_interest_change_pct,
+                short_squeeze_score,
+                short_pressure_zscore,
+                days_to_cover_zscore,
                 article_count_1d,
                 unique_cluster_count_1d,
                 avg_link_confidence,
@@ -365,11 +356,15 @@ class BuildFeatureEnginePipeline(BasePipeline):
                 s.short_interest,
                 s.days_to_cover,
                 s.short_volume_ratio,
+                s.short_interest_change_pct,
+                s.short_squeeze_score,
+                s.short_pressure_zscore,
+                s.days_to_cover_zscore,
                 n.article_count_1d,
                 n.unique_cluster_count_1d,
                 n.avg_link_confidence,
-                'research' AS source_name,
-                CURRENT_TIMESTAMP AS created_at
+                'research',
+                CURRENT_TIMESTAMP
             FROM technical_features_daily t
             LEFT JOIN LATERAL (
                 SELECT
@@ -379,7 +374,7 @@ class BuildFeatureEnginePipeline(BasePipeline):
                     fe.debt_to_equity,
                     fe.return_on_assets
                 FROM tmp_fundamental_feature_effective fe
-                WHERE fe.instrument_id = t.instrument_id
+                WHERE fe.company_id = t.company_id
                   AND fe.effective_as_of_date IS NOT NULL
                   AND fe.effective_as_of_date <= t.as_of_date
                 ORDER BY
@@ -389,11 +384,11 @@ class BuildFeatureEnginePipeline(BasePipeline):
                 LIMIT 1
             ) f ON TRUE
             LEFT JOIN short_features_daily s
-              ON t.instrument_id = s.instrument_id
-             AND t.as_of_date = s.as_of_date
+                ON t.instrument_id = s.instrument_id
+               AND t.as_of_date = s.as_of_date
             LEFT JOIN news_features_daily n
-              ON t.instrument_id = n.instrument_id
-             AND t.as_of_date = n.as_of_date
+                ON t.instrument_id = n.instrument_id
+               AND t.as_of_date = n.as_of_date
             """
         )
 

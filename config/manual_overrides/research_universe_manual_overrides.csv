@@ -1,0 +1,5 @@
+symbol,include_in_research_universe,override_reason
+AACIU,false,manual_exclude_unit
+AACOU,false,manual_exclude_unit
+AAPW,false,manual_exclude_warrant
+XYZ,true,manual_include_reviewed

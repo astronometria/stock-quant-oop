@@ -69,7 +69,7 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 SELECT COUNT(*)
                 FROM research_features_daily f
                 INNER JOIN research_universe ru
-                  ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
+                    ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
                 WHERE ru.include_in_research_universe = TRUE
                 """
             ).fetchone()[0]
@@ -77,8 +77,69 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         if self._rows_read == 0:
             raise PipelineError("no filtered rows available in research_features_daily")
 
+    def _rebuild_dataset_schema_if_needed(self) -> None:
+        info = self.con.execute("PRAGMA table_info('research_dataset_daily')").fetchall()
+        cols = [row[1] for row in info]
+        if "short_interest_pct_volume" not in cols:
+            return
+
+        self.con.execute("DROP TABLE IF EXISTS research_dataset_daily__new")
+        self.con.execute(
+            """
+            CREATE TABLE research_dataset_daily__new (
+                dataset_name VARCHAR,
+                dataset_version VARCHAR,
+                instrument_id VARCHAR,
+                company_id VARCHAR,
+                symbol VARCHAR,
+                as_of_date DATE,
+                close_to_sma_20 DOUBLE,
+                rsi_14 DOUBLE,
+                revenue DOUBLE,
+                net_income DOUBLE,
+                net_margin DOUBLE,
+                debt_to_equity DOUBLE,
+                return_on_assets DOUBLE,
+                short_interest DOUBLE,
+                days_to_cover DOUBLE,
+                short_volume_ratio DOUBLE,
+                article_count_1d BIGINT,
+                unique_cluster_count_1d BIGINT,
+                avg_link_confidence DOUBLE,
+                fwd_return_1d DOUBLE,
+                fwd_return_5d DOUBLE,
+                fwd_return_20d DOUBLE,
+                direction_1d INTEGER,
+                direction_5d INTEGER,
+                direction_20d INTEGER,
+                realized_vol_20d DOUBLE,
+                created_at TIMESTAMP,
+                short_squeeze_score DOUBLE,
+                short_pressure_zscore DOUBLE,
+                days_to_cover_zscore DOUBLE,
+                short_interest_change_pct DOUBLE
+            )
+            """
+        )
+        self.con.execute("DROP TABLE research_dataset_daily")
+        self.con.execute("ALTER TABLE research_dataset_daily__new RENAME TO research_dataset_daily")
+
     def load(self, data) -> None:
         con = self.con
+        self._rebuild_dataset_schema_if_needed()
+
+        existing_columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('research_dataset_daily')").fetchall()
+        }
+        for column_name, sql in [
+            ("short_interest_change_pct", "ALTER TABLE research_dataset_daily ADD COLUMN short_interest_change_pct DOUBLE"),
+            ("short_squeeze_score", "ALTER TABLE research_dataset_daily ADD COLUMN short_squeeze_score DOUBLE"),
+            ("short_pressure_zscore", "ALTER TABLE research_dataset_daily ADD COLUMN short_pressure_zscore DOUBLE"),
+            ("days_to_cover_zscore", "ALTER TABLE research_dataset_daily ADD COLUMN days_to_cover_zscore DOUBLE"),
+        ]:
+            if column_name not in existing_columns:
+                con.execute(sql)
 
         con.execute(
             """
@@ -142,16 +203,20 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 r.direction_5d,
                 r.direction_20d,
                 v.realized_vol_20d,
-                CURRENT_TIMESTAMP AS created_at
+                CURRENT_TIMESTAMP AS created_at,
+                f.short_squeeze_score,
+                f.short_pressure_zscore,
+                f.days_to_cover_zscore,
+                f.short_interest_change_pct
             FROM research_features_daily f
             INNER JOIN tmp_research_universe_symbols ru
-              ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
+                ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
             LEFT JOIN return_labels_daily r
-              ON f.instrument_id = r.instrument_id
-             AND f.as_of_date = r.as_of_date
+                ON f.instrument_id = r.instrument_id
+               AND f.as_of_date = r.as_of_date
             LEFT JOIN volatility_labels_daily v
-              ON f.instrument_id = v.instrument_id
-             AND f.as_of_date = v.as_of_date
+                ON f.instrument_id = v.instrument_id
+               AND f.as_of_date = v.as_of_date
             """,
             [self.dataset_name, self.dataset_version],
         )
@@ -185,7 +250,11 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 direction_5d,
                 direction_20d,
                 realized_vol_20d,
-                created_at
+                created_at,
+                short_squeeze_score,
+                short_pressure_zscore,
+                days_to_cover_zscore,
+                short_interest_change_pct
             )
             SELECT
                 dataset_name,
@@ -214,7 +283,11 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 direction_5d,
                 direction_20d,
                 realized_vol_20d,
-                created_at
+                created_at,
+                short_squeeze_score,
+                short_pressure_zscore,
+                days_to_cover_zscore,
+                short_interest_change_pct
             FROM tmp_dataset_joined
             """
         )
@@ -258,23 +331,17 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                     dataset_version,
                     universe_name,
                     as_of_date,
-                    feature_run_id,
-                    label_run_id,
                     row_count,
-                    config_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
                     self.dataset_name,
                     self.dataset_version,
-                    "research_universe_conservative_v1",
+                    "research_universe",
                     max_as_of,
-                    None,
-                    None,
                     self._dataset_rows,
-                    "{}",
                     datetime.utcnow(),
                 ],
             )
@@ -285,8 +352,8 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         result.rows_written = self._dataset_rows + self._version_rows
         result.metrics["dataset_name"] = self.dataset_name
         result.metrics["dataset_version"] = self.dataset_version
-        result.metrics["research_universe_rows"] = self._research_universe_rows
         result.metrics["dataset_rows"] = self._dataset_rows
+        result.metrics["research_universe_rows"] = self._research_universe_rows
         result.metrics["written_dataset_rows"] = self._dataset_rows
         result.metrics["written_dataset_version"] = self._version_rows
         return result

@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+from stock_quant.app.dto.pipeline_result import PipelineResult
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+from stock_quant.pipelines.base_pipeline import BasePipeline
+from stock_quant.shared.exceptions import PipelineError
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+class BuildShortDataPipeline(BasePipeline):
+
+    pipeline_name = "build_short_data"
+
+    def __init__(self, repository=None, uow: DuckDbUnitOfWork | None = None):
+
+        if repository is not None:
+            self.uow = repository.uow
+        else:
+            self.uow = uow
+
+        if self.uow is None:
+            raise ValueError("BuildShortDataPipeline requires repository or uow")
+
+        self._metrics: dict[str, int] = {}
+        self._rows_written = 0
+        self._progress_total_steps = 7
+
+    @property
+    def con(self):
+
+        if self.uow.connection is None:
+            raise PipelineError("active DB connection required")
+
+        return self.uow.connection
+
+    def extract(self):
+        return None
+
+    def transform(self, data):
+        return None
+
+    def validate(self, data):
+
+        short_interest_rows = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM short_interest_history"
+            ).fetchone()[0]
+        )
+
+        short_volume_rows = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM finra_daily_short_volume_source_raw"
+            ).fetchone()[0]
+        )
+
+        if short_interest_rows == 0:
+            raise PipelineError(
+                "short_interest_history is empty — run build_finra_short_interest first"
+            )
+
+        if short_volume_rows == 0:
+            raise PipelineError(
+                "daily short volume raw table empty"
+            )
+
+    def _log_step(self, step_no: int, label: str):
+
+        print(
+            f"[build_short_data] step {step_no}/{self._progress_total_steps}: {label}",
+            flush=True,
+        )
+
+    def load(self, data):
+
+        con = self.con
+
+        short_interest_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM short_interest_history"
+            ).fetchone()[0]
+        )
+
+        short_volume_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM finra_daily_short_volume_source_raw"
+            ).fetchone()[0]
+        )
+
+        progress = tqdm(
+            total=self._progress_total_steps,
+            desc="build_short_data",
+            unit="step",
+            dynamic_ncols=True,
+            mininterval=0.2,
+        )
+
+        # ---------------------------------------------------------
+        # reset tables
+        # ---------------------------------------------------------
+
+        self._log_step(1, "reset target tables")
+
+        con.execute("DELETE FROM daily_short_volume_history")
+        con.execute("DELETE FROM short_features_daily")
+
+        progress.update(1)
+
+        # ---------------------------------------------------------
+        # ticker map
+        # ---------------------------------------------------------
+
+        self._log_step(2, "build ticker map")
+
+        con.execute("DROP TABLE IF EXISTS tmp_ticker_map")
+
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_ticker_map AS
+            SELECT
+                UPPER(TRIM(th.symbol)) AS symbol_key,
+                th.symbol,
+                th.instrument_id,
+                im.company_id,
+                th.valid_from,
+                COALESCE(th.valid_to, DATE '9999-12-31') AS valid_to,
+                th.is_current
+            FROM ticker_history th
+            LEFT JOIN instrument_master im
+                ON th.instrument_id = im.instrument_id
+            WHERE th.symbol IS NOT NULL
+            """
+        )
+
+        progress.update(1)
+
+        # ---------------------------------------------------------
+        # build daily short volume history
+        # ---------------------------------------------------------
+
+        self._log_step(3, "build daily short volume history")
+
+        con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_base")
+
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_daily_short_volume_base AS
+            WITH ranked AS (
+                SELECT
+                    m.instrument_id,
+                    m.company_id,
+                    COALESCE(m.symbol, UPPER(TRIM(r.symbol))) AS symbol,
+                    r.trade_date,
+                    CAST(r.short_volume AS DOUBLE) AS short_volume,
+                    CAST(r.total_volume AS DOUBLE) AS total_volume,
+                    CASE
+                        WHEN r.total_volume <> 0
+                        THEN r.short_volume / r.total_volume
+                        ELSE NULL
+                    END AS short_volume_ratio,
+                    r.source_name,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(r.symbol)), r.trade_date
+                        ORDER BY m.valid_from DESC NULLS LAST
+                    ) AS rn
+                FROM finra_daily_short_volume_source_raw r
+                LEFT JOIN tmp_ticker_map m
+                    ON UPPER(TRIM(r.symbol)) = m.symbol_key
+                    AND r.trade_date BETWEEN m.valid_from AND m.valid_to
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn = 1
+            """
+        )
+
+        con.execute(
+            """
+            INSERT INTO daily_short_volume_history
+            SELECT
+                instrument_id,
+                company_id,
+                symbol,
+                trade_date,
+                short_volume,
+                total_volume,
+                short_volume_ratio,
+                source_name,
+                CURRENT_TIMESTAMP
+            FROM tmp_daily_short_volume_base
+            """
+        )
+
+        progress.update(1)
+
+        # ---------------------------------------------------------
+        # resolve settlement mapping
+        # ---------------------------------------------------------
+
+        self._log_step(4, "resolve settlement date mapping")
+
+        con.execute("DROP TABLE IF EXISTS tmp_short_interest_match_dates")
+
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_short_interest_match_dates AS
+            SELECT
+                d.symbol,
+                d.trade_date,
+                MAX(s.settlement_date) AS settlement_date
+            FROM tmp_daily_short_volume_base d
+            LEFT JOIN short_interest_history s
+                ON d.symbol = s.symbol
+                AND s.settlement_date <= d.trade_date
+            GROUP BY
+                d.symbol,
+                d.trade_date
+            """
+        )
+
+        progress.update(1)
+
+        # ---------------------------------------------------------
+        # join short interest
+        # ---------------------------------------------------------
+
+        self._log_step(5, "join short interest")
+
+        con.execute("DROP TABLE IF EXISTS tmp_short_interest_join")
+
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_short_interest_join AS
+            SELECT
+                d.*,
+                s.short_interest,
+                s.avg_daily_volume,
+                s.days_to_cover,
+                s.previous_short_interest
+            FROM tmp_daily_short_volume_base d
+            LEFT JOIN tmp_short_interest_match_dates m
+                ON d.symbol = m.symbol
+                AND d.trade_date = m.trade_date
+            LEFT JOIN short_interest_history s
+                ON d.symbol = s.symbol
+                AND s.settlement_date = m.settlement_date
+            """
+        )
+
+        progress.update(1)
+
+        # ---------------------------------------------------------
+        # build features
+        # ---------------------------------------------------------
+
+        self._log_step(6, "build short features")
+
+        con.execute(
+            """
+            INSERT INTO short_features_daily
+            SELECT
+                instrument_id,
+                company_id,
+                symbol,
+                trade_date,
+                short_interest,
+                avg_daily_volume,
+                days_to_cover,
+                short_volume,
+                total_volume,
+                short_volume_ratio,
+                short_interest - previous_short_interest,
+                source_name,
+                CURRENT_TIMESTAMP
+            FROM tmp_short_interest_join
+            """
+        )
+
+        progress.update(1)
+
+        # ---------------------------------------------------------
+        # metrics
+        # ---------------------------------------------------------
+
+        self._log_step(7, "collect metrics")
+
+        short_feature_rows = int(
+            con.execute(
+                "SELECT COUNT(*) FROM short_features_daily"
+            ).fetchone()[0]
+        )
+
+        progress.update(1)
+        progress.close()
+
+        self._rows_written = short_feature_rows
+
+        self._metrics = {
+            "short_interest_history_rows": short_interest_rows,
+            "daily_short_volume_raw_rows": short_volume_rows,
+            "short_feature_rows": short_feature_rows,
+        }
+
+    def finalize(self, result: PipelineResult):
+
+        result.rows_written = self._rows_written
+        result.metrics.update(self._metrics)
+
+        return result
+

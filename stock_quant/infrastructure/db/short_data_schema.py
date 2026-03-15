@@ -69,11 +69,30 @@ class ShortDataSchemaManager:
                 total_volume DOUBLE,
                 short_volume_ratio DOUBLE,
                 short_interest_change DOUBLE,
+                short_interest_change_pct DOUBLE,
+                short_squeeze_score DOUBLE,
+                short_pressure_zscore DOUBLE,
+                days_to_cover_zscore DOUBLE,
                 source_name VARCHAR,
                 created_at TIMESTAMP
             )
             """
         )
+
+        existing_columns = {
+            row[1]
+            for row in self.con.execute("PRAGMA table_info('short_features_daily')").fetchall()
+        }
+
+        alter_statements = [
+            ("short_interest_change_pct", "ALTER TABLE short_features_daily ADD COLUMN short_interest_change_pct DOUBLE"),
+            ("short_squeeze_score", "ALTER TABLE short_features_daily ADD COLUMN short_squeeze_score DOUBLE"),
+            ("short_pressure_zscore", "ALTER TABLE short_features_daily ADD COLUMN short_pressure_zscore DOUBLE"),
+            ("days_to_cover_zscore", "ALTER TABLE short_features_daily ADD COLUMN days_to_cover_zscore DOUBLE"),
+        ]
+        for column_name, sql in alter_statements:
+            if column_name not in existing_columns:
+                self.con.execute(sql)
 
     def _create_finra_daily_short_volume_source_raw(self) -> None:
         self.con.execute(

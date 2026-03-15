@@ -15,6 +15,7 @@ class ResearchUniverseSchemaManager:
 
     def initialize(self) -> None:
         self._create_research_universe()
+        self._create_research_universe_manual_overrides()
 
     def _create_research_universe(self) -> None:
         self.con.execute(
@@ -30,6 +31,21 @@ class ResearchUniverseSchemaManager:
                 is_preferred_candidate BOOLEAN,
                 include_in_research_universe BOOLEAN,
                 exclusion_reason VARCHAR,
+                manual_override_applied BOOLEAN,
+                manual_override_include BOOLEAN,
+                manual_override_reason VARCHAR,
+                created_at TIMESTAMP
+            )
+            """
+        )
+
+    def _create_research_universe_manual_overrides(self) -> None:
+        self.con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS research_universe_manual_overrides (
+                symbol VARCHAR,
+                include_in_research_universe BOOLEAN,
+                override_reason VARCHAR,
                 created_at TIMESTAMP
             )
             """
