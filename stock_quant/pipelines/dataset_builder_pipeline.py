@@ -32,6 +32,8 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         self.dataset_name = dataset_name
         self.dataset_version = dataset_version
         self.version_service = DatasetVersionService()
+
+        self._rows_read = 0
         self._dataset_rows = 0
         self._version_rows = 0
 
@@ -48,46 +50,35 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         return None
 
     def validate(self, data) -> None:
-        count = self.con.execute("SELECT COUNT(*) FROM research_features_daily").fetchone()[0]
-        if int(count) == 0:
+        self._rows_read = int(
+            self.con.execute("SELECT COUNT(*) FROM research_features_daily").fetchone()[0]
+        )
+        if self._rows_read == 0:
             raise PipelineError("no rows available in research_features_daily")
 
     def load(self, data) -> None:
         con = self.con
 
-        con.execute("DELETE FROM research_dataset_daily")
+        con.execute(
+            """
+            DELETE FROM research_dataset_daily
+            WHERE dataset_name = ? AND dataset_version = ?
+            """,
+            [self.dataset_name, self.dataset_version],
+        )
 
         con.execute(
             """
-            INSERT INTO research_dataset_daily (
-                dataset_name,
-                dataset_version,
-                instrument_id,
-                company_id,
-                symbol,
-                as_of_date,
-                close_to_sma_20,
-                rsi_14,
-                revenue,
-                net_income,
-                net_margin,
-                debt_to_equity,
-                return_on_assets,
-                short_interest,
-                days_to_cover,
-                short_volume_ratio,
-                article_count_1d,
-                unique_cluster_count_1d,
-                avg_link_confidence,
-                fwd_return_1d,
-                fwd_return_5d,
-                fwd_return_20d,
-                direction_1d,
-                direction_5d,
-                direction_20d,
-                realized_vol_20d,
-                created_at
-            )
+            DELETE FROM dataset_versions
+            WHERE dataset_name = ? AND dataset_version = ?
+            """,
+            [self.dataset_name, self.dataset_version],
+        )
+
+        con.execute("DROP TABLE IF EXISTS tmp_dataset_joined")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_dataset_joined AS
             SELECT
                 ? AS dataset_name,
                 ? AS dataset_version,
@@ -127,13 +118,91 @@ class BuildDatasetBuilderPipeline(BasePipeline):
             [self.dataset_name, self.dataset_version],
         )
 
+        con.execute(
+            """
+            INSERT INTO research_dataset_daily (
+                dataset_name,
+                dataset_version,
+                instrument_id,
+                company_id,
+                symbol,
+                as_of_date,
+                close_to_sma_20,
+                rsi_14,
+                revenue,
+                net_income,
+                net_margin,
+                debt_to_equity,
+                return_on_assets,
+                short_interest,
+                days_to_cover,
+                short_volume_ratio,
+                article_count_1d,
+                unique_cluster_count_1d,
+                avg_link_confidence,
+                fwd_return_1d,
+                fwd_return_5d,
+                fwd_return_20d,
+                direction_1d,
+                direction_5d,
+                direction_20d,
+                realized_vol_20d,
+                created_at
+            )
+            SELECT
+                dataset_name,
+                dataset_version,
+                instrument_id,
+                company_id,
+                symbol,
+                as_of_date,
+                close_to_sma_20,
+                rsi_14,
+                revenue,
+                net_income,
+                net_margin,
+                debt_to_equity,
+                return_on_assets,
+                short_interest,
+                days_to_cover,
+                short_volume_ratio,
+                article_count_1d,
+                unique_cluster_count_1d,
+                avg_link_confidence,
+                fwd_return_1d,
+                fwd_return_5d,
+                fwd_return_20d,
+                direction_1d,
+                direction_5d,
+                direction_20d,
+                realized_vol_20d,
+                created_at
+            FROM tmp_dataset_joined
+            """
+        )
+
         self._dataset_rows = int(
-            con.execute("SELECT COUNT(*) FROM research_dataset_daily").fetchone()[0]
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM research_dataset_daily
+                WHERE dataset_name = ? AND dataset_version = ?
+                """,
+                [self.dataset_name, self.dataset_version],
+            ).fetchone()[0]
         )
 
         max_as_of = con.execute(
-            "SELECT MAX(as_of_date) FROM research_dataset_daily"
+            """
+            SELECT MAX(as_of_date)
+            FROM research_dataset_daily
+            WHERE dataset_name = ? AND dataset_version = ?
+            """,
+            [self.dataset_name, self.dataset_version],
         ).fetchone()[0]
+
+        if max_as_of is None:
+            raise PipelineError("dataset build produced zero rows")
 
         if self.repository is not None:
             version_row = self.version_service.build_dataset_version(
@@ -174,9 +243,11 @@ class BuildDatasetBuilderPipeline(BasePipeline):
             self._version_rows = 1
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
-        result.rows_read = self._dataset_rows
+        result.rows_read = self._rows_read
         result.rows_written = self._dataset_rows + self._version_rows
-        result.metrics["research_dataset_rows"] = self._dataset_rows
+        result.metrics["dataset_name"] = self.dataset_name
+        result.metrics["dataset_version"] = self.dataset_version
+        result.metrics["dataset_rows"] = self._dataset_rows
         result.metrics["written_dataset_rows"] = self._dataset_rows
         result.metrics["written_dataset_version"] = self._version_rows
         return result

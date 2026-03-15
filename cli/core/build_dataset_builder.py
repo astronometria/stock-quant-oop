@@ -11,7 +11,6 @@ from stock_quant.infrastructure.db.feature_engine_schema import FeatureEngineSch
 from stock_quant.infrastructure.db.label_engine_schema import LabelEngineSchemaManager
 from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.repositories.duckdb_dataset_builder_repository import DuckDbDatasetBuilderRepository
 from stock_quant.pipelines.dataset_builder_pipeline import BuildDatasetBuilderPipeline
 
 
@@ -42,9 +41,8 @@ def main() -> int:
         LabelEngineSchemaManager(uow).initialize()
         DatasetBuilderSchemaManager(uow).initialize()
 
-        repository = DuckDbDatasetBuilderRepository(uow)
         pipeline = BuildDatasetBuilderPipeline(
-            repository=repository,
+            uow=uow,
             dataset_name=args.dataset_name,
             dataset_version=args.dataset_version,
         )
