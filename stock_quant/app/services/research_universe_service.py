@@ -4,9 +4,6 @@ from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 
 
 class ResearchUniverseService:
-    RESEARCH_UNIVERSE_NAME = "research_universe"
-    RESEARCH_UNIVERSE_SOURCE = "research_universe_service"
-
     def __init__(self, uow: DuckDbUnitOfWork) -> None:
         self.uow = uow
 
@@ -16,24 +13,30 @@ class ResearchUniverseService:
             raise RuntimeError("active DB connection is required")
         return self.uow.connection
 
-    def rebuild_conservative_research_universe(self) -> dict[str, int]:
+    def _resolve_snapshot_date(self) -> object:
+        row = self.con.execute(
+            """
+            SELECT MAX(price_date)
+            FROM price_source_daily_raw_all
+            WHERE asset_class = 'STOCK'
+              AND venue_group IN ('NASDAQ', 'NYSE', 'NYSEMKT')
+            """
+        ).fetchone()
+        snapshot_date = row[0] if row else None
+        if snapshot_date is None:
+            raise RuntimeError("unable to resolve research universe snapshot date from price_source_daily_raw_all")
+        return snapshot_date
+
+    def _build_current_snapshot(self) -> dict[str, int]:
         con = self.con
 
         con.execute("DELETE FROM research_universe")
-
-        for table_name in [
-            "tmp_stock_base",
-            "tmp_adr_symbols",
-            "tmp_suffix_candidates",
-            "tmp_suffix_exclusions",
-            "tmp_manual_overrides",
-            "tmp_research_universe_base",
-            "tmp_research_universe_snapshot",
-            "tmp_research_universe_snapshot_resolved",
-            "tmp_current_research_membership_open",
-            "tmp_current_research_membership_changed",
-        ]:
-            con.execute(f"DROP TABLE IF EXISTS {table_name}")
+        con.execute("DROP TABLE IF EXISTS tmp_stock_base")
+        con.execute("DROP TABLE IF EXISTS tmp_adr_symbols")
+        con.execute("DROP TABLE IF EXISTS tmp_suffix_candidates")
+        con.execute("DROP TABLE IF EXISTS tmp_suffix_exclusions")
+        con.execute("DROP TABLE IF EXISTS tmp_manual_overrides")
+        con.execute("DROP TABLE IF EXISTS tmp_research_universe_base")
 
         con.execute(
             """
@@ -73,7 +76,7 @@ class ResearchUniverseService:
             CREATE TEMP TABLE tmp_adr_symbols AS
             SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
             FROM instrument_master
-            WHERE UPPER(TRIM(COALESCE(security_type, ''))) = 'ADR'
+            WHERE UPPER(TRIM(COALESCE(security_type, instrument_type, ''))) = 'ADR'
               AND symbol IS NOT NULL
               AND TRIM(symbol) <> ''
             """
@@ -207,18 +210,11 @@ class ResearchUniverseService:
             """
         )
 
-        stock_base_count = int(
-            con.execute("SELECT COUNT(*) FROM tmp_stock_base").fetchone()[0]
-        )
-        adr_count = int(
-            con.execute("SELECT COUNT(*) FROM tmp_adr_symbols").fetchone()[0]
-        )
-        suffix_exclusion_count = int(
-            con.execute("SELECT COUNT(*) FROM tmp_suffix_exclusions").fetchone()[0]
-        )
-        manual_override_count = int(
-            con.execute("SELECT COUNT(*) FROM tmp_manual_overrides").fetchone()[0]
-        )
+        stock_base_count = int(con.execute("SELECT COUNT(*) FROM tmp_stock_base").fetchone()[0])
+        adr_count = int(con.execute("SELECT COUNT(*) FROM tmp_adr_symbols").fetchone()[0])
+        suffix_exclusion_count = int(con.execute("SELECT COUNT(*) FROM tmp_suffix_exclusions").fetchone()[0])
+        manual_override_count = int(con.execute("SELECT COUNT(*) FROM tmp_manual_overrides").fetchone()[0])
+
         manual_exclusion_count = int(
             con.execute(
                 """
@@ -229,6 +225,7 @@ class ResearchUniverseService:
                 """
             ).fetchone()[0]
         )
+
         included_count = int(
             con.execute(
                 """
@@ -238,113 +235,58 @@ class ResearchUniverseService:
                 """
             ).fetchone()[0]
         )
-        total_rows = int(
-            con.execute("SELECT COUNT(*) FROM research_universe").fetchone()[0]
-        )
 
-        snapshot_price_date = con.execute(
-            """
-            SELECT MAX(price_date)
-            FROM price_source_daily_raw_all
-            WHERE asset_class = 'STOCK'
-              AND venue_group IN ('NASDAQ', 'NYSE', 'NYSEMKT')
-            """
-        ).fetchone()[0]
-        if snapshot_price_date is None:
-            raise RuntimeError("unable to derive research universe snapshot date from price_source_daily_raw_all")
+        total_rows = int(con.execute("SELECT COUNT(*) FROM research_universe").fetchone()[0])
 
+        return {
+            "stock_base_count": stock_base_count,
+            "adr_count": adr_count,
+            "derived_suffix_exclusion_count": suffix_exclusion_count,
+            "manual_override_count": manual_override_count,
+            "manual_exclusion_count": manual_exclusion_count,
+            "research_universe_rows": total_rows,
+            "included_research_universe_rows": included_count,
+            "preferred_auto_exclusions": 0,
+        }
+
+    def _refresh_membership_history(self, snapshot_date: object) -> dict[str, int]:
+        con = self.con
+
+        con.execute("DROP TABLE IF EXISTS tmp_research_universe_history_snapshot")
         con.execute(
             """
-            CREATE TEMP TABLE tmp_research_universe_snapshot AS
+            CREATE TEMP TABLE tmp_research_universe_history_snapshot AS
             SELECT
+                im.instrument_id,
+                im.company_id,
                 ru.symbol,
-                ru.include_in_research_universe,
-                ru.exclusion_reason,
-                ru.manual_override_applied,
-                ru.manual_override_include,
-                ru.manual_override_reason,
-                ?::DATE AS snapshot_date,
+                'research_universe' AS universe_name,
+                CAST(? AS DATE) AS effective_from,
+                CAST(NULL AS DATE) AS effective_to,
                 CASE
                     WHEN ru.include_in_research_universe THEN 'ACTIVE'
                     ELSE 'EXCLUDED'
                 END AS membership_status,
                 CASE
-                    WHEN ru.include_in_research_universe THEN COALESCE(ru.manual_override_reason, 'included')
-                    ELSE COALESCE(ru.manual_override_reason, ru.exclusion_reason, 'excluded')
-                END AS membership_reason
+                    WHEN ru.include_in_research_universe THEN 'included'
+                    ELSE COALESCE(ru.exclusion_reason, 'excluded')
+                END AS reason,
+                'research_universe_service' AS source_name
             FROM research_universe ru
+            LEFT JOIN instrument_master im
+                ON UPPER(TRIM(im.symbol)) = UPPER(TRIM(ru.symbol))
             WHERE ru.symbol IS NOT NULL
               AND TRIM(ru.symbol) <> ''
-            """,
-            [snapshot_price_date],
-        )
-
-        con.execute(
             """
-            CREATE TEMP TABLE tmp_research_universe_snapshot_resolved AS
-            WITH th_ranked AS (
-                SELECT
-                    s.symbol,
-                    s.snapshot_date,
-                    th.instrument_id,
-                    COALESCE(th.company_id, im.company_id) AS company_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY s.symbol, s.snapshot_date
-                        ORDER BY
-                            COALESCE(th.is_primary, FALSE) DESC,
-                            th.valid_from DESC NULLS LAST,
-                            th.created_at DESC NULLS LAST
-                    ) AS rn
-                FROM tmp_research_universe_snapshot s
-                LEFT JOIN ticker_history th
-                    ON UPPER(TRIM(s.symbol)) = UPPER(TRIM(th.symbol))
-                   AND s.snapshot_date BETWEEN th.valid_from AND COALESCE(th.valid_to, DATE '9999-12-31')
-                LEFT JOIN instrument_master im
-                    ON th.instrument_id = im.instrument_id
-            ),
-            im_fallback AS (
-                SELECT
-                    UPPER(TRIM(symbol)) AS symbol_key,
-                    instrument_id,
-                    company_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY UPPER(TRIM(symbol))
-                        ORDER BY
-                            COALESCE(is_active, FALSE) DESC,
-                            COALESCE(listing_date, DATE '1900-01-01') DESC,
-                            created_at DESC NULLS LAST
-                    ) AS rn
-                FROM instrument_master
-                WHERE symbol IS NOT NULL
-                  AND TRIM(symbol) <> ''
-            )
-            SELECT
-                COALESCE(t.instrument_id, f.instrument_id) AS instrument_id,
-                COALESCE(t.company_id, f.company_id) AS company_id,
-                s.symbol,
-                ?::VARCHAR AS universe_name,
-                s.snapshot_date AS effective_from,
-                CAST(NULL AS DATE) AS effective_to,
-                s.membership_status,
-                s.membership_reason AS reason,
-                ?::VARCHAR AS source_name
-            FROM tmp_research_universe_snapshot s
-            LEFT JOIN th_ranked t
-                ON s.symbol = t.symbol
-               AND s.snapshot_date = t.snapshot_date
-               AND t.rn = 1
-            LEFT JOIN im_fallback f
-                ON UPPER(TRIM(s.symbol)) = f.symbol_key
-               AND f.rn = 1
-            """,
-            [self.RESEARCH_UNIVERSE_NAME, self.RESEARCH_UNIVERSE_SOURCE],
+            ,
+            [snapshot_date],
         )
 
-        unresolved_membership_rows = int(
+        unresolved_rows = int(
             con.execute(
                 """
                 SELECT COUNT(*)
-                FROM tmp_research_universe_snapshot_resolved
+                FROM tmp_research_universe_history_snapshot
                 WHERE instrument_id IS NULL
                 """
             ).fetchone()[0]
@@ -353,74 +295,47 @@ class ResearchUniverseService:
         con.execute(
             """
             DELETE FROM universe_membership_history
-            WHERE LOWER(TRIM(universe_name)) = LOWER(TRIM(?))
-              AND effective_from = ?
+            WHERE LOWER(TRIM(universe_name)) IN ('research', 'research_universe')
+              AND effective_from = CAST(? AS DATE)
             """,
-            [self.RESEARCH_UNIVERSE_NAME, snapshot_price_date],
-        )
-
-        con.execute(
-            """
-            CREATE TEMP TABLE tmp_current_research_membership_open AS
-            SELECT
-                instrument_id,
-                company_id,
-                symbol,
-                universe_name,
-                effective_from,
-                effective_to,
-                membership_status,
-                reason,
-                source_name
-            FROM universe_membership_history
-            WHERE LOWER(TRIM(universe_name)) = LOWER(TRIM(?))
-              AND effective_to IS NULL
-            """,
-            [self.RESEARCH_UNIVERSE_NAME],
-        )
-
-        con.execute(
-            """
-            CREATE TEMP TABLE tmp_current_research_membership_changed AS
-            SELECT
-                cur.instrument_id,
-                cur.company_id,
-                cur.symbol,
-                cur.universe_name,
-                cur.effective_from,
-                cur.effective_to,
-                cur.membership_status,
-                cur.reason,
-                cur.source_name
-            FROM tmp_current_research_membership_open cur
-            INNER JOIN tmp_research_universe_snapshot_resolved snap
-                ON UPPER(TRIM(cur.symbol)) = UPPER(TRIM(snap.symbol))
-            WHERE (
-                    COALESCE(cur.instrument_id, '') <> COALESCE(snap.instrument_id, '')
-                 OR COALESCE(cur.company_id, '') <> COALESCE(snap.company_id, '')
-                 OR COALESCE(cur.membership_status, '') <> COALESCE(snap.membership_status, '')
-                 OR COALESCE(cur.reason, '') <> COALESCE(snap.reason, '')
-            )
-              AND cur.effective_from < snap.effective_from
-            """
-        )
-
-        changed_membership_rows = int(
-            con.execute(
-                "SELECT COUNT(*) FROM tmp_current_research_membership_changed"
-            ).fetchone()[0]
+            [snapshot_date],
         )
 
         con.execute(
             """
             UPDATE universe_membership_history AS h
-            SET effective_to = c.effective_from - INTERVAL 1 DAY
-            FROM tmp_current_research_membership_changed c
-            WHERE LOWER(TRIM(h.universe_name)) = LOWER(TRIM(c.universe_name))
-              AND UPPER(TRIM(h.symbol)) = UPPER(TRIM(c.symbol))
+            SET effective_to = CAST(? AS DATE)
+            WHERE LOWER(TRIM(h.universe_name)) IN ('research', 'research_universe')
               AND h.effective_to IS NULL
-              AND h.effective_from = c.effective_from
-            """
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM tmp_research_universe_history_snapshot s
+                  WHERE s.instrument_id = h.instrument_id
+                    AND LOWER(TRIM(s.universe_name)) = LOWER(TRIM(h.universe_name))
+                    AND UPPER(TRIM(s.membership_status)) = UPPER(TRIM(h.membership_status))
+                    AND COALESCE(TRIM(s.reason), '') = COALESCE(TRIM(h.reason), '')
+              )
+            """,
+            [snapshot_date],
+        )
+
+        changed_rows = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM tmp_research_universe_history_snapshot s
+                WHERE s.instrument_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM universe_membership_history h
+                      WHERE h.instrument_id = s.instrument_id
+                        AND LOWER(TRIM(h.universe_name)) = LOWER(TRIM(s.universe_name))
+                        AND h.effective_to IS NULL
+                        AND UPPER(TRIM(h.membership_status)) = UPPER(TRIM(s.membership_status))
+                        AND COALESCE(TRIM(h.reason), '') = COALESCE(TRIM(s.reason), '')
+                  )
+                """
+            ).fetchone()[0]
         )
 
         con.execute(
@@ -438,66 +353,78 @@ class ResearchUniverseService:
                 created_at
             )
             SELECT
-                snap.instrument_id,
-                snap.company_id,
-                snap.symbol,
-                snap.universe_name,
-                snap.effective_from,
-                snap.effective_to,
-                snap.membership_status,
-                snap.reason,
-                snap.source_name,
+                s.instrument_id,
+                s.company_id,
+                s.symbol,
+                s.universe_name,
+                s.effective_from,
+                s.effective_to,
+                s.membership_status,
+                s.reason,
+                s.source_name,
                 CURRENT_TIMESTAMP
-            FROM tmp_research_universe_snapshot_resolved snap
-            LEFT JOIN universe_membership_history h
-                ON LOWER(TRIM(h.universe_name)) = LOWER(TRIM(snap.universe_name))
-               AND UPPER(TRIM(h.symbol)) = UPPER(TRIM(snap.symbol))
-               AND h.effective_to IS NULL
-               AND COALESCE(h.instrument_id, '') = COALESCE(snap.instrument_id, '')
-               AND COALESCE(h.company_id, '') = COALESCE(snap.company_id, '')
-               AND COALESCE(h.membership_status, '') = COALESCE(snap.membership_status, '')
-               AND COALESCE(h.reason, '') = COALESCE(snap.reason, '')
-            WHERE h.symbol IS NULL
+            FROM tmp_research_universe_history_snapshot s
+            WHERE s.instrument_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM universe_membership_history h
+                  WHERE h.instrument_id = s.instrument_id
+                    AND LOWER(TRIM(h.universe_name)) = LOWER(TRIM(s.universe_name))
+                    AND h.effective_to IS NULL
+                    AND UPPER(TRIM(h.membership_status)) = UPPER(TRIM(s.membership_status))
+                    AND COALESCE(TRIM(h.reason), '') = COALESCE(TRIM(s.reason), '')
+              )
             """
         )
 
-        history_rows_for_research_universe = int(
+        history_rows = int(
             con.execute(
                 """
                 SELECT COUNT(*)
                 FROM universe_membership_history
-                WHERE LOWER(TRIM(universe_name)) = LOWER(TRIM(?))
-                """,
-                [self.RESEARCH_UNIVERSE_NAME],
+                WHERE LOWER(TRIM(universe_name)) IN ('research', 'research_universe')
+                """
             ).fetchone()[0]
         )
 
-        active_history_rows_for_research_universe = int(
+        active_rows = int(
             con.execute(
                 """
                 SELECT COUNT(*)
                 FROM universe_membership_history
-                WHERE LOWER(TRIM(universe_name)) = LOWER(TRIM(?))
+                WHERE LOWER(TRIM(universe_name)) IN ('research', 'research_universe')
                   AND effective_to IS NULL
                   AND UPPER(TRIM(COALESCE(membership_status, ''))) = 'ACTIVE'
+                """
+            ).fetchone()[0]
+        )
+
+        snapshot_date_rows = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM universe_membership_history
+                WHERE LOWER(TRIM(universe_name)) IN ('research', 'research_universe')
+                  AND effective_from = CAST(? AS DATE)
                 """,
-                [self.RESEARCH_UNIVERSE_NAME],
+                [snapshot_date],
             ).fetchone()[0]
         )
 
         return {
-            "stock_base_count": stock_base_count,
-            "adr_count": adr_count,
-            "derived_suffix_exclusion_count": suffix_exclusion_count,
-            "manual_override_count": manual_override_count,
-            "manual_exclusion_count": manual_exclusion_count,
-            "research_universe_rows": total_rows,
-            "included_research_universe_rows": included_count,
-            "preferred_auto_exclusions": 0,
-            "research_universe_snapshot_date_rows": 1,
-            "research_universe_snapshot_date_yyyymmdd": int(snapshot_price_date.strftime("%Y%m%d")),
-            "research_universe_history_rows": history_rows_for_research_universe,
-            "research_universe_history_active_rows": active_history_rows_for_research_universe,
-            "research_universe_history_changed_rows": changed_membership_rows,
-            "research_universe_history_unresolved_rows": unresolved_membership_rows,
+            "research_universe_history_rows": history_rows,
+            "research_universe_history_active_rows": active_rows,
+            "research_universe_history_changed_rows": changed_rows,
+            "research_universe_history_unresolved_rows": unresolved_rows,
+            "research_universe_snapshot_date_rows": snapshot_date_rows,
+            "research_universe_snapshot_date_yyyymmdd": int(str(snapshot_date).replace("-", "")),
         }
+
+    def rebuild_conservative_research_universe(self) -> dict[str, int]:
+        snapshot_metrics = self._build_current_snapshot()
+        snapshot_date = self._resolve_snapshot_date()
+        history_metrics = self._refresh_membership_history(snapshot_date)
+
+        merged = dict(snapshot_metrics)
+        merged.update(history_metrics)
+        return merged

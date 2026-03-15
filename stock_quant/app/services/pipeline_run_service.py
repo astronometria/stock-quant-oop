@@ -1,50 +1,70 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from typing import Any
 
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
 
 class PipelineRunService:
-    def build_started_payload(
-        self,
-        pipeline_name: str,
-        config: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        now = datetime.utcnow()
-        return {
-            "pipeline_name": pipeline_name,
-            "status": "RUNNING",
-            "started_at": now,
-            "finished_at": None,
-            "rows_read": 0,
-            "rows_written": 0,
-            "metrics_json": json.dumps({}, sort_keys=True),
-            "config_json": json.dumps(config or {}, sort_keys=True),
-            "error_message": None,
-            "created_at": now,
-        }
+    def __init__(self, uow: DuckDbUnitOfWork):
+        self.uow = uow
 
-    def build_finished_payload(
+    def start_run(self, pipeline_name: str, config_json: str = "{}") -> int:
+        with self.uow as uow:
+            con = uow.connection
+
+            run_id = con.execute(
+                "SELECT nextval('pipeline_run_id_seq')"
+            ).fetchone()[0]
+
+            con.execute(
+                """
+                INSERT INTO pipeline_runs (
+                    run_id,
+                    pipeline_name,
+                    started_at,
+                    status,
+                    config_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    pipeline_name,
+                    datetime.utcnow(),
+                    "RUNNING",
+                    config_json,
+                ),
+            )
+
+            return int(run_id)
+
+    def finish_run(
         self,
-        pipeline_name: str,
+        run_id: int,
         status: str,
-        rows_read: int,
-        rows_written: int,
-        metrics: dict[str, Any] | None = None,
-        config: dict[str, Any] | None = None,
-        error_message: str | None = None,
-    ) -> dict[str, Any]:
-        now = datetime.utcnow()
-        return {
-            "pipeline_name": pipeline_name,
-            "status": status,
-            "started_at": now,
-            "finished_at": now,
-            "rows_read": int(rows_read),
-            "rows_written": int(rows_written),
-            "metrics_json": json.dumps(metrics or {}, sort_keys=True, default=str),
-            "config_json": json.dumps(config or {}, sort_keys=True, default=str),
-            "error_message": error_message,
-            "created_at": now,
-        }
+        rows_read: int = 0,
+        rows_written: int = 0,
+    ) -> None:
+        with self.uow as uow:
+            con = uow.connection
+
+            con.execute(
+                """
+                UPDATE pipeline_runs
+                SET
+                    finished_at = ?,
+                    status = ?,
+                    rows_read = ?,
+                    rows_written = ?
+                WHERE run_id = ?
+                """,
+                (
+                    datetime.utcnow(),
+                    status,
+                    rows_read,
+                    rows_written,
+                    run_id,
+                ),
+            )
