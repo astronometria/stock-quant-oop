@@ -125,13 +125,16 @@ def discover_files(sources: Iterable[str], manifests: Iterable[str]) -> list[Pat
     for path in discovered:
         name = path.name.lower()
         parent = path.parent.name.upper()
+
         if parent not in ALLOWED_MARKET_DIRS:
             continue
         if not (name.endswith(".txt") or name.endswith(".csv")):
             continue
+
         key = str(path.resolve())
         if key in seen:
             continue
+
         seen.add(key)
         filtered.append(path.resolve())
 
@@ -163,7 +166,7 @@ def split_files(paths: list[Path]) -> tuple[list[str], list[str], list[str], lis
     empty_files = 0
     skipped_bad_payload_files = 0
 
-    for path in tqdm(paths, desc="probe_finra", unit="file"):
+    for path in tqdm(paths, desc="probe_finra", unit="file", dynamic_ncols=True):
         lines = _nonempty_lines(path, limit=3)
         if not lines:
             empty_files += 1
@@ -187,6 +190,7 @@ def split_files(paths: list[Path]) -> tuple[list[str], list[str], list[str], lis
             continue
 
         first_parts = [p.strip() for p in first.split("|")]
+
         if len(first_parts) == 5 and _looks_like_valid_payload_date(first_parts[0]):
             no_header_5_files.append(str(path))
             continue
@@ -215,7 +219,12 @@ def _create_stage(con: duckdb.DuckDBPyConnection, stage_name: str) -> None:
             trade_date DATE,
             symbol VARCHAR,
             short_volume DOUBLE,
-            total_volume DOUBLE
+            short_exempt_volume DOUBLE,
+            total_volume DOUBLE,
+            market_code VARCHAR,
+            source_file VARCHAR,
+            publication_date DATE,
+            available_at TIMESTAMP
         )
         """
     )
@@ -228,21 +237,49 @@ def _insert_from_sql(con: duckdb.DuckDBPyConnection, sql: str, stage_name: str) 
     return int(after - before)
 
 
+def _metadata_select(market_expr: str) -> str:
+    return f"""
+        UPPER(
+            COALESCE(
+                NULLIF(TRIM({market_expr}), ''),
+                NULLIF(REGEXP_EXTRACT(filename, '.*/([^/]+)/[^/]+$', 1), '')
+            )
+        ) AS market_code,
+        NULLIF(REGEXP_EXTRACT(filename, '.*/([^/]+)$', 1), '') AS source_file,
+        CAST(
+            TRY_STRPTIME(
+                NULLIF(REGEXP_EXTRACT(filename, '([0-9]{{8}})', 1), ''),
+                '%Y%m%d'
+            ) AS DATE
+        ) AS publication_date,
+        CAST(
+            TRY_STRPTIME(
+                NULLIF(REGEXP_EXTRACT(filename, '([0-9]{{8}})', 1), ''),
+                '%Y%m%d'
+            ) AS TIMESTAMP
+        ) AS available_at
+    """
+
+
 def _load_batch_header_5(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
     if not files:
         return 0
+
     file_list_sql = _sql_file_list(files)
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(trim("Date"), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(trim("Symbol")) AS symbol,
+        CAST(TRY_STRPTIME(TRIM("Date"), '%Y%m%d') AS DATE) AS trade_date,
+        UPPER(TRIM("Symbol")) AS symbol,
         TRY_CAST("ShortVolume" AS DOUBLE) AS short_volume,
-        TRY_CAST("TotalVolume" AS DOUBLE) AS total_volume
+        NULL::DOUBLE AS short_exempt_volume,
+        TRY_CAST("TotalVolume" AS DOUBLE) AS total_volume,
+        {_metadata_select('"Market"')}
     FROM read_csv(
         {file_list_sql},
         delim='|',
         header=TRUE,
+        filename=TRUE,
         columns={{
             'Date':'VARCHAR',
             'Symbol':'VARCHAR',
@@ -261,18 +298,22 @@ def _load_batch_header_5(con: duckdb.DuckDBPyConnection, files: list[str], stage
 def _load_batch_header_6(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
     if not files:
         return 0
+
     file_list_sql = _sql_file_list(files)
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(trim("Date"), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(trim("Symbol")) AS symbol,
+        CAST(TRY_STRPTIME(TRIM("Date"), '%Y%m%d') AS DATE) AS trade_date,
+        UPPER(TRIM("Symbol")) AS symbol,
         TRY_CAST("ShortVolume" AS DOUBLE) AS short_volume,
-        TRY_CAST("TotalVolume" AS DOUBLE) AS total_volume
+        TRY_CAST("ShortExemptVolume" AS DOUBLE) AS short_exempt_volume,
+        TRY_CAST("TotalVolume" AS DOUBLE) AS total_volume,
+        {_metadata_select('"Market"')}
     FROM read_csv(
         {file_list_sql},
         delim='|',
         header=TRUE,
+        filename=TRUE,
         columns={{
             'Date':'VARCHAR',
             'Symbol':'VARCHAR',
@@ -292,18 +333,22 @@ def _load_batch_header_6(con: duckdb.DuckDBPyConnection, files: list[str], stage
 def _load_batch_no_header_5(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
     if not files:
         return 0
+
     file_list_sql = _sql_file_list(files)
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(trim(column0), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(trim(column1)) AS symbol,
+        CAST(TRY_STRPTIME(TRIM(column0), '%Y%m%d') AS DATE) AS trade_date,
+        UPPER(TRIM(column1)) AS symbol,
         TRY_CAST(column2 AS DOUBLE) AS short_volume,
-        TRY_CAST(column3 AS DOUBLE) AS total_volume
+        NULL::DOUBLE AS short_exempt_volume,
+        TRY_CAST(column3 AS DOUBLE) AS total_volume,
+        {_metadata_select('column4')}
     FROM read_csv(
         {file_list_sql},
         delim='|',
         header=FALSE,
+        filename=TRUE,
         columns={{
             'column0':'VARCHAR',
             'column1':'VARCHAR',
@@ -322,18 +367,22 @@ def _load_batch_no_header_5(con: duckdb.DuckDBPyConnection, files: list[str], st
 def _load_batch_no_header_6(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
     if not files:
         return 0
+
     file_list_sql = _sql_file_list(files)
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(trim(column0), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(trim(column1)) AS symbol,
+        CAST(TRY_STRPTIME(TRIM(column0), '%Y%m%d') AS DATE) AS trade_date,
+        UPPER(TRIM(column1)) AS symbol,
         TRY_CAST(column2 AS DOUBLE) AS short_volume,
-        TRY_CAST(column4 AS DOUBLE) AS total_volume
+        TRY_CAST(column3 AS DOUBLE) AS short_exempt_volume,
+        TRY_CAST(column4 AS DOUBLE) AS total_volume,
+        {_metadata_select('column5')}
     FROM read_csv(
         {file_list_sql},
         delim='|',
         header=FALSE,
+        filename=TRUE,
         columns={{
             'column0':'VARCHAR',
             'column1':'VARCHAR',
@@ -362,7 +411,7 @@ def _load_grouped_files(
         return inserted
 
     batches = list(_chunked(files, BATCH_SIZE))
-    for batch in tqdm(batches, desc=desc, unit="batch"):
+    for batch in tqdm(batches, desc=desc, unit="batch", dynamic_ncols=True):
         inserted += loader(con=con, files=batch, stage_name=stage_name)
     return inserted
 
@@ -420,11 +469,16 @@ def build_into_db(
             trade_date,
             symbol,
             short_volume,
-            total_volume
+            short_exempt_volume,
+            total_volume,
+            market_code,
+            source_file,
+            publication_date,
+            available_at
         FROM tmp_finra_stage
         WHERE trade_date IS NOT NULL
           AND symbol IS NOT NULL
-          AND trim(symbol) <> ''
+          AND TRIM(symbol) <> ''
           AND short_volume IS NOT NULL
           AND total_volume IS NOT NULL
           AND short_volume >= 0
@@ -441,7 +495,12 @@ def build_into_db(
             short_volume,
             total_volume,
             source_name,
-            ingested_at
+            ingested_at,
+            short_exempt_volume,
+            market_code,
+            source_file,
+            publication_date,
+            available_at
         )
         SELECT
             symbol,
@@ -449,10 +508,24 @@ def build_into_db(
             SUM(short_volume) AS short_volume,
             SUM(total_volume) AS total_volume,
             ? AS source_name,
-            CURRENT_TIMESTAMP AS ingested_at
+            CURRENT_TIMESTAMP AS ingested_at,
+            SUM(short_exempt_volume) AS short_exempt_volume,
+            market_code,
+            source_file,
+            publication_date,
+            available_at
         FROM tmp_finra_clean
-        GROUP BY symbol, trade_date
-        ORDER BY symbol, trade_date
+        GROUP BY
+            symbol,
+            trade_date,
+            market_code,
+            source_file,
+            publication_date,
+            available_at
+        ORDER BY
+            symbol,
+            trade_date,
+            source_file
         """,
         [source_name],
     )
@@ -487,12 +560,13 @@ def main() -> int:
     config.ensure_directories()
 
     files = discover_files(args.sources, args.manifests)
-
     session_factory = DuckDbSessionFactory(config.db_path)
+
     with DuckDbUnitOfWork(session_factory) as uow:
         schema = ShortDataSchemaManager(uow)
         schema.initialize()
 
+    with DuckDbUnitOfWork(session_factory) as uow:
         if uow.connection is None:
             raise RuntimeError("active DB connection is required")
 
