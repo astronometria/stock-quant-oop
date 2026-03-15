@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.app.services.dataset_version_service import DatasetVersionService
@@ -50,96 +51,173 @@ class BuildDatasetBuilderPipeline(BasePipeline):
     def transform(self, data):
         return None
 
-    def validate(self, data) -> None:
-        included_universe_count = int(
+    def _table_columns(self, table_name: str) -> set[str]:
+        rows = self.con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+        return {str(row[1]).strip() for row in rows}
+
+    def _has_table(self, table_name: str) -> bool:
+        row = self.con.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = ?
+            """,
+            [table_name],
+        ).fetchone()
+        return bool(row and row[0])
+
+    def _history_universe_name_expr(self) -> str:
+        return """
+            CASE
+                WHEN LOWER(TRIM(universe_name)) IN ('research', 'research_universe')
+                    THEN 1
+                ELSE 0
+            END = 1
+        """
+
+    def _history_membership_active_expr(self) -> str:
+        columns = self._table_columns("universe_membership_history")
+
+        if "membership_status" in columns:
+            return """
+                UPPER(TRIM(COALESCE(membership_status, ''))) IN ('ACTIVE', 'INCLUDED')
+            """
+        if "is_active" in columns:
+            return "COALESCE(is_active, FALSE) = TRUE"
+        if "include_in_universe" in columns:
+            return "COALESCE(include_in_universe, FALSE) = TRUE"
+
+        raise PipelineError(
+            "universe_membership_history does not expose membership_status/is_active/include_in_universe"
+        )
+
+    def _ensure_dataset_schema(self) -> None:
+        info = self.con.execute("PRAGMA table_info('research_dataset_daily')").fetchall()
+        cols = [row[1] for row in info]
+
+        if "short_interest_pct_volume" in cols:
+            self.con.execute("DROP TABLE IF EXISTS research_dataset_daily__new")
             self.con.execute(
                 """
+                CREATE TABLE research_dataset_daily__new (
+                    dataset_name VARCHAR,
+                    dataset_version VARCHAR,
+                    instrument_id VARCHAR,
+                    company_id VARCHAR,
+                    symbol VARCHAR,
+                    as_of_date DATE,
+                    close_to_sma_20 DOUBLE,
+                    rsi_14 DOUBLE,
+                    revenue DOUBLE,
+                    net_income DOUBLE,
+                    net_margin DOUBLE,
+                    debt_to_equity DOUBLE,
+                    return_on_assets DOUBLE,
+                    short_interest DOUBLE,
+                    days_to_cover DOUBLE,
+                    short_volume_ratio DOUBLE,
+                    article_count_1d BIGINT,
+                    unique_cluster_count_1d BIGINT,
+                    avg_link_confidence DOUBLE,
+                    fwd_return_1d DOUBLE,
+                    fwd_return_5d DOUBLE,
+                    fwd_return_20d DOUBLE,
+                    direction_1d INTEGER,
+                    direction_5d INTEGER,
+                    direction_20d INTEGER,
+                    realized_vol_20d DOUBLE,
+                    created_at TIMESTAMP,
+                    short_squeeze_score DOUBLE,
+                    short_pressure_zscore DOUBLE,
+                    days_to_cover_zscore DOUBLE,
+                    short_interest_change_pct DOUBLE
+                )
+                """
+            )
+            self.con.execute("DROP TABLE research_dataset_daily")
+            self.con.execute("ALTER TABLE research_dataset_daily__new RENAME TO research_dataset_daily")
+
+        existing_columns = {
+            row[1]
+            for row in self.con.execute("PRAGMA table_info('research_dataset_daily')").fetchall()
+        }
+        for column_name, sql in [
+            (
+                "short_interest_change_pct",
+                "ALTER TABLE research_dataset_daily ADD COLUMN short_interest_change_pct DOUBLE",
+            ),
+            (
+                "short_squeeze_score",
+                "ALTER TABLE research_dataset_daily ADD COLUMN short_squeeze_score DOUBLE",
+            ),
+            (
+                "short_pressure_zscore",
+                "ALTER TABLE research_dataset_daily ADD COLUMN short_pressure_zscore DOUBLE",
+            ),
+            (
+                "days_to_cover_zscore",
+                "ALTER TABLE research_dataset_daily ADD COLUMN days_to_cover_zscore DOUBLE",
+            ),
+        ]:
+            if column_name not in existing_columns:
+                self.con.execute(sql)
+
+    def validate(self, data) -> None:
+        if not self._has_table("universe_membership_history"):
+            raise PipelineError("universe_membership_history table is required for PIT dataset build")
+
+        active_expr = self._history_membership_active_expr()
+        universe_expr = self._history_universe_name_expr()
+
+        included_history_count = int(
+            self.con.execute(
+                f"""
                 SELECT COUNT(*)
-                FROM research_universe
-                WHERE include_in_research_universe = TRUE
+                FROM universe_membership_history
+                WHERE {universe_expr}
+                  AND {active_expr}
                 """
             ).fetchone()[0]
         )
-        if included_universe_count == 0:
-            raise PipelineError("no included rows available in research_universe")
+        if included_history_count == 0:
+            raise PipelineError(
+                "no active rows available in universe_membership_history for research universe"
+            )
 
         self._rows_read = int(
             self.con.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                 FROM research_features_daily f
-                INNER JOIN research_universe ru
-                    ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
-                WHERE ru.include_in_research_universe = TRUE
+                INNER JOIN universe_membership_history u
+                    ON u.instrument_id = f.instrument_id
+                   AND {universe_expr.replace("universe_name", "u.universe_name")}
+                   AND {active_expr.replace("membership_status", "u.membership_status")
+                                   .replace("is_active", "u.is_active")
+                                   .replace("include_in_universe", "u.include_in_universe")}
+                   AND u.effective_from <= f.as_of_date
+                   AND COALESCE(u.effective_to, DATE '9999-12-31') > f.as_of_date
                 """
             ).fetchone()[0]
         )
         if self._rows_read == 0:
-            raise PipelineError("no filtered rows available in research_features_daily")
-
-    def _rebuild_dataset_schema_if_needed(self) -> None:
-        info = self.con.execute("PRAGMA table_info('research_dataset_daily')").fetchall()
-        cols = [row[1] for row in info]
-        if "short_interest_pct_volume" not in cols:
-            return
-
-        self.con.execute("DROP TABLE IF EXISTS research_dataset_daily__new")
-        self.con.execute(
-            """
-            CREATE TABLE research_dataset_daily__new (
-                dataset_name VARCHAR,
-                dataset_version VARCHAR,
-                instrument_id VARCHAR,
-                company_id VARCHAR,
-                symbol VARCHAR,
-                as_of_date DATE,
-                close_to_sma_20 DOUBLE,
-                rsi_14 DOUBLE,
-                revenue DOUBLE,
-                net_income DOUBLE,
-                net_margin DOUBLE,
-                debt_to_equity DOUBLE,
-                return_on_assets DOUBLE,
-                short_interest DOUBLE,
-                days_to_cover DOUBLE,
-                short_volume_ratio DOUBLE,
-                article_count_1d BIGINT,
-                unique_cluster_count_1d BIGINT,
-                avg_link_confidence DOUBLE,
-                fwd_return_1d DOUBLE,
-                fwd_return_5d DOUBLE,
-                fwd_return_20d DOUBLE,
-                direction_1d INTEGER,
-                direction_5d INTEGER,
-                direction_20d INTEGER,
-                realized_vol_20d DOUBLE,
-                created_at TIMESTAMP,
-                short_squeeze_score DOUBLE,
-                short_pressure_zscore DOUBLE,
-                days_to_cover_zscore DOUBLE,
-                short_interest_change_pct DOUBLE
+            raise PipelineError(
+                "no PIT-filtered rows available in research_features_daily from universe_membership_history"
             )
-            """
-        )
-        self.con.execute("DROP TABLE research_dataset_daily")
-        self.con.execute("ALTER TABLE research_dataset_daily__new RENAME TO research_dataset_daily")
 
     def load(self, data) -> None:
         con = self.con
-        self._rebuild_dataset_schema_if_needed()
+        self._ensure_dataset_schema()
 
-        existing_columns = {
-            row[1]
-            for row in con.execute("PRAGMA table_info('research_dataset_daily')").fetchall()
-        }
-        for column_name, sql in [
-            ("short_interest_change_pct", "ALTER TABLE research_dataset_daily ADD COLUMN short_interest_change_pct DOUBLE"),
-            ("short_squeeze_score", "ALTER TABLE research_dataset_daily ADD COLUMN short_squeeze_score DOUBLE"),
-            ("short_pressure_zscore", "ALTER TABLE research_dataset_daily ADD COLUMN short_pressure_zscore DOUBLE"),
-            ("days_to_cover_zscore", "ALTER TABLE research_dataset_daily ADD COLUMN days_to_cover_zscore DOUBLE"),
-        ]:
-            if column_name not in existing_columns:
-                con.execute(sql)
+        active_expr = self._history_membership_active_expr()
+        universe_expr = self._history_universe_name_expr()
+
+        active_expr_u = (
+            active_expr.replace("membership_status", "u.membership_status")
+            .replace("is_active", "u.is_active")
+            .replace("include_in_universe", "u.include_in_universe")
+        )
+        universe_expr_u = universe_expr.replace("universe_name", "u.universe_name")
 
         con.execute(
             """
@@ -157,24 +235,30 @@ class BuildDatasetBuilderPipeline(BasePipeline):
             [self.dataset_name, self.dataset_version],
         )
 
-        con.execute("DROP TABLE IF EXISTS tmp_research_universe_symbols")
+        con.execute("DROP TABLE IF EXISTS tmp_research_universe_membership")
         con.execute("DROP TABLE IF EXISTS tmp_dataset_joined")
 
         con.execute(
-            """
-            CREATE TEMP TABLE tmp_research_universe_symbols AS
-            SELECT DISTINCT symbol
-            FROM research_universe
-            WHERE include_in_research_universe = TRUE
+            f"""
+            CREATE TEMP TABLE tmp_research_universe_membership AS
+            SELECT
+                instrument_id,
+                company_id,
+                symbol,
+                effective_from,
+                COALESCE(effective_to, DATE '9999-12-31') AS effective_to
+            FROM universe_membership_history
+            WHERE {universe_expr}
+              AND {active_expr}
             """
         )
 
         self._research_universe_rows = int(
-            con.execute("SELECT COUNT(*) FROM tmp_research_universe_symbols").fetchone()[0]
+            con.execute("SELECT COUNT(*) FROM tmp_research_universe_membership").fetchone()[0]
         )
 
         con.execute(
-            """
+            f"""
             CREATE TEMP TABLE tmp_dataset_joined AS
             SELECT
                 ? AS dataset_name,
@@ -209,8 +293,12 @@ class BuildDatasetBuilderPipeline(BasePipeline):
                 f.days_to_cover_zscore,
                 f.short_interest_change_pct
             FROM research_features_daily f
-            INNER JOIN tmp_research_universe_symbols ru
-                ON UPPER(TRIM(f.symbol)) = UPPER(TRIM(ru.symbol))
+            INNER JOIN universe_membership_history u
+                ON u.instrument_id = f.instrument_id
+               AND {universe_expr_u}
+               AND {active_expr_u}
+               AND u.effective_from <= f.as_of_date
+               AND COALESCE(u.effective_to, DATE '9999-12-31') > f.as_of_date
             LEFT JOIN return_labels_daily r
                 ON f.instrument_id = r.instrument_id
                AND f.as_of_date = r.as_of_date
@@ -315,45 +403,74 @@ class BuildDatasetBuilderPipeline(BasePipeline):
         if max_as_of is None:
             raise PipelineError("dataset build produced zero rows")
 
-        if self.repository is not None:
-            version_row = self.version_service.build_dataset_version(
-                dataset_name=self.dataset_name,
-                dataset_version=self.dataset_version,
-                as_of_date=str(max_as_of),
-                row_count=self._dataset_rows,
+        config_payload = json.dumps(
+            {
+                "filter_source": "universe_membership_history",
+                "survivor_bias_aware": True,
+                "dataset_builder_pipeline": self.pipeline_name,
+                "dataset_name": self.dataset_name,
+                "dataset_version": self.dataset_version,
+            },
+            sort_keys=True,
+        )
+
+        version_row = self.version_service.build_dataset_version(
+            dataset_name=self.dataset_name,
+            dataset_version=self.dataset_version,
+            universe_name="research_universe",
+            as_of_date=max_as_of,
+            row_count=self._dataset_rows,
+            feature_run_id=None,
+            label_run_id=None,
+            config_json=config_payload,
+            created_at=datetime.utcnow(),
+        )
+
+        con.execute(
+            """
+            INSERT INTO dataset_versions (
+                dataset_name,
+                dataset_version,
+                universe_name,
+                as_of_date,
+                feature_run_id,
+                label_run_id,
+                row_count,
+                config_json,
+                created_at
             )
-            self._version_rows = int(self.repository.insert_dataset_version(version_row))
-        else:
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version_row.dataset_name,
+                version_row.dataset_version,
+                version_row.universe_name,
+                version_row.as_of_date,
+                version_row.feature_run_id,
+                version_row.label_run_id,
+                version_row.row_count,
+                version_row.config_json,
+                version_row.created_at,
+            ),
+        )
+
+        self._version_rows = int(
             con.execute(
                 """
-                INSERT INTO dataset_versions (
-                    dataset_name,
-                    dataset_version,
-                    universe_name,
-                    as_of_date,
-                    row_count,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
+                SELECT COUNT(*)
+                FROM dataset_versions
+                WHERE dataset_name = ? AND dataset_version = ?
                 """,
-                [
-                    self.dataset_name,
-                    self.dataset_version,
-                    "research_universe",
-                    max_as_of,
-                    self._dataset_rows,
-                    datetime.utcnow(),
-                ],
-            )
-            self._version_rows = 1
+                [self.dataset_name, self.dataset_version],
+            ).fetchone()[0]
+        )
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
         result.rows_read = self._rows_read
-        result.rows_written = self._dataset_rows + self._version_rows
-        result.metrics["dataset_name"] = self.dataset_name
-        result.metrics["dataset_version"] = self.dataset_version
+        result.rows_written = self._dataset_rows
         result.metrics["dataset_rows"] = self._dataset_rows
+        result.metrics["dataset_version_rows"] = self._version_rows
         result.metrics["research_universe_rows"] = self._research_universe_rows
-        result.metrics["written_dataset_rows"] = self._dataset_rows
-        result.metrics["written_dataset_version"] = self._version_rows
+        result.metrics["pit_filter_source"] = "universe_membership_history"
+        result.metrics["survivor_bias_aware"] = 1
         return result
