@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+import pandas as pd
+
 from stock_quant.app.services.price_ingestion_service import PriceIngestionService
 from stock_quant.infrastructure.providers.prices.historical_price_provider import HistoricalPriceProvider
 from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
@@ -27,17 +29,20 @@ class BuildPricesPipeline(BasePipeline):
     def pipeline_name(self) -> str:
         return "build_prices"
 
-    def extract(self) -> Iterable[Mapping[str, Any]]:
-        symbols = self.symbols or self._load_symbols_from_repository()
+    def extract(self) -> Any:
+        symbols = self.symbols
 
         if self.mode == "backfill":
             if self.historical_provider is None:
                 raise ValueError("historical_provider is required for mode=backfill")
-            return self.historical_provider.fetch_history(
+            return self.historical_provider.fetch_history_frame(
                 symbols=symbols,
                 start_date=self.start_date,
                 end_date=self.end_date,
             )
+
+        if symbols is None:
+            symbols = self._load_symbols_from_repository()
 
         if self.daily_provider is None:
             raise ValueError("daily_provider is required for mode=daily")
@@ -47,7 +52,15 @@ class BuildPricesPipeline(BasePipeline):
             as_of=self.as_of,
         )
 
-    def transform(self, data: Iterable[Mapping[str, Any]]) -> Any:
+    def transform(self, data: Any) -> Any:
+        if isinstance(data, pd.DataFrame):
+            frame = self.service.build_price_frame_from_frame(data)
+            summary = self.service.summarize_frame(frame, rows_read=len(data))
+            return {
+                "frame": frame,
+                "summary": summary,
+            }
+
         materialized = list(data)
         frame = self.service.build_price_frame(materialized)
         summary = self.service.summarize_frame(frame, rows_read=len(materialized))
@@ -75,25 +88,8 @@ class BuildPricesPipeline(BasePipeline):
                 },
             }
 
-        if hasattr(self.repository, "upsert_price_history"):
-            rows_written = int(self.repository.upsert_price_history(frame))
-        elif hasattr(self.repository, "write_price_history"):
-            rows_written = int(self.repository.write_price_history(frame))
-        elif hasattr(self.repository, "write_history"):
-            rows_written = int(self.repository.write_history(frame))
-        else:
-            raise AttributeError(
-                "price repository must implement upsert_price_history(frame), "
-                "write_price_history(frame) or write_history(frame)"
-            )
-
-        latest_rows = 0
-        if hasattr(self.repository, "refresh_price_latest"):
-            latest_rows = int(self.repository.refresh_price_latest())
-        elif hasattr(self.repository, "rebuild_price_latest"):
-            latest_rows = int(self.repository.rebuild_price_latest())
-        elif hasattr(self.repository, "write_price_latest_from_history"):
-            latest_rows = int(self.repository.write_price_latest_from_history())
+        rows_written = int(self.repository.upsert_price_history(frame))
+        latest_rows = int(self.repository.refresh_price_latest())
 
         return {
             "rows_read": summary.rows_read,

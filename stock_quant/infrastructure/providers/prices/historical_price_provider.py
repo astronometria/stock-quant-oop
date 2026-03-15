@@ -16,14 +16,14 @@ class HistoricalPriceProvider(PriceSourcePort):
         self._source_paths = [Path(path).expanduser().resolve() for path in source_paths]
         self._loader = loader or RawPriceLoader()
 
-    def fetch_daily_prices(self, symbols: list[str], as_of: date | None = None) -> Iterable[Any]:
+    def fetch_daily_prices(self, symbols: list[str] | None, as_of: date | None = None) -> Iterable[Any]:
         end_date = as_of
         start_date = as_of
         return self.fetch_history(symbols=symbols, start_date=start_date, end_date=end_date)
 
     def fetch_history(
         self,
-        symbols: list[str],
+        symbols: list[str] | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
     ) -> Iterable[Any]:
@@ -38,18 +38,22 @@ class HistoricalPriceProvider(PriceSourcePort):
         end_date: date | None = None,
     ) -> pd.DataFrame:
         frame = self._loader.load_many(self._source_paths)
-        return self._filter_frame(frame, symbols=symbols or [], start_date=start_date, end_date=end_date)
+        return self._filter_frame(frame, symbols=symbols, start_date=start_date, end_date=end_date)
 
     def _filter_frame(
         self,
         frame: pd.DataFrame,
-        symbols: list[str],
+        symbols: list[str] | None,
         start_date: date | None,
         end_date: date | None,
     ) -> pd.DataFrame:
         filtered = frame.copy()
 
-        normalized_symbols = {symbol.strip().upper() for symbol in symbols if str(symbol).strip()}
+        normalized_symbols = {
+            str(symbol).strip().upper()
+            for symbol in (symbols or [])
+            if str(symbol).strip()
+        }
         if normalized_symbols:
             filtered = filtered[filtered["symbol"].isin(normalized_symbols)]
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
 
 class MasterDataService:
-    def __init__(self, uow) -> None:
+    def __init__(self, uow: DuckDbUnitOfWork) -> None:
         self.uow = uow
 
     @property
@@ -15,14 +17,11 @@ class MasterDataService:
         con = self.con
 
         price_symbol_count = int(
-            con.execute(
-                "SELECT COUNT(DISTINCT symbol) FROM price_bars_adjusted"
-            ).fetchone()[0]
+            con.execute("SELECT COUNT(DISTINCT symbol) FROM price_history").fetchone()[0]
         )
 
         con.execute("DROP TABLE IF EXISTS tmp_old_instrument_master")
         con.execute("DROP TABLE IF EXISTS tmp_old_ticker_history")
-        con.execute("DROP TABLE IF EXISTS tmp_price_symbol_bounds")
 
         con.execute(
             """
@@ -31,6 +30,7 @@ class MasterDataService:
             FROM instrument_master
             """
         )
+
         con.execute(
             """
             CREATE TEMP TABLE tmp_old_ticker_history AS
@@ -38,24 +38,11 @@ class MasterDataService:
             FROM ticker_history
             """
         )
-        con.execute(
-            """
-            CREATE TEMP TABLE tmp_price_symbol_bounds AS
-            SELECT
-                p.symbol,
-                p.instrument_id,
-                MIN(p.bar_date) AS min_bar_date,
-                MAX(p.bar_date) AS max_bar_date
-            FROM price_bars_adjusted p
-            GROUP BY p.symbol, p.instrument_id
-            """
-        )
 
         con.execute("DELETE FROM instrument_identifier_map")
         con.execute("DELETE FROM ticker_history")
         con.execute("DELETE FROM instrument_master")
 
-        # 1) Instruments pilotés par les ids historiques déjà présents dans les prix
         con.execute(
             """
             INSERT INTO instrument_master (
@@ -68,61 +55,39 @@ class MasterDataService:
                 is_active,
                 created_at
             )
+            WITH price_symbols AS (
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    MIN(price_date) AS min_price_date,
+                    MAX(price_date) AS max_price_date
+                FROM price_history
+                GROUP BY 1
+            )
             SELECT
-                b.instrument_id,
-                o.company_id,
-                b.symbol,
-                COALESCE(o.exchange, t.exchange),
-                COALESCE(o.security_type, 'COMMON_STOCK'),
-                o.share_class,
-                TRUE AS is_active,
+                COALESCE(
+                    o.instrument_id,
+                    'INST:' || SUBSTR(MD5(ps.symbol), 1, 16)
+                ) AS instrument_id,
+                COALESCE(
+                    o.company_id,
+                    'COMP:' || SUBSTR(MD5(ps.symbol), 1, 16)
+                ) AS company_id,
+                ps.symbol,
+                COALESCE(o.exchange, 'UNKNOWN') AS exchange,
+                COALESCE(o.security_type, 'COMMON_STOCK') AS security_type,
+                COALESCE(o.share_class, 'ORDINARY') AS share_class,
+                CASE
+                    WHEN ps.max_price_date >= CURRENT_DATE - INTERVAL 30 DAY THEN TRUE
+                    ELSE COALESCE(o.is_active, FALSE)
+                END AS is_active,
                 CURRENT_TIMESTAMP AS created_at
-            FROM tmp_price_symbol_bounds b
+            FROM price_symbols ps
             LEFT JOIN tmp_old_instrument_master o
-                ON o.symbol = b.symbol
-            LEFT JOIN tmp_old_ticker_history t
-                ON t.symbol = b.symbol
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY b.symbol, b.instrument_id
-                ORDER BY
-                    CASE WHEN o.instrument_id IS NOT NULL THEN 0 ELSE 1 END,
-                    CASE WHEN t.instrument_id IS NOT NULL THEN 0 ELSE 1 END
-            ) = 1
+              ON UPPER(TRIM(ps.symbol)) = UPPER(TRIM(o.symbol))
+            ORDER BY ps.symbol
             """
         )
 
-        # 2) Conserver les anciens symboles non présents dans les prix
-        con.execute(
-            """
-            INSERT INTO instrument_master (
-                instrument_id,
-                company_id,
-                symbol,
-                exchange,
-                security_type,
-                share_class,
-                is_active,
-                created_at
-            )
-            SELECT
-                o.instrument_id,
-                o.company_id,
-                o.symbol,
-                o.exchange,
-                o.security_type,
-                o.share_class,
-                o.is_active,
-                CURRENT_TIMESTAMP AS created_at
-            FROM tmp_old_instrument_master o
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM tmp_price_symbol_bounds b
-                WHERE b.symbol = o.symbol
-            )
-            """
-        )
-
-        # 3) Ticker history PIT à partir de l'historique prix
         con.execute(
             """
             INSERT INTO ticker_history (
@@ -134,65 +99,29 @@ class MasterDataService:
                 is_current,
                 created_at
             )
+            WITH price_symbols AS (
+                SELECT
+                    UPPER(TRIM(ph.symbol)) AS symbol,
+                    MIN(ph.price_date) AS min_price_date,
+                    MAX(ph.price_date) AS max_price_date
+                FROM price_history ph
+                GROUP BY 1
+            )
             SELECT
-                b.instrument_id,
-                b.symbol,
-                COALESCE(
-                    im.exchange,
-                    o.exchange,
-                    t.exchange
-                ) AS exchange,
-                b.min_bar_date AS valid_from,
+                im.instrument_id,
+                ps.symbol,
+                im.exchange,
+                ps.min_price_date AS valid_from,
                 NULL AS valid_to,
                 TRUE AS is_current,
                 CURRENT_TIMESTAMP AS created_at
-            FROM tmp_price_symbol_bounds b
-            LEFT JOIN instrument_master im
-                ON im.instrument_id = b.instrument_id
-            LEFT JOIN tmp_old_instrument_master o
-                ON o.symbol = b.symbol
-            LEFT JOIN tmp_old_ticker_history t
-                ON t.symbol = b.symbol
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY b.symbol, b.instrument_id
-                ORDER BY
-                    CASE WHEN im.instrument_id IS NOT NULL THEN 0 ELSE 1 END,
-                    CASE WHEN o.instrument_id IS NOT NULL THEN 0 ELSE 1 END,
-                    CASE WHEN t.instrument_id IS NOT NULL THEN 0 ELSE 1 END
-            ) = 1
+            FROM price_symbols ps
+            INNER JOIN instrument_master im
+              ON UPPER(TRIM(ps.symbol)) = UPPER(TRIM(im.symbol))
+            ORDER BY ps.symbol
             """
         )
 
-        # 4) Conserver les anciens ticker_history pour les symboles hors historique prix
-        con.execute(
-            """
-            INSERT INTO ticker_history (
-                instrument_id,
-                symbol,
-                exchange,
-                valid_from,
-                valid_to,
-                is_current,
-                created_at
-            )
-            SELECT
-                t.instrument_id,
-                t.symbol,
-                t.exchange,
-                t.valid_from,
-                t.valid_to,
-                t.is_current,
-                CURRENT_TIMESTAMP AS created_at
-            FROM tmp_old_ticker_history t
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM tmp_price_symbol_bounds b
-                WHERE b.symbol = t.symbol
-            )
-            """
-        )
-
-        # 5) Recréer une map ticker minimale cohérente avec les ids reconstruits
         con.execute(
             """
             INSERT INTO instrument_identifier_map (

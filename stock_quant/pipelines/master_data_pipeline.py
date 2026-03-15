@@ -38,11 +38,11 @@ class BuildMasterDataPipeline(BasePipeline):
 
     def validate(self, data) -> None:
         price_rows = int(
-            self.con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0]
+            self.con.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
         )
         self._rows_read = price_rows
         if price_rows == 0:
-            raise PipelineError("no rows available in price_bars_adjusted")
+            raise PipelineError("no rows available in price_history")
 
     def load(self, data) -> None:
         self._metrics = self.service.rebuild_master_from_price_history()

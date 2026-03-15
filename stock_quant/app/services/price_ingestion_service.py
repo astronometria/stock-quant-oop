@@ -61,8 +61,14 @@ class PriceIngestionService:
         normalized = self.normalize_records(records)
         if not normalized:
             return self._empty_frame()
-
         frame = pd.DataFrame(normalized)
+        return self.build_price_frame_from_frame(frame)
+
+    def build_price_frame_from_frame(self, input_frame: pd.DataFrame) -> pd.DataFrame:
+        if input_frame is None or input_frame.empty:
+            return self._empty_frame()
+
+        frame = input_frame.copy()
 
         frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
         frame["price_date"] = pd.to_datetime(frame["price_date"], errors="coerce").dt.date
@@ -71,6 +77,7 @@ class PriceIngestionService:
         frame["low"] = pd.to_numeric(frame["low"], errors="coerce")
         frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
         frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0).astype("int64")
+        frame["source_name"] = frame.get("source_name", "unknown")
         frame["source_name"] = frame["source_name"].fillna("unknown").astype(str)
 
         if "ingested_at" not in frame.columns:
