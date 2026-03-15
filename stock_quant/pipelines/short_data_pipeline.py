@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.pipelines.base_pipeline import BasePipeline
@@ -49,8 +51,9 @@ class BuildShortDataPipeline(BasePipeline):
         )
 
         if short_interest_rows == 0:
-            raise PipelineError("short_interest_history is empty — run build_finra_short_interest / canonical short history load first")
-
+            raise PipelineError(
+                "short_interest_history is empty — run build_finra_short_interest / canonical short history load first"
+            )
         if short_volume_raw_rows == 0:
             raise PipelineError("finra_daily_short_volume_source_raw is empty")
 
@@ -70,7 +73,9 @@ class BuildShortDataPipeline(BasePipeline):
             self.con.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sql_type}")
 
     def _ensure_schema(self) -> None:
-        # Canonical PIT fields on history tables
+        cpu_threads = max(1, min((os.cpu_count() or 8), 16))
+        self.con.execute(f"PRAGMA threads={cpu_threads}")
+
         self._ensure_column("short_interest_history", "publication_date", "DATE")
         self._ensure_column("short_interest_history", "available_at", "TIMESTAMP")
 
@@ -78,7 +83,6 @@ class BuildShortDataPipeline(BasePipeline):
         self._ensure_column("daily_short_volume_history", "available_at", "TIMESTAMP")
         self._ensure_column("daily_short_volume_history", "short_exempt_volume", "DOUBLE")
 
-        # Feature fields
         self._ensure_column("short_features_daily", "short_exempt_volume", "DOUBLE")
         self._ensure_column("short_features_daily", "short_interest_change_pct", "DOUBLE")
         self._ensure_column("short_features_daily", "short_squeeze_score", "DOUBLE")
@@ -86,7 +90,6 @@ class BuildShortDataPipeline(BasePipeline):
         self._ensure_column("short_features_daily", "days_to_cover_zscore", "DOUBLE")
         self._ensure_column("short_features_daily", "max_source_available_at", "TIMESTAMP")
 
-        # Helpful indexes
         self.con.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_daily_short_volume_history_instrument_trade_date
@@ -165,12 +168,22 @@ class BuildShortDataPipeline(BasePipeline):
 
         before_missing_pub = int(
             con.execute(
-                "SELECT COUNT(*) FROM short_interest_history WHERE instrument_id IS NOT NULL AND publication_date IS NULL"
+                """
+                SELECT COUNT(*)
+                FROM short_interest_history
+                WHERE instrument_id IS NOT NULL
+                  AND publication_date IS NULL
+                """
             ).fetchone()[0]
         )
         before_missing_avail = int(
             con.execute(
-                "SELECT COUNT(*) FROM short_interest_history WHERE instrument_id IS NOT NULL AND available_at IS NULL"
+                """
+                SELECT COUNT(*)
+                FROM short_interest_history
+                WHERE instrument_id IS NOT NULL
+                  AND available_at IS NULL
+                """
             ).fetchone()[0]
         )
 
@@ -182,7 +195,6 @@ class BuildShortDataPipeline(BasePipeline):
               AND publication_date IS NULL
             """
         )
-
         con.execute(
             """
             UPDATE short_interest_history
@@ -197,12 +209,22 @@ class BuildShortDataPipeline(BasePipeline):
 
         after_missing_pub = int(
             con.execute(
-                "SELECT COUNT(*) FROM short_interest_history WHERE instrument_id IS NOT NULL AND publication_date IS NULL"
+                """
+                SELECT COUNT(*)
+                FROM short_interest_history
+                WHERE instrument_id IS NOT NULL
+                  AND publication_date IS NULL
+                """
             ).fetchone()[0]
         )
         after_missing_avail = int(
             con.execute(
-                "SELECT COUNT(*) FROM short_interest_history WHERE instrument_id IS NOT NULL AND available_at IS NULL"
+                """
+                SELECT COUNT(*)
+                FROM short_interest_history
+                WHERE instrument_id IS NOT NULL
+                  AND available_at IS NULL
+                """
             ).fetchone()[0]
         )
 
@@ -224,11 +246,13 @@ class BuildShortDataPipeline(BasePipeline):
 
         available_expr = f"CAST({publication_expr} AS TIMESTAMP)"
         if "available_at" in raw_cols:
-            available_expr = f"COALESCE(CAST(r.available_at AS TIMESTAMP), CAST({publication_expr} AS TIMESTAMP))"
+            available_expr = (
+                f"COALESCE(CAST(r.available_at AS TIMESTAMP), CAST({publication_expr} AS TIMESTAMP))"
+            )
 
         return short_exempt_expr, publication_expr, available_expr
 
-    def _upsert_missing_daily_short_volume_history(self) -> dict[str, int]:
+    def _upsert_canonical_daily_short_volume_history(self) -> dict[str, int]:
         con = self.con
         short_exempt_expr, publication_expr, available_expr = self._source_exprs_for_daily_raw()
 
@@ -236,11 +260,11 @@ class BuildShortDataPipeline(BasePipeline):
             con.execute("SELECT COUNT(*) FROM daily_short_volume_history").fetchone()[0]
         )
 
-        con.execute("DROP TABLE IF EXISTS tmp_missing_daily_short_volume")
+        con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_canonical_source")
         con.execute(
             f"""
-            CREATE TEMP TABLE tmp_missing_daily_short_volume AS
-            WITH ranked AS (
+            CREATE TEMP TABLE tmp_daily_short_volume_canonical_source AS
+            WITH mapped AS (
                 SELECT
                     m.instrument_id,
                     m.company_id,
@@ -249,17 +273,18 @@ class BuildShortDataPipeline(BasePipeline):
                     CAST(r.short_volume AS DOUBLE) AS short_volume,
                     {short_exempt_expr} AS short_exempt_volume,
                     CAST(r.total_volume AS DOUBLE) AS total_volume,
-                    CASE
-                        WHEN r.total_volume IS NOT NULL AND r.total_volume <> 0
-                             AND r.short_volume IS NOT NULL
-                        THEN CAST(r.short_volume AS DOUBLE) / CAST(r.total_volume AS DOUBLE)
-                        ELSE NULL
-                    END AS short_volume_ratio,
                     {publication_expr} AS publication_date,
                     {available_expr} AS available_at,
                     COALESCE(r.source_name, 'finra_daily_non_otc') AS source_name,
+                    COALESCE(r.source_file, '') AS source_file,
+                    COALESCE(r.market_code, '') AS market_code,
                     ROW_NUMBER() OVER (
-                        PARTITION BY UPPER(TRIM(r.symbol)), CAST(r.trade_date AS DATE)
+                        PARTITION BY
+                            UPPER(TRIM(r.symbol)),
+                            CAST(r.trade_date AS DATE),
+                            COALESCE(r.source_file, ''),
+                            COALESCE(r.market_code, ''),
+                            COALESCE(r.source_name, '')
                         ORDER BY m.valid_from DESC NULLS LAST
                     ) AS rn
                 FROM finra_daily_short_volume_source_raw r
@@ -269,26 +294,57 @@ class BuildShortDataPipeline(BasePipeline):
                 WHERE r.symbol IS NOT NULL
                   AND TRIM(r.symbol) <> ''
                   AND r.trade_date IS NOT NULL
+            ),
+            dedup AS (
+                SELECT
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    trade_date,
+                    short_volume,
+                    short_exempt_volume,
+                    total_volume,
+                    publication_date,
+                    available_at,
+                    source_name
+                FROM mapped
+                WHERE rn = 1
+                  AND instrument_id IS NOT NULL
             )
             SELECT
-                r.instrument_id,
-                r.company_id,
-                r.symbol,
-                r.trade_date,
-                r.short_volume,
-                r.short_exempt_volume,
-                r.total_volume,
-                r.short_volume_ratio,
-                r.publication_date,
-                r.available_at,
-                r.source_name
-            FROM ranked r
+                instrument_id,
+                MAX(company_id) AS company_id,
+                MAX(symbol) AS symbol,
+                trade_date,
+                SUM(short_volume) AS short_volume,
+                CASE
+                    WHEN COUNT(short_exempt_volume) > 0 THEN SUM(COALESCE(short_exempt_volume, 0))
+                    ELSE NULL
+                END AS short_exempt_volume,
+                SUM(total_volume) AS total_volume,
+                CASE
+                    WHEN SUM(total_volume) IS NOT NULL AND SUM(total_volume) <> 0
+                    THEN SUM(short_volume) / SUM(total_volume)
+                    ELSE NULL
+                END AS short_volume_ratio,
+                MIN(publication_date) AS publication_date,
+                MAX(available_at) AS available_at,
+                MAX(source_name) AS source_name
+            FROM dedup
+            GROUP BY instrument_id, trade_date
+            """
+        )
+
+        con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_missing")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_daily_short_volume_missing AS
+            SELECT s.*
+            FROM tmp_daily_short_volume_canonical_source s
             LEFT JOIN daily_short_volume_history h
-              ON h.instrument_id = r.instrument_id
-             AND h.trade_date = r.trade_date
-            WHERE r.rn = 1
-              AND r.instrument_id IS NOT NULL
-              AND h.instrument_id IS NULL
+              ON h.instrument_id = s.instrument_id
+             AND h.trade_date = s.trade_date
+            WHERE h.instrument_id IS NULL
             """
         )
 
@@ -321,11 +377,69 @@ class BuildShortDataPipeline(BasePipeline):
                 available_at,
                 source_name,
                 CURRENT_TIMESTAMP
-            FROM tmp_missing_daily_short_volume
+            FROM tmp_daily_short_volume_missing
             """
         )
 
-        # Backfill PIT fields on already-existing canonical rows
+        before_null_short_exempt = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM daily_short_volume_history
+                WHERE instrument_id IS NOT NULL
+                  AND short_exempt_volume IS NULL
+                """
+            ).fetchone()[0]
+        )
+
+        con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_updates")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_daily_short_volume_updates AS
+            SELECT
+                h.instrument_id,
+                h.trade_date,
+                s.company_id,
+                s.symbol,
+                s.short_volume,
+                s.short_exempt_volume,
+                s.total_volume,
+                s.short_volume_ratio,
+                s.publication_date,
+                s.available_at,
+                s.source_name
+            FROM daily_short_volume_history h
+            INNER JOIN tmp_daily_short_volume_canonical_source s
+              ON h.instrument_id = s.instrument_id
+             AND h.trade_date = s.trade_date
+            WHERE
+                h.company_id IS NULL
+                OR h.symbol IS NULL
+                OR h.publication_date IS NULL
+                OR h.available_at IS NULL
+                OR (
+                    h.short_exempt_volume IS NULL
+                    AND s.short_exempt_volume IS NOT NULL
+                )
+            """
+        )
+
+        con.execute(
+            """
+            UPDATE daily_short_volume_history AS h
+            SET
+                company_id = COALESCE(h.company_id, u.company_id),
+                symbol = COALESCE(h.symbol, u.symbol),
+                publication_date = COALESCE(h.publication_date, u.publication_date),
+                available_at = COALESCE(h.available_at, u.available_at),
+                short_exempt_volume = COALESCE(h.short_exempt_volume, u.short_exempt_volume),
+                source_name = COALESCE(h.source_name, u.source_name)
+            FROM tmp_daily_short_volume_updates u
+            WHERE h.instrument_id = u.instrument_id
+              AND h.trade_date = u.trade_date
+            """
+        )
+
         con.execute(
             """
             UPDATE daily_short_volume_history
@@ -349,28 +463,51 @@ class BuildShortDataPipeline(BasePipeline):
         after_count = int(
             con.execute("SELECT COUNT(*) FROM daily_short_volume_history").fetchone()[0]
         )
-
+        after_null_short_exempt = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM daily_short_volume_history
+                WHERE instrument_id IS NOT NULL
+                  AND short_exempt_volume IS NULL
+                """
+            ).fetchone()[0]
+        )
         null_pub = int(
             con.execute(
-                "SELECT COUNT(*) FROM daily_short_volume_history WHERE instrument_id IS NOT NULL AND publication_date IS NULL"
+                """
+                SELECT COUNT(*)
+                FROM daily_short_volume_history
+                WHERE instrument_id IS NOT NULL
+                  AND publication_date IS NULL
+                """
             ).fetchone()[0]
         )
         null_avail = int(
             con.execute(
-                "SELECT COUNT(*) FROM daily_short_volume_history WHERE instrument_id IS NOT NULL AND available_at IS NULL"
+                """
+                SELECT COUNT(*)
+                FROM daily_short_volume_history
+                WHERE instrument_id IS NOT NULL
+                  AND available_at IS NULL
+                """
             ).fetchone()[0]
         )
 
         return {
             "inserted_daily_short_volume_history": after_count - before_count,
+            "backfilled_daily_short_volume_history_short_exempt_volume": (
+                before_null_short_exempt - after_null_short_exempt
+            ),
+            "remaining_daily_short_volume_history_null_short_exempt_volume": after_null_short_exempt,
             "remaining_daily_short_volume_history_null_publication_date": null_pub,
             "remaining_daily_short_volume_history_null_available_at": null_avail,
         }
 
-    def _backfill_existing_short_features_metadata(self) -> dict[str, int]:
+    def _backfill_existing_short_feature_metadata(self) -> dict[str, int]:
         con = self.con
 
-        before_missing_max_available = int(
+        before_null_available = int(
             con.execute(
                 """
                 SELECT COUNT(*)
@@ -379,60 +516,68 @@ class BuildShortDataPipeline(BasePipeline):
                   AND max_source_available_at IS NULL
                 """
             ).fetchone()[0]
+        )
+        before_null_short_exempt = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM short_features_daily
+                WHERE instrument_id IS NOT NULL
+                  AND short_exempt_volume IS NULL
+                """
+            ).fetchone()[0]
+        )
+
+        con.execute("DROP TABLE IF EXISTS tmp_short_feature_updates")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_short_feature_updates AS
+            SELECT
+                f.instrument_id,
+                f.as_of_date,
+                d.company_id,
+                d.symbol,
+                d.short_volume,
+                d.short_exempt_volume,
+                d.total_volume,
+                d.short_volume_ratio,
+                d.available_at
+            FROM short_features_daily AS f
+            INNER JOIN daily_short_volume_history AS d
+              ON f.instrument_id = d.instrument_id
+             AND f.as_of_date = d.trade_date
+            WHERE
+                f.company_id IS NULL
+                OR f.symbol IS NULL
+                OR f.short_volume IS NULL
+                OR f.total_volume IS NULL
+                OR f.short_volume_ratio IS NULL
+                OR f.max_source_available_at IS NULL
+                OR (
+                    f.short_exempt_volume IS NULL
+                    AND d.short_exempt_volume IS NOT NULL
+                )
+            """
         )
 
         con.execute(
             """
             UPDATE short_features_daily AS f
             SET
-                short_exempt_volume = COALESCE(f.short_exempt_volume, d.short_exempt_volume),
-                max_source_available_at = COALESCE(
-                    f.max_source_available_at,
-                    d.available_at,
-                    CAST(d.trade_date AS TIMESTAMP)
-                ),
-                short_interest_change = COALESCE(
-                    f.short_interest_change,
-                    CASE
-                        WHEN f.short_interest IS NOT NULL
-                             AND f.short_interest_change IS NULL
-                        THEN f.short_interest - (f.short_interest - COALESCE(f.short_interest_change, 0))
-                        ELSE f.short_interest_change
-                    END
-                ),
-                short_interest_change_pct = COALESCE(
-                    f.short_interest_change_pct,
-                    CASE
-                        WHEN f.short_interest IS NOT NULL
-                             AND f.short_interest_change IS NOT NULL
-                             AND (f.short_interest - f.short_interest_change) IS NOT NULL
-                             AND (f.short_interest - f.short_interest_change) <> 0
-                        THEN f.short_interest_change / (f.short_interest - f.short_interest_change)
-                        ELSE f.short_interest_change_pct
-                    END
-                ),
-                short_squeeze_score = COALESCE(
-                    f.short_squeeze_score,
-                    CASE
-                        WHEN f.days_to_cover IS NOT NULL AND f.short_volume_ratio IS NOT NULL
-                        THEN (0.7 * f.days_to_cover) + (0.3 * (100.0 * f.short_volume_ratio))
-                        ELSE NULL
-                    END
-                )
-            FROM daily_short_volume_history AS d
-            WHERE f.instrument_id = d.instrument_id
-              AND f.as_of_date = d.trade_date
-              AND f.instrument_id IS NOT NULL
-              AND (
-                    f.max_source_available_at IS NULL
-                 OR f.short_exempt_volume IS NULL
-                 OR f.short_squeeze_score IS NULL
-                 OR f.short_interest_change_pct IS NULL
-              )
+                company_id = COALESCE(f.company_id, u.company_id),
+                symbol = COALESCE(f.symbol, u.symbol),
+                short_volume = COALESCE(f.short_volume, u.short_volume),
+                short_exempt_volume = COALESCE(f.short_exempt_volume, u.short_exempt_volume),
+                total_volume = COALESCE(f.total_volume, u.total_volume),
+                short_volume_ratio = COALESCE(f.short_volume_ratio, u.short_volume_ratio),
+                max_source_available_at = COALESCE(f.max_source_available_at, u.available_at)
+            FROM tmp_short_feature_updates u
+            WHERE f.instrument_id = u.instrument_id
+              AND f.as_of_date = u.as_of_date
             """
         )
 
-        after_missing_max_available = int(
+        after_null_available = int(
             con.execute(
                 """
                 SELECT COUNT(*)
@@ -442,73 +587,128 @@ class BuildShortDataPipeline(BasePipeline):
                 """
             ).fetchone()[0]
         )
+        after_null_short_exempt = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM short_features_daily
+                WHERE instrument_id IS NOT NULL
+                  AND short_exempt_volume IS NULL
+                """
+            ).fetchone()[0]
+        )
+
+        remaining_null_short_pressure = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM short_features_daily
+                WHERE instrument_id IS NOT NULL
+                  AND short_pressure_zscore IS NULL
+                """
+            ).fetchone()[0]
+        )
+        remaining_null_days_to_cover_zscore = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM short_features_daily
+                WHERE instrument_id IS NOT NULL
+                  AND days_to_cover_zscore IS NULL
+                """
+            ).fetchone()[0]
+        )
 
         return {
-            "backfilled_short_features_max_source_available_at": before_missing_max_available - after_missing_max_available,
-            "remaining_short_features_null_max_source_available_at": after_missing_max_available,
+            "backfilled_short_features_max_source_available_at": (
+                before_null_available - after_null_available
+            ),
+            "backfilled_short_features_short_exempt_volume": (
+                before_null_short_exempt - after_null_short_exempt
+            ),
+            "remaining_short_features_null_max_source_available_at": after_null_available,
+            "remaining_short_features_null_short_exempt_volume": after_null_short_exempt,
+            "remaining_short_features_null_short_pressure_zscore": remaining_null_short_pressure,
+            "remaining_short_features_null_days_to_cover_zscore": remaining_null_days_to_cover_zscore,
         }
 
-    def _insert_missing_short_features(self) -> dict[str, int]:
+    def _insert_missing_short_feature_rows(self) -> dict[str, int]:
         con = self.con
-
         before_count = int(
             con.execute("SELECT COUNT(*) FROM short_features_daily").fetchone()[0]
         )
 
-        con.execute("DROP TABLE IF EXISTS tmp_missing_feature_keys")
+        con.execute("DROP TABLE IF EXISTS tmp_short_interest_match_dates")
         con.execute(
             """
-            CREATE TEMP TABLE tmp_missing_feature_keys AS
+            CREATE TEMP TABLE tmp_short_interest_match_dates AS
+            SELECT
+                d.instrument_id,
+                d.trade_date,
+                MAX(s.settlement_date) AS settlement_date
+            FROM daily_short_volume_history d
+            LEFT JOIN short_interest_history s
+              ON d.instrument_id = s.instrument_id
+             AND s.settlement_date <= d.trade_date
+            GROUP BY d.instrument_id, d.trade_date
+            """
+        )
+
+        con.execute("DROP TABLE IF EXISTS tmp_missing_short_features_base")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_missing_short_features_base AS
             SELECT
                 d.instrument_id,
                 d.company_id,
                 d.symbol,
-                d.trade_date,
+                d.trade_date AS as_of_date,
+                s.short_interest,
+                s.avg_daily_volume,
+                s.days_to_cover,
                 d.short_volume,
                 d.short_exempt_volume,
                 d.total_volume,
                 d.short_volume_ratio,
-                d.available_at,
+                CASE
+                    WHEN s.short_interest IS NOT NULL
+                     AND s.previous_short_interest IS NOT NULL
+                    THEN s.short_interest - s.previous_short_interest
+                    ELSE NULL
+                END AS short_interest_change,
+                CASE
+                    WHEN s.short_interest IS NOT NULL
+                     AND s.previous_short_interest IS NOT NULL
+                     AND s.previous_short_interest <> 0
+                    THEN (s.short_interest - s.previous_short_interest) / s.previous_short_interest
+                    ELSE NULL
+                END AS short_interest_change_pct,
+                CASE
+                    WHEN s.days_to_cover IS NOT NULL
+                     AND d.short_volume_ratio IS NOT NULL
+                    THEN (0.7 * s.days_to_cover) + (0.3 * (100.0 * d.short_volume_ratio))
+                    ELSE NULL
+                END AS short_squeeze_score,
+                d.available_at AS max_source_available_at,
                 d.source_name
             FROM daily_short_volume_history d
+            LEFT JOIN tmp_short_interest_match_dates m
+              ON d.instrument_id = m.instrument_id
+             AND d.trade_date = m.trade_date
+            LEFT JOIN short_interest_history s
+              ON d.instrument_id = s.instrument_id
+             AND s.settlement_date = m.settlement_date
             LEFT JOIN short_features_daily f
-              ON f.instrument_id = d.instrument_id
-             AND f.as_of_date = d.trade_date
-            WHERE d.instrument_id IS NOT NULL
-              AND f.instrument_id IS NULL
+              ON d.instrument_id = f.instrument_id
+             AND d.trade_date = f.as_of_date
+            WHERE f.instrument_id IS NULL
             """
         )
 
-        con.execute("DROP TABLE IF EXISTS tmp_missing_feature_join")
+        con.execute("DROP TABLE IF EXISTS tmp_missing_short_features_scored")
         con.execute(
             """
-            CREATE TEMP TABLE tmp_missing_feature_join AS
-            WITH matched AS (
-                SELECT
-                    d.instrument_id,
-                    d.company_id,
-                    d.symbol,
-                    d.trade_date AS as_of_date,
-                    d.short_volume,
-                    d.short_exempt_volume,
-                    d.total_volume,
-                    d.short_volume_ratio,
-                    d.available_at AS volume_available_at,
-                    d.source_name,
-                    s.short_interest,
-                    s.previous_short_interest,
-                    s.avg_daily_volume,
-                    s.days_to_cover,
-                    s.available_at AS short_available_at,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY d.instrument_id, d.trade_date
-                        ORDER BY s.settlement_date DESC NULLS LAST
-                    ) AS rn
-                FROM tmp_missing_feature_keys d
-                LEFT JOIN short_interest_history s
-                  ON s.instrument_id = d.instrument_id
-                 AND s.settlement_date <= d.trade_date
-            )
+            CREATE TEMP TABLE tmp_missing_short_features_scored AS
             SELECT
                 instrument_id,
                 company_id,
@@ -521,29 +721,70 @@ class BuildShortDataPipeline(BasePipeline):
                 short_exempt_volume,
                 total_volume,
                 short_volume_ratio,
+                short_interest_change,
+                short_interest_change_pct,
+                short_squeeze_score,
                 CASE
-                    WHEN short_interest IS NOT NULL AND previous_short_interest IS NOT NULL
-                    THEN short_interest - previous_short_interest
+                    WHEN COUNT(short_volume_ratio) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) >= 20
+                     AND STDDEV_SAMP(short_volume_ratio) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) IS NOT NULL
+                     AND STDDEV_SAMP(short_volume_ratio) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) <> 0
+                    THEN (
+                        short_volume_ratio - AVG(short_volume_ratio) OVER (
+                            PARTITION BY instrument_id
+                            ORDER BY as_of_date
+                            ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                        )
+                    ) / STDDEV_SAMP(short_volume_ratio) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    )
                     ELSE NULL
-                END AS short_interest_change,
+                END AS short_pressure_zscore,
                 CASE
-                    WHEN short_interest IS NOT NULL
-                         AND previous_short_interest IS NOT NULL
-                         AND previous_short_interest <> 0
-                    THEN (short_interest - previous_short_interest) / previous_short_interest
+                    WHEN COUNT(days_to_cover) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) >= 20
+                     AND STDDEV_SAMP(days_to_cover) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) IS NOT NULL
+                     AND STDDEV_SAMP(days_to_cover) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) <> 0
+                    THEN (
+                        days_to_cover - AVG(days_to_cover) OVER (
+                            PARTITION BY instrument_id
+                            ORDER BY as_of_date
+                            ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                        )
+                    ) / STDDEV_SAMP(days_to_cover) OVER (
+                        PARTITION BY instrument_id
+                        ORDER BY as_of_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    )
                     ELSE NULL
-                END AS short_interest_change_pct,
-                CASE
-                    WHEN days_to_cover IS NOT NULL AND short_volume_ratio IS NOT NULL
-                    THEN (0.7 * days_to_cover) + (0.3 * (100.0 * short_volume_ratio))
-                    ELSE NULL
-                END AS short_squeeze_score,
-                CAST(NULL AS DOUBLE) AS short_pressure_zscore,
-                CAST(NULL AS DOUBLE) AS days_to_cover_zscore,
-                COALESCE(short_available_at, volume_available_at, CAST(as_of_date AS TIMESTAMP)) AS max_source_available_at,
+                END AS days_to_cover_zscore,
+                max_source_available_at,
                 source_name
-            FROM matched
-            WHERE rn = 1
+            FROM tmp_missing_short_features_base
             """
         )
 
@@ -590,7 +831,7 @@ class BuildShortDataPipeline(BasePipeline):
                 max_source_available_at,
                 source_name,
                 CURRENT_TIMESTAMP
-            FROM tmp_missing_feature_join
+            FROM tmp_missing_short_features_scored
             """
         )
 
@@ -604,6 +845,10 @@ class BuildShortDataPipeline(BasePipeline):
 
     def load(self, data) -> None:
         con = self.con
+
+        self._metrics["rows_read_raw"] = int(
+            con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0]
+        )
 
         progress = tqdm(
             total=self._progress_total_steps,
@@ -625,17 +870,17 @@ class BuildShortDataPipeline(BasePipeline):
         self._metrics.update(self._backfill_short_interest_pit())
         progress.update(1)
 
-        self._log_step(4, "build ticker map and upsert missing daily short volume history")
+        self._log_step(4, "build ticker map and upsert canonical daily short volume history")
         self._build_ticker_map_temp()
-        self._metrics.update(self._upsert_missing_daily_short_volume_history())
+        self._metrics.update(self._upsert_canonical_daily_short_volume_history())
         progress.update(1)
 
         self._log_step(5, "backfill existing short feature metadata")
-        self._metrics.update(self._backfill_existing_short_features_metadata())
+        self._metrics.update(self._backfill_existing_short_feature_metadata())
         progress.update(1)
 
         self._log_step(6, "insert missing short feature rows")
-        self._metrics.update(self._insert_missing_short_features())
+        self._metrics.update(self._insert_missing_short_feature_rows())
         progress.update(1)
 
         self._log_step(7, "collect final counts")
@@ -649,7 +894,6 @@ class BuildShortDataPipeline(BasePipeline):
             con.execute("SELECT COUNT(*) FROM short_features_daily").fetchone()[0]
         )
         progress.update(1)
-        progress.close()
 
         self._rows_written = (
             int(self._metrics.get("inserted_daily_short_volume_history", 0))
@@ -657,9 +901,7 @@ class BuildShortDataPipeline(BasePipeline):
         )
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
-        result.rows_read = int(
-            self.con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0]
-        )
+        result.rows_read = int(self._metrics.get("rows_read_raw", 0))
         result.rows_written = self._rows_written
         result.metrics.update(self._metrics)
         return result
