@@ -1,3 +1,18 @@
+===== DATE =====
+Mon 16 Mar 2026 06:40:06 PM EDT
+===== COMPILE TARGET =====
+
+===== HELP CHECK =====
+16:                                        [--skip-finra]
+17:                                        [--finra-output-dir FINRA_OUTPUT_DIR]
+18:                                        [--finra-start-date FINRA_START_DATE]
+19:                                        [--finra-end-date FINRA_END_DATE]
+60:  --skip-finra          Skip FINRA daily refresh.
+61:  --finra-output-dir FINRA_OUTPUT_DIR
+64:  --finra-start-date FINRA_START_DATE
+66:  --finra-end-date FINRA_END_DATE
+
+===== DOC CHECK =====
 # DB Rebuild
 
 ## Objectif
@@ -126,3 +141,4 @@ Fenêtre FINRA explicite :
 python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --stooq-source /path/to/stooq.zip --finra-start-date 2026-01-01 --finra-end-date 2026-03-16 --verbose
 
 Attention : sauter le backfill Stooq n'est pas un vrai from-scratch rebuild complet.
+===== DONE =====

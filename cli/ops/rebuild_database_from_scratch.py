@@ -15,14 +15,10 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Rebuild the DuckDB database from scratch using real raw symbol sources, "
             "core SEC normalization, fundamentals construction, mandatory Stooq price backfill, "
-            "optional Yahoo daily refresh, and future extension points such as FINRA."
+            "optional Yahoo daily refresh, and FINRA daily refresh."
         )
     )
-    parser.add_argument(
-        "--db-path",
-        default=None,
-        help="Path to DuckDB database file.",
-    )
+    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
 
     # ------------------------------------------------------------------
     # Core rebuild switches
@@ -37,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-fundamentals", action="store_true", help="Skip build_fundamentals.")
 
     # ------------------------------------------------------------------
-    # Price-specific switches
+    # Prices
     # ------------------------------------------------------------------
     parser.add_argument(
         "--skip-price-backfill",
@@ -66,17 +62,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--price-start-date",
         default=None,
-        help="Optional start date for prices (YYYY-MM-DD). Applies to daily and can be used for explicit backfill windows.",
+        help="Optional start date for prices (YYYY-MM-DD).",
     )
     parser.add_argument(
         "--price-end-date",
         default=None,
-        help="Optional end date for prices (YYYY-MM-DD). Applies to daily and can be used for explicit backfill windows.",
+        help="Optional end date for prices (YYYY-MM-DD).",
     )
     parser.add_argument(
         "--price-as-of",
         default=None,
         help="Optional single date for daily price refresh (YYYY-MM-DD).",
+    )
+
+    # ------------------------------------------------------------------
+    # FINRA
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--skip-finra",
+        action="store_true",
+        help="Skip FINRA daily refresh.",
+    )
+    parser.add_argument(
+        "--finra-output-dir",
+        default="~/stock-quant-oop/data/raw/finra/short_interest",
+        help="Directory where FINRA short-interest files are stored/downloaded.",
+    )
+    parser.add_argument(
+        "--finra-start-date",
+        default=None,
+        help="Inclusive FINRA start date YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--finra-end-date",
+        default=None,
+        help="Inclusive FINRA end date YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--finra-source-market",
+        default="regular",
+        choices=["regular", "otc", "both"],
+        help="Source market passed to FINRA normalized build.",
+    )
+    parser.add_argument(
+        "--finra-overwrite-downloads",
+        action="store_true",
+        help="Overwrite existing local FINRA download files.",
+    )
+    parser.add_argument(
+        "--finra-truncate-raw",
+        action="store_true",
+        help="Delete existing finra_short_interest_source_raw before load.",
     )
 
     # ------------------------------------------------------------------
@@ -99,9 +135,7 @@ def _run_step(step_name: str, command: list[str]) -> None:
     completed = subprocess.run(command, text=True)
 
     if completed.returncode != 0:
-        raise SystemExit(
-            f"step failed: {step_name} (exit_code={completed.returncode})"
-        )
+        raise SystemExit(f"step failed: {step_name} (exit_code={completed.returncode})")
 
 
 def _latest_file(directory: Path, pattern: str) -> Path | None:
@@ -145,40 +179,37 @@ def main() -> int:
     print(f"project_root={project_root}", flush=True)
     print(f"db_path={db_path}", flush=True)
 
-    # ------------------------------------------------------------------
-    # 1) Init DB schema
-    # ------------------------------------------------------------------
     if not args.skip_init:
-        command = [
-            python_bin,
-            str(project_root / "cli" / "core" / "init_market_db.py"),
-            "--db-path",
-            str(db_path),
-        ]
-        _run_step("INIT MARKET DB", command)
+        _run_step(
+            "INIT MARKET DB",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "init_market_db.py"),
+                "--db-path",
+                str(db_path),
+            ],
+        )
 
-    # ------------------------------------------------------------------
-    # 2) Fetch raw symbol sources to local disk
-    # ------------------------------------------------------------------
     if not args.skip_sec_fetch:
-        command = [
-            python_bin,
-            str(project_root / "cli" / "raw" / "fetch_sec_company_tickers_raw.py"),
-            "--verbose",
-        ]
-        _run_step("FETCH SEC COMPANY TICKERS RAW", command)
+        _run_step(
+            "FETCH SEC COMPANY TICKERS RAW",
+            [
+                python_bin,
+                str(project_root / "cli" / "raw" / "fetch_sec_company_tickers_raw.py"),
+                "--verbose",
+            ],
+        )
 
     if not args.skip_nasdaq_fetch:
-        command = [
-            python_bin,
-            str(project_root / "cli" / "raw" / "fetch_nasdaq_symbol_directory_raw.py"),
-            "--verbose",
-        ]
-        _run_step("FETCH NASDAQ SYMBOL DIRECTORY RAW", command)
+        _run_step(
+            "FETCH NASDAQ SYMBOL DIRECTORY RAW",
+            [
+                python_bin,
+                str(project_root / "cli" / "raw" / "fetch_nasdaq_symbol_directory_raw.py"),
+                "--verbose",
+            ],
+        )
 
-    # ------------------------------------------------------------------
-    # 3) Resolve latest local raw symbol files
-    # ------------------------------------------------------------------
     sec_file = _latest_file(sec_dir, "sec_company_tickers_*.csv")
     nasdaqlisted_file = _latest_file(nasdaq_dir, "nasdaqlisted_*.csv")
     otherlisted_file = _latest_file(nasdaq_dir, "otherlisted_*.csv")
@@ -188,9 +219,6 @@ def main() -> int:
     print(f"nasdaqlisted_file={nasdaqlisted_file}", flush=True)
     print(f"otherlisted_file={otherlisted_file}", flush=True)
 
-    # ------------------------------------------------------------------
-    # 4) Load symbol_reference_source_raw from real local raw files
-    # ------------------------------------------------------------------
     if not args.skip_raw_load:
         missing_files: list[str] = []
         if sec_file is None:
@@ -202,31 +230,29 @@ def main() -> int:
 
         if missing_files:
             raise SystemExit(
-                "cannot load symbol_reference_source_raw; missing files: "
-                + ", ".join(missing_files)
+                "cannot load symbol_reference_source_raw; missing files: " + ", ".join(missing_files)
             )
 
-        command = [
-            python_bin,
-            str(project_root / "cli" / "raw" / "load_symbol_reference_source_raw.py"),
-            "--db-path",
-            str(db_path),
-            "--truncate",
-            "--source",
-            str(nasdaqlisted_file),
-            "--source",
-            str(otherlisted_file),
-            "--source",
-            str(sec_file),
-            "--verbose",
-        ]
-        _run_step("LOAD SYMBOL_REFERENCE_SOURCE_RAW", command)
+        _run_step(
+            "LOAD SYMBOL_REFERENCE_SOURCE_RAW",
+            [
+                python_bin,
+                str(project_root / "cli" / "raw" / "load_symbol_reference_source_raw.py"),
+                "--db-path",
+                str(db_path),
+                "--truncate",
+                "--source",
+                str(nasdaqlisted_file),
+                "--source",
+                str(otherlisted_file),
+                "--source",
+                str(sec_file),
+                "--verbose",
+            ],
+        )
 
-    # ------------------------------------------------------------------
-    # 5) Build market_universe
-    # ------------------------------------------------------------------
     if not args.skip_market_universe:
-        command = [
+        cmd = [
             python_bin,
             str(project_root / "cli" / "core" / "build_market_universe.py"),
             "--db-path",
@@ -234,55 +260,45 @@ def main() -> int:
             "--verbose",
         ]
         if not args.allow_adr:
-            # Current CLI remains conservative by default.
             pass
-        _run_step("BUILD MARKET UNIVERSE", command)
+        _run_step("BUILD MARKET UNIVERSE", cmd)
 
-    # ------------------------------------------------------------------
-    # 6) Build symbol_reference
-    # ------------------------------------------------------------------
     if not args.skip_symbol_reference:
-        command = [
-            python_bin,
-            str(project_root / "cli" / "core" / "build_symbol_reference.py"),
-            "--db-path",
-            str(db_path),
-            "--verbose",
-        ]
-        _run_step("BUILD SYMBOL REFERENCE", command)
+        _run_step(
+            "BUILD SYMBOL REFERENCE",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_symbol_reference.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
 
-    # ------------------------------------------------------------------
-    # 7) Build SEC filings
-    # ------------------------------------------------------------------
     if not args.skip_sec_filings:
-        command = [
-            python_bin,
-            str(project_root / "cli" / "core" / "build_sec_filings.py"),
-            "--db-path",
-            str(db_path),
-            "--verbose",
-        ]
-        _run_step("BUILD SEC FILINGS", command)
+        _run_step(
+            "BUILD SEC FILINGS",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_sec_filings.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
 
-    # ------------------------------------------------------------------
-    # 8) Build fundamentals
-    # ------------------------------------------------------------------
     if not args.skip_fundamentals:
-        command = [
-            python_bin,
-            str(project_root / "cli" / "core" / "build_fundamentals.py"),
-            "--db-path",
-            str(db_path),
-            "--verbose",
-        ]
-        _run_step("BUILD FUNDAMENTALS", command)
+        _run_step(
+            "BUILD FUNDAMENTALS",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_fundamentals.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
 
-    # ------------------------------------------------------------------
-    # 9) Historical price backfill is part of the rebuild.
-    #
-    # This is essential for a real from-scratch rebuild because daily Yahoo
-    # refresh alone is not sufficient to reconstruct long history.
-    # ------------------------------------------------------------------
     if not args.skip_price_backfill:
         if not args.stooq_sources:
             raise SystemExit(
@@ -290,7 +306,7 @@ def main() -> int:
                 "pass at least one --stooq-source or explicitly use --skip-price-backfill"
             )
 
-        command = [
+        cmd = [
             python_bin,
             str(project_root / "cli" / "core" / "build_prices.py"),
             "--db-path",
@@ -299,14 +315,11 @@ def main() -> int:
             "backfill",
             "--verbose",
         ]
-        command = _extend_with_optional_price_filters(command, args)
-        _run_step("BUILD PRICES BACKFILL", command)
+        cmd = _extend_with_optional_price_filters(cmd, args)
+        _run_step("BUILD PRICES BACKFILL", cmd)
 
-    # ------------------------------------------------------------------
-    # 10) Daily price refresh after historical backfill
-    # ------------------------------------------------------------------
     if not args.skip_price_daily:
-        command = [
+        cmd = [
             python_bin,
             str(project_root / "cli" / "core" / "build_prices.py"),
             "--db-path",
@@ -317,16 +330,42 @@ def main() -> int:
         ]
 
         for symbol in args.price_symbols:
-            command.extend(["--symbol", str(symbol)])
+            cmd.extend(["--symbol", str(symbol)])
 
         if args.price_start_date:
-            command.extend(["--start-date", str(args.price_start_date)])
+            cmd.extend(["--start-date", str(args.price_start_date)])
         if args.price_end_date:
-            command.extend(["--end-date", str(args.price_end_date)])
+            cmd.extend(["--end-date", str(args.price_end_date)])
         if args.price_as_of:
-            command.extend(["--as-of", str(args.price_as_of)])
+            cmd.extend(["--as-of", str(args.price_as_of)])
 
-        _run_step("BUILD PRICES DAILY", command)
+        _run_step("BUILD PRICES DAILY", cmd)
+
+    if not args.skip_finra:
+        finra_cmd = [
+            python_bin,
+            str(project_root / "cli" / "ops" / "run_finra_daily_refresh.py"),
+            "--project-root",
+            str(project_root),
+            "--db-path",
+            str(db_path),
+            "--output-dir",
+            str(Path(args.finra_output_dir).expanduser().resolve()),
+            "--source-market",
+            str(args.finra_source_market),
+        ]
+        if args.finra_start_date:
+            finra_cmd.extend(["--start-date", str(args.finra_start_date)])
+        if args.finra_end_date:
+            finra_cmd.extend(["--end-date", str(args.finra_end_date)])
+        if args.finra_overwrite_downloads:
+            finra_cmd.append("--overwrite-downloads")
+        if args.finra_truncate_raw:
+            finra_cmd.append("--truncate-raw")
+        if args.verbose:
+            finra_cmd.append("--verbose")
+
+        _run_step("RUN FINRA DAILY REFRESH", finra_cmd)
 
     print("===== REBUILD DATABASE COMPLETE =====", flush=True)
     print(f"db_path={db_path}", flush=True)
