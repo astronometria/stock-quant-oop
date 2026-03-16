@@ -6,9 +6,10 @@ from __future__ import annotations
 # Repository d'accès aux tables SEC dans DuckDB.
 #
 # Ajustements importants dans cette version:
-# - alignement strict avec le schéma SEC existant + migré
+# - ajout de load_cik_company_map() attendu par BuildSecFilingPipeline
+# - alignement avec le schéma SEC existant + migré
 # - conservation de available_at dans sec_fact_normalized
-# - méthodes de lecture utiles pour les services de build
+# - helpers de lecture utiles pour les services de build
 # - helpers PIT pour futures étapes de recherche quant
 # =============================================================================
 
@@ -38,6 +39,44 @@ class DuckDbSecRepository:
     @staticmethod
     def _safe_datetime(value: datetime | None) -> datetime | None:
         return value
+
+    # =========================================================================
+    # Reference helpers
+    # =========================================================================
+    def load_cik_company_map(self) -> dict[str, str]:
+        """
+        Construit une map CIK -> company_id à partir de symbol_reference.
+
+        Pourquoi:
+        - BuildSecFilingPipeline en a besoin pour enrichir sec_filing.company_id
+        - le repo public appelait cette méthode depuis le pipeline, mais elle
+          n'était pas implémentée dans le repository SEC
+
+        Logique:
+        - on prend les lignes de symbol_reference avec company_id et cik non vides
+        - si plusieurs lignes partagent le même CIK, on garde la première
+          company_id rencontrée après tri stable
+        """
+        rows = self.con.execute(
+            """
+            SELECT
+                TRIM(CAST(cik AS VARCHAR)) AS cik,
+                TRIM(CAST(company_id AS VARCHAR)) AS company_id
+            FROM symbol_reference
+            WHERE cik IS NOT NULL
+              AND TRIM(CAST(cik AS VARCHAR)) <> ''
+              AND company_id IS NOT NULL
+              AND TRIM(CAST(company_id AS VARCHAR)) <> ''
+            ORDER BY cik, company_id
+            """
+        ).fetchall()
+
+        mapping: dict[str, str] = {}
+        for cik, company_id in rows:
+            normalized_cik = str(cik).strip().zfill(10)
+            if normalized_cik not in mapping:
+                mapping[normalized_cik] = str(company_id).strip()
+        return mapping
 
     # =========================================================================
     # RAW INDEX
@@ -297,6 +336,7 @@ class DuckDbSecRepository:
             )
             """
         )
+
         try:
             self.con.executemany(
                 """
