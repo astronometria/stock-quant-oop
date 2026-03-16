@@ -9,15 +9,12 @@ class BuildMarketUniversePipeline(BasePipeline):
     """
     Construit `market_universe` à partir de `symbol_reference_source_raw`.
 
-    Philosophie
-    -----------
-    On repart ici d'une logique de filtrage simple et robuste pour la recherche quant :
-
-    - univers cible : equities US standard listées sur NASDAQ ou NYSE
-    - on fusionne les signaux multi-sources par symbole
-    - on n'utilise PAS une seule ligne "gagnante" avant classification
-    - on exclut explicitement :
-        * OTC / pink / venues hors NASDAQ/NYSE
+    Univers cible
+    -------------
+    - actions US standard
+    - venues autorisées : NASDAQ, NYSE
+    - exclusions explicites :
+        * OTC / Pink / autres venues non autorisées
         * ETF / ETN
         * ADR / ADS / depositary shares
         * preferred
@@ -25,11 +22,12 @@ class BuildMarketUniversePipeline(BasePipeline):
         * right
         * unit
 
-    Notes d'implémentation
-    ----------------------
+    Notes
+    -----
     - SQL-first
     - pipeline mince
-    - repository attendu : objet avec `con`
+    - repository attendu : objet exposant `con`
+    - on fusionne les signaux multi-sources par symbole
     """
 
     pipeline_name = "build_market_universe"
@@ -91,11 +89,6 @@ class BuildMarketUniversePipeline(BasePipeline):
 
         # ------------------------------------------------------------------
         # 1) Normalisation brute par ligne
-        #
-        # Important :
-        # - on garde toutes les lignes valides
-        # - on harmonise les exchanges
-        # - on prépare un texte d'évidence pour détecter les types exclus
         # ------------------------------------------------------------------
         con.execute(
             """
@@ -109,7 +102,7 @@ class BuildMarketUniversePipeline(BasePipeline):
                     WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NASDAQ', 'NASDAQGS', 'NASDAQGM', 'NASDAQCM') THEN 'NASDAQ'
                     WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE', 'NYQ') THEN 'NYSE'
                     WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE_ARCA', 'NYSEARCA', 'ARCA', 'P') THEN 'NYSE_ARCA'
-                    WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE_MKT', 'NYSE_MKT LLC', 'NYSEMKT', 'AMEX', 'A', 'NYSE_AMERICAN', 'NYSEAMERICAN') THEN 'NYSE_AMERICAN'
+                    WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE_MKT', 'NYSEMKT', 'AMEX', 'A', 'NYSE_AMERICAN', 'NYSEAMERICAN') THEN 'NYSE_AMERICAN'
                     WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('BATS', 'Z') THEN 'BATS'
                     WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('IEX', 'V') THEN 'IEX'
                     WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) LIKE 'OTC%' THEN 'OTC'
@@ -133,9 +126,6 @@ class BuildMarketUniversePipeline(BasePipeline):
 
         # ------------------------------------------------------------------
         # 2) Agrégation par symbole
-        #
-        # On fusionne les signaux SEC + NASDAQ au lieu de classifier ligne par ligne.
-        # C'est ici que le pipeline précédent se faisait piéger.
         # ------------------------------------------------------------------
         con.execute(
             """
@@ -146,6 +136,11 @@ class BuildMarketUniversePipeline(BasePipeline):
                 COALESCE(
                     MAX(company_name) FILTER (
                         WHERE source_name = 'sec_company_tickers_exchange'
+                          AND company_name IS NOT NULL
+                          AND TRIM(company_name) <> ''
+                    ),
+                    MAX(company_name) FILTER (
+                        WHERE source_name = 'nasdaq_symbol_directory'
                           AND company_name IS NOT NULL
                           AND TRIM(company_name) <> ''
                     ),
@@ -173,7 +168,10 @@ class BuildMarketUniversePipeline(BasePipeline):
 
                 COALESCE(
                     MAX(exchange_normalized) FILTER (
-                        WHERE exchange_normalized IN ('NASDAQ', 'NYSE')
+                        WHERE exchange_normalized = 'NASDAQ'
+                    ),
+                    MAX(exchange_normalized) FILTER (
+                        WHERE exchange_normalized = 'NYSE'
                     ),
                     MAX(exchange_normalized) FILTER (
                         WHERE exchange_normalized IS NOT NULL
@@ -181,7 +179,6 @@ class BuildMarketUniversePipeline(BasePipeline):
                 ) AS exchange_normalized,
 
                 MAX(as_of_date) AS as_of_date,
-
                 COUNT(*) AS source_row_count,
                 COUNT(DISTINCT source_name) AS source_name_count,
 
@@ -244,11 +241,9 @@ class BuildMarketUniversePipeline(BasePipeline):
         # ------------------------------------------------------------------
         # 3) Décision finale d'inclusion
         #
-        # Règle voulue :
-        # - NASDAQ / NYSE uniquement
-        # - exclusion explicite des instruments non standards
-        # - si une ligne est sur NASDAQ/NYSE et n'est pas explicitement exclue,
-        #   on la traite comme equity standard
+        # IMPORTANT :
+        # - exchange_normalized NULL => EXCLU
+        # - seule inclusion possible : NASDAQ / NYSE explicites
         # ------------------------------------------------------------------
         con.execute(
             f"""
@@ -274,6 +269,7 @@ class BuildMarketUniversePipeline(BasePipeline):
                 END AS security_type,
 
                 CASE
+                    WHEN exchange_normalized IS NULL THEN FALSE
                     WHEN exchange_normalized NOT IN ('NASDAQ', 'NYSE') THEN FALSE
                     WHEN is_etf THEN FALSE
                     WHEN is_etn THEN FALSE
@@ -370,11 +366,6 @@ class BuildMarketUniversePipeline(BasePipeline):
             """
         )
 
-        # ------------------------------------------------------------------
-        # 4) Conflits informatifs
-        #
-        # On loggue ici les symboles multi-sources.
-        # ------------------------------------------------------------------
         con.execute(
             """
             INSERT INTO market_universe_conflicts (
@@ -457,6 +448,15 @@ class BuildMarketUniversePipeline(BasePipeline):
                 """
             ).fetchone()[0]
         )
+        etn_excluded_count = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM market_universe
+                WHERE exclusion_reason = 'etn_excluded'
+                """
+            ).fetchone()[0]
+        )
         adr_excluded_count = int(
             con.execute(
                 """
@@ -513,6 +513,7 @@ class BuildMarketUniversePipeline(BasePipeline):
             "exchange_not_allowed_count": exchange_not_allowed_count,
             "missing_exchange_count": missing_exchange_count,
             "etf_excluded_count": etf_excluded_count,
+            "etn_excluded_count": etn_excluded_count,
             "adr_excluded_count": adr_excluded_count,
             "preferred_excluded_count": preferred_excluded_count,
             "warrant_excluded_count": warrant_excluded_count,
