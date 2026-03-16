@@ -7,16 +7,22 @@ import sys
 from pathlib import Path
 
 from stock_quant.app.services.pipeline_run_service import PipelineRunService
-from stock_quant.app.services.subprocess_json_capture_service import SubprocessJsonCaptureService
+from stock_quant.app.services.subprocess_json_capture_service import (
+    SubprocessJsonCaptureService,
+)
 from stock_quant.infrastructure.config.settings_loader import build_app_config
 from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
 from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.repositories.duckdb_pipeline_run_repository import DuckDbPipelineRunRepository
+from stock_quant.infrastructure.repositories.duckdb_pipeline_run_repository import (
+    DuckDbPipelineRunRepository,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the full daily research pipeline with pipeline_runs logging.")
+    parser = argparse.ArgumentParser(
+        description="Run the full daily research pipeline with pipeline_runs logging."
+    )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument("--dataset-name", default="research_dataset_v1")
     parser.add_argument("--dataset-version", default="v1")
@@ -31,6 +37,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _stringify_command(command: list[object]) -> list[str]:
+    """
+    Convertit une commande hétérogène en liste de chaînes.
+    """
     return [str(part) for part in command]
 
 
@@ -40,6 +49,9 @@ def run_and_log_step(
     pipeline_name: str,
     config_payload: dict,
 ) -> int:
+    """
+    Exécute une commande subprocess puis log son résultat dans `pipeline_runs`.
+    """
     capture = SubprocessJsonCaptureService()
     payload_builder = PipelineRunService()
 
@@ -67,7 +79,11 @@ def run_and_log_step(
     session_factory = DuckDbSessionFactory(db_path)
     with DuckDbUnitOfWork(session_factory) as uow:
         ResearchSchemaManager(uow).initialize()
-        repo = DuckDbPipelineRunRepository(uow)
+
+        # Convention homogène :
+        # repository(connection) et non repository(uow).
+        repo = DuckDbPipelineRunRepository(uow.connection)
+
         payload = payload_builder.build_finished_payload(
             pipeline_name=pipeline_name,
             status=status,
@@ -84,6 +100,7 @@ def run_and_log_step(
 
 def main() -> int:
     args = parse_args()
+
     config = build_app_config(db_path=args.db_path)
     config.ensure_directories()
 
@@ -95,17 +112,25 @@ def main() -> int:
         cleanup_cmd: list[object] = [
             python,
             str(project_root / "cli" / "core" / "cleanup_research_runs.py"),
-            "--db-path", str(db_path),
-            "--dataset-name", args.dataset_name,
-            "--dataset-version", args.dataset_version,
-            "--experiment-name", args.experiment_name,
-            "--backtest-name", args.backtest_name,
-            "--llm-run-name", args.llm_run_name,
+            "--db-path",
+            str(db_path),
+            "--dataset-name",
+            args.dataset_name,
+            "--dataset-version",
+            args.dataset_version,
+            "--experiment-name",
+            args.experiment_name,
+            "--backtest-name",
+            args.backtest_name,
+            "--llm-run-name",
+            args.llm_run_name,
         ]
         cleanup_cmd_str = _stringify_command(cleanup_cmd)
+
         if args.verbose:
             print("===== RUN cleanup_research_runs =====", flush=True)
             print(" ".join(cleanup_cmd_str), flush=True)
+
         cleanup_rc = subprocess.run(cleanup_cmd_str).returncode
         if cleanup_rc != 0:
             return cleanup_rc
@@ -113,17 +138,23 @@ def main() -> int:
     llm_cmd: list[object] = [
         python,
         str(project_root / "cli" / "core" / "register_llm_run.py"),
-        "--db-path", str(db_path),
-        "--run-name", args.llm_run_name,
-        "--model-name", args.model_name,
-        "--prompt-version", args.prompt_version,
+        "--db-path",
+        str(db_path),
+        "--run-name",
+        args.llm_run_name,
+        "--model-name",
+        args.model_name,
+        "--prompt-version",
+        args.prompt_version,
     ]
     if args.verbose:
         llm_cmd.append("--verbose")
+
     llm_cmd_str = _stringify_command(llm_cmd)
     if args.verbose:
         print("===== RUN register_llm_run =====", flush=True)
         print(" ".join(llm_cmd_str), flush=True)
+
     llm_rc = subprocess.run(llm_cmd_str).returncode
     if llm_rc != 0:
         return llm_rc
@@ -134,8 +165,10 @@ def main() -> int:
             [
                 python,
                 str(project_root / "cli" / "core" / "build_feature_engine.py"),
-                "--db-path", str(db_path),
-            ] + (["--verbose"] if args.verbose else []),
+                "--db-path",
+                str(db_path),
+            ]
+            + (["--verbose"] if args.verbose else []),
             {"mode": "daily"},
         ),
         (
@@ -143,8 +176,10 @@ def main() -> int:
             [
                 python,
                 str(project_root / "cli" / "core" / "build_label_engine.py"),
-                "--db-path", str(db_path),
-            ] + (["--verbose"] if args.verbose else []),
+                "--db-path",
+                str(db_path),
+            ]
+            + (["--verbose"] if args.verbose else []),
             {"mode": "daily"},
         ),
         (
@@ -152,23 +187,37 @@ def main() -> int:
             [
                 python,
                 str(project_root / "cli" / "core" / "build_dataset_builder.py"),
-                "--db-path", str(db_path),
-                "--dataset-name", args.dataset_name,
-                "--dataset-version", args.dataset_version,
-            ] + (["--verbose"] if args.verbose else []),
-            {"mode": "daily", "dataset_name": args.dataset_name, "dataset_version": args.dataset_version},
+                "--db-path",
+                str(db_path),
+                "--dataset-name",
+                args.dataset_name,
+                "--dataset-version",
+                args.dataset_version,
+            ]
+            + (["--verbose"] if args.verbose else []),
+            {
+                "mode": "daily",
+                "dataset_name": args.dataset_name,
+                "dataset_version": args.dataset_version,
+            },
         ),
         (
             "build_backtest",
             [
                 python,
                 str(project_root / "cli" / "core" / "build_backtest.py"),
-                "--db-path", str(db_path),
-                "--dataset-name", args.dataset_name,
-                "--dataset-version", args.dataset_version,
-                "--experiment-name", args.experiment_name,
-                "--backtest-name", args.backtest_name,
-            ] + (["--verbose"] if args.verbose else []),
+                "--db-path",
+                str(db_path),
+                "--dataset-name",
+                args.dataset_name,
+                "--dataset-version",
+                args.dataset_version,
+                "--experiment-name",
+                args.experiment_name,
+                "--backtest-name",
+                args.backtest_name,
+            ]
+            + (["--verbose"] if args.verbose else []),
             {
                 "mode": "daily",
                 "dataset_name": args.dataset_name,
@@ -183,6 +232,7 @@ def main() -> int:
         command_str = _stringify_command(command)
         print(f"===== RUN {pipeline_name} =====", flush=True)
         print(" ".join(command_str), flush=True)
+
         rc = run_and_log_step(
             db_path=db_path,
             command=command,

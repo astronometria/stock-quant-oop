@@ -7,11 +7,15 @@ from stock_quant.infrastructure.config.settings_loader import build_app_config
 from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
 from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.repositories.duckdb_pipeline_run_repository import DuckDbPipelineRunRepository
+from stock_quant.infrastructure.repositories.duckdb_pipeline_run_repository import (
+    DuckDbPipelineRunRepository,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cleanup duplicate logical runs before rerun.")
+    parser = argparse.ArgumentParser(
+        description="Cleanup duplicate logical runs before rerun."
+    )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument("--dataset-name", default="research_dataset_v1")
     parser.add_argument("--dataset-version", default="v1")
@@ -28,9 +32,13 @@ def main() -> int:
     config.ensure_directories()
 
     session_factory = DuckDbSessionFactory(config.db_path)
+
     with DuckDbUnitOfWork(session_factory) as uow:
         ResearchSchemaManager(uow).initialize()
-        repo = DuckDbPipelineRunRepository(uow)
+
+        # Convention homogène :
+        # les repositories consomment la connexion brute.
+        repo = DuckDbPipelineRunRepository(uow.connection)
 
         repo.delete_dataset_version(args.dataset_name, args.dataset_version)
         repo.delete_experiment_runs(args.experiment_name)
