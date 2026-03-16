@@ -2,19 +2,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
+from stock_quant.domain.ports.repositories import PriceRepositoryPort
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
-class DuckDbPriceRepository:
+class DuckDbPriceRepository(PriceRepositoryPort):
     """
     Incremental DuckDB repository for canonical price storage.
 
     Design goals:
-    - no full-table delete on price_history
-    - backward compatible with current DB schema
-    - forward compatible with instrument_id/company_id columns
-    - symbol-based fallback while migrating toward instrument-based history
+    - no full-table delete on price_history during incremental updates
+    - preserve legacy public API used by pipelines/tests
+    - remain compatible with current symbol-based schema
+    - support future instrument/company identifiers when present
     """
 
     def __init__(self, uow: DuckDbUnitOfWork) -> None:
@@ -26,6 +28,10 @@ class DuckDbPriceRepository:
             raise RepositoryError("active DB connection is required")
         return self.uow.connection
 
+    # ------------------------------------------------------------------
+    # Incremental API
+    # ------------------------------------------------------------------
+
     def list_allowed_symbols(self) -> list[str]:
         try:
             tables = self._list_tables()
@@ -33,7 +39,7 @@ class DuckDbPriceRepository:
             if "market_universe" in tables:
                 rows = self.con.execute(
                     """
-                    SELECT DISTINCT symbol
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
                     FROM market_universe
                     WHERE include_in_universe = TRUE
                       AND symbol IS NOT NULL
@@ -41,12 +47,12 @@ class DuckDbPriceRepository:
                     ORDER BY symbol
                     """
                 ).fetchall()
-                return [str(row[0]).strip().upper() for row in rows]
+                return [row[0] for row in rows]
 
             if "universe_membership_history" in tables:
                 rows = self.con.execute(
                     """
-                    SELECT DISTINCT symbol
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
                     FROM universe_membership_history
                     WHERE membership_status IN ('included', 'active', 'eligible')
                       AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
@@ -55,9 +61,9 @@ class DuckDbPriceRepository:
                     ORDER BY symbol
                     """
                 ).fetchall()
-                return [str(row[0]).strip().upper() for row in rows]
+                return [row[0] for row in rows]
 
-            raise RepositoryError("no supported universe table found")
+            return sorted(self.load_included_symbols())
         except Exception as exc:
             raise RepositoryError(f"failed to list allowed symbols: {exc}") from exc
 
@@ -90,7 +96,7 @@ class DuckDbPriceRepository:
 
             if symbols:
                 normalized_symbols = sorted(
-                    {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+                    {self._norm_symbol(symbol) for symbol in symbols if self._norm_symbol(symbol)}
                 )
                 if not normalized_symbols:
                     return self._count_rows("price_latest")
@@ -138,6 +144,121 @@ class DuckDbPriceRepository:
             return self._count_rows("price_latest")
         except Exception as exc:
             raise RepositoryError(f"failed to refresh price_latest: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Backward-compatible public API
+    # ------------------------------------------------------------------
+
+    def load_raw_price_bars(self) -> list[RawPriceBar]:
+        try:
+            rows = self.con.execute(
+                """
+                SELECT
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    source_name
+                FROM price_source_daily_raw
+                ORDER BY symbol, price_date
+                """
+            ).fetchall()
+            return [
+                RawPriceBar(
+                    symbol=row[0],
+                    price_date=row[1],
+                    open=row[2],
+                    high=row[3],
+                    low=row[4],
+                    close=row[5],
+                    volume=row[6],
+                    source_name=row[7] or "unknown",
+                )
+                for row in rows
+            ]
+        except Exception as exc:
+            raise RepositoryError(f"failed to load raw price bars: {exc}") from exc
+
+    def load_included_symbols(self) -> set[str]:
+        """
+        Historical-safe symbol probe.
+
+        Preference order:
+        1. ticker_history / instrument_master when present
+        2. market_universe included symbols as fallback for minimal test DBs
+        """
+        try:
+            rows: list[tuple[str]] = []
+            tables = self._list_tables()
+
+            if "ticker_history" in tables or "instrument_master" in tables:
+                union_parts: list[str] = []
+                if "ticker_history" in tables:
+                    union_parts.append("SELECT symbol FROM ticker_history")
+                if "instrument_master" in tables:
+                    union_parts.append("SELECT symbol FROM instrument_master")
+
+                rows = self.con.execute(
+                    f"""
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                    FROM (
+                        {' UNION '.join(union_parts)}
+                    ) t
+                    WHERE symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+
+            if not rows and "market_universe" in tables:
+                rows = self.con.execute(
+                    """
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                    FROM market_universe
+                    WHERE include_in_universe = TRUE
+                      AND symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+
+            return {row[0] for row in rows}
+        except Exception as exc:
+            raise RepositoryError(f"failed to load included symbols: {exc}") from exc
+
+    def replace_price_history(self, entries: list[PriceBar]) -> int:
+        try:
+            if not entries:
+                return 0
+
+            import pandas as pd
+
+            frame = pd.DataFrame(
+                [
+                    {
+                        "symbol": self._norm_symbol(e.symbol),
+                        "price_date": e.price_date,
+                        "open": e.open,
+                        "high": e.high,
+                        "low": e.low,
+                        "close": e.close,
+                        "volume": e.volume,
+                        "source_name": e.source_name,
+                        "ingested_at": e.ingested_at,
+                    }
+                    for e in entries
+                    if self._norm_symbol(e.symbol) and e.price_date is not None
+                ]
+            )
+            return self.upsert_price_history(frame)
+        except Exception as exc:
+            raise RepositoryError(f"failed to replace price_history: {exc}") from exc
+
+    def rebuild_price_latest(self) -> int:
+        return self.refresh_price_latest(symbols=None)
 
     def load_price_source_daily_raw_rows(self) -> list[dict[str, Any]]:
         try:
@@ -217,6 +338,10 @@ class DuckDbPriceRepository:
         except Exception as exc:
             raise RepositoryError(f"failed to load price_source_daily_raw_all rows: {exc}") from exc
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _create_stage_table(self) -> None:
         price_history_columns = self._table_columns("price_history")
         if not price_history_columns:
@@ -238,7 +363,7 @@ class DuckDbPriceRepository:
 
             join_sql = """
                 LEFT JOIN instrument_master im
-                  ON UPPER(TRIM(src.symbol)) = UPPER(TRIM(im.symbol))
+                  ON UPPER(TRIM(d.symbol)) = UPPER(TRIM(im.symbol))
             """
 
         self.con.execute(
@@ -286,7 +411,7 @@ class DuckDbPriceRepository:
                 d.source_name,
                 COALESCE(d.ingested_at, CURRENT_TIMESTAMP) AS ingested_at
             FROM dedup d
-            {join_sql.replace('src.', 'd.')}
+            {join_sql}
             """
         )
 
@@ -409,6 +534,11 @@ class DuckDbPriceRepository:
             FROM ranked h
             WHERE h.rn = 1
         """
+
+    def _norm_symbol(self, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip().upper()
 
     def _table_columns(self, table_name: str) -> set[str]:
         try:

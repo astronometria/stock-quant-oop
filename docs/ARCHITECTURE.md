@@ -144,7 +144,7 @@ scripts staging / ingestion brute
 cli/tools
 utilitaires d’export
 
-legacy/cli
+cli/ops
 anciens scripts conservés pour référence
 
 ---

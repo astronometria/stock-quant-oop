@@ -21,7 +21,6 @@ Le coeur OOP en place couvre déjà :
 - `cli/ops/` : opérations récurrentes ou lourdes
 - `cli/raw/` : scripts raw / staging déplacés hors du chemin principal
 - `cli/tools/` : utilitaires d’export
-- `legacy/cli/` : anciens scripts sortis du coeur
 - `stock_quant/` : package applicatif
 - `docs/` : documentation projet
 - `tests/` : tests unitaires et d’intégration
@@ -71,4 +70,3 @@ Mode backfill via sources historiques :
 
 - Le provider daily officiel pour les prix est `yfinance`.
 - Les scripts raw/staging ont été déplacés sous `cli/raw/`, avec wrappers de compatibilité en racine `cli/`.
-- Certains scripts historiques restent en `legacy/cli/` et ne font pas partie du coeur supporté.

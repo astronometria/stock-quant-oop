@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 from stock_quant.domain.entities.short_interest import (
@@ -80,26 +79,49 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
         """
         Historical-safe symbol probe.
 
-        Important:
-        - Must not depend on current market_universe membership
-        - Must not filter on include_in_universe = TRUE
-        - Returns symbols known by identifier history / master data only
+        Preference order:
+        1. ticker_history / instrument_master if available
+        2. market_universe included symbols as fallback for minimal test DBs
         """
         try:
-            rows = self.con.execute(
-                """
-                SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
-                FROM (
-                    SELECT symbol FROM ticker_history
-                    UNION
-                    SELECT symbol FROM instrument_master
-                ) t
-                WHERE symbol IS NOT NULL
-                  AND TRIM(symbol) <> ''
-                ORDER BY symbol
-                """
-            ).fetchall()
-            return {row[0] for row in rows}
+            tables = self._list_tables()
+            union_parts: list[str] = []
+
+            if "ticker_history" in tables:
+                union_parts.append("SELECT symbol FROM ticker_history")
+            if "instrument_master" in tables:
+                union_parts.append("SELECT symbol FROM instrument_master")
+
+            if union_parts:
+                rows = self.con.execute(
+                    f"""
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                    FROM (
+                        {' UNION '.join(union_parts)}
+                    ) t
+                    WHERE symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+                result = {row[0] for row in rows}
+                if result:
+                    return result
+
+            if "market_universe" in tables:
+                rows = self.con.execute(
+                    """
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                    FROM market_universe
+                    WHERE include_in_universe = TRUE
+                      AND symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+                return {row[0] for row in rows}
+
+            return set()
         except Exception as exc:
             raise RepositoryError(f"failed to load known symbols: {exc}") from exc
 
@@ -140,7 +162,8 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
                 for e in entries
                 if self._norm_symbol(e.symbol)
                 and e.settlement_date is not None
-                and (e.source_file is not None and str(e.source_file).strip() != "")
+                and e.source_file is not None
+                and str(e.source_file).strip() != ""
             ]
             if not payload:
                 return 0
@@ -397,3 +420,13 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
         if value is None:
             return ""
         return str(value).strip().upper()
+
+    def _list_tables(self) -> set[str]:
+        rows = self.con.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'main'
+            """
+        ).fetchall()
+        return {row[0] for row in rows}

@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-ALLOWED_EXCHANGES = {"NASDAQ", "NYSE"}
+ALLOWED_EXCHANGES = {"NASDAQ", "NYSE", "NYSE_ARCA", "NYSEAMERICAN", "NYSE_AMERICAN"}
+OTC_EXCHANGES = {"OTC", "OTCQX", "OTCQB", "OTCPINK", "PINK", "GREY", "GREY_MARKET"}
 
 
 @dataclass(frozen=True)
@@ -24,17 +25,13 @@ def decide_universe_inclusion(
     is_unit: bool,
     allow_adr: bool = True,
 ) -> UniverseInclusionDecision:
-    if exchange_normalized not in ALLOWED_EXCHANGES:
-        return UniverseInclusionDecision(False, "exchange_not_allowed")
+    exchange = (exchange_normalized or "").strip().upper()
 
-    if not is_common_stock:
-        return UniverseInclusionDecision(False, "not_common_stock")
+    if exchange in OTC_EXCHANGES:
+        return UniverseInclusionDecision(False, "otc_security")
 
     if is_etf:
         return UniverseInclusionDecision(False, "etf_excluded")
-
-    if is_adr and not allow_adr:
-        return UniverseInclusionDecision(False, "adr_excluded")
 
     if is_preferred:
         return UniverseInclusionDecision(False, "preferred_excluded")
@@ -47,6 +44,18 @@ def decide_universe_inclusion(
 
     if is_unit:
         return UniverseInclusionDecision(False, "unit_excluded")
+
+    if is_adr:
+        if not allow_adr:
+            return UniverseInclusionDecision(False, "adr_excluded")
+        if exchange and exchange not in OTC_EXCHANGES:
+            return UniverseInclusionDecision(True, None)
+
+    if exchange not in ALLOWED_EXCHANGES:
+        return UniverseInclusionDecision(False, "exchange_not_allowed")
+
+    if not is_common_stock:
+        return UniverseInclusionDecision(False, "not_common_stock")
 
     return UniverseInclusionDecision(True, None)
 

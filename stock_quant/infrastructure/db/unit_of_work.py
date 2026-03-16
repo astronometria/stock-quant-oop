@@ -23,7 +23,12 @@ class DuckDbUnitOfWork:
     def rollback(self) -> None:
         if self.connection is None:
             return
-        self.connection.rollback()
+        try:
+            self.connection.rollback()
+        except Exception as exc:
+            message = str(exc).lower()
+            if "no transaction is active" not in message:
+                raise
 
     def __exit__(
         self,
@@ -36,7 +41,7 @@ class DuckDbUnitOfWork:
                 if exc is None:
                     self.connection.commit()
                 else:
-                    self.connection.rollback()
+                    self.rollback()
         finally:
             if self.connection is not None:
                 self.connection.close()

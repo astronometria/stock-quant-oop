@@ -35,67 +35,25 @@ def parse_args() -> argparse.Namespace:
         choices=["regular", "otc", "both"],
         help="Source market selection passed to supported steps.",
     )
-    parser.add_argument(
-        "--skip-symbol-load",
-        action="store_true",
-        help="Skip loading symbol reference raw staging data.",
-    )
-    parser.add_argument(
-        "--skip-universe",
-        action="store_true",
-        help="Skip market universe build step.",
-    )
-    parser.add_argument(
-        "--skip-symbol-reference",
-        action="store_true",
-        help="Skip symbol reference build step.",
-    )
-    parser.add_argument(
-        "--skip-price-load",
-        action="store_true",
-        help="Skip loading price raw staging data.",
-    )
-    parser.add_argument(
-        "--skip-prices",
-        action="store_true",
-        help="Skip price build step.",
-    )
-    parser.add_argument(
-        "--skip-finra-load",
-        action="store_true",
-        help="Skip loading FINRA raw staging data.",
-    )
-    parser.add_argument(
-        "--skip-finra",
-        action="store_true",
-        help="Skip FINRA short interest build step.",
-    )
-    parser.add_argument(
-        "--skip-news-load",
-        action="store_true",
-        help="Skip loading news raw staging data.",
-    )
-    parser.add_argument(
-        "--skip-news-raw",
-        action="store_true",
-        help="Skip normalized news build step.",
-    )
-    parser.add_argument(
-        "--skip-news-candidates",
-        action="store_true",
-        help="Skip news symbol candidates step.",
-    )
-    parser.add_argument(
-        "--truncate-raw",
-        action="store_true",
-        help="Pass --truncate to raw loader steps when supported.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output for child commands when supported.",
-    )
+    parser.add_argument("--skip-symbol-load", action="store_true")
+    parser.add_argument("--skip-universe", action="store_true")
+    parser.add_argument("--skip-symbol-reference", action="store_true")
+    parser.add_argument("--skip-price-load", action="store_true")
+    parser.add_argument("--skip-prices", action="store_true")
+    parser.add_argument("--skip-finra-load", action="store_true")
+    parser.add_argument("--skip-finra", action="store_true")
+    parser.add_argument("--skip-news-load", action="store_true")
+    parser.add_argument("--skip-news-raw", action="store_true")
+    parser.add_argument("--skip-news-candidates", action="store_true")
+    parser.add_argument("--truncate-raw", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
+
+
+def _append_if(args: list[str], flag: str, condition: bool) -> list[str]:
+    if condition:
+        args.append(flag)
+    return args
 
 
 def main() -> int:
@@ -108,25 +66,22 @@ def main() -> int:
         verbose=args.verbose,
     )
 
-    steps: list[CorePipelineStep] = []
-
-    steps.append(
+    steps: list[CorePipelineStep] = [
         CorePipelineStep(
             name="init_market_db",
-            relative_script="cli/init_market_db.py",
+            relative_script="cli/core/init_market_db.py",
             extra_args=["--drop-existing"] if args.drop_existing else [],
         )
-    )
+    ]
 
-    if not args.skip_symbol_load and orchestrator.script_exists("cli/load_symbol_reference_source_raw.py"):
-        symbol_load_args: list[str] = []
-        if args.truncate_raw:
-            symbol_load_args.append("--truncate")
+    if not args.skip_symbol_load:
+        symbol_args: list[str] = []
+        _append_if(symbol_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
                 name="load_symbol_reference_source_raw",
-                relative_script="cli/load_symbol_reference_source_raw.py",
-                extra_args=symbol_load_args,
+                relative_script="cli/raw/load_symbol_reference_source_raw.py",
+                extra_args=symbol_args,
             )
         )
 
@@ -134,7 +89,7 @@ def main() -> int:
         steps.append(
             CorePipelineStep(
                 name="build_market_universe",
-                relative_script="cli/build_market_universe.py",
+                relative_script="cli/core/build_market_universe.py",
             )
         )
 
@@ -142,64 +97,37 @@ def main() -> int:
         steps.append(
             CorePipelineStep(
                 name="build_symbol_reference",
-                relative_script="cli/build_symbol_reference.py",
+                relative_script="cli/core/build_symbol_reference.py",
             )
         )
 
     if not args.skip_price_load:
-        if orchestrator.script_exists("cli/load_price_source_daily_raw_all_from_stooq_zip.py"):
-            raw_all_args: list[str] = []
-            if args.truncate_raw:
-                raw_all_args.append("--truncate")
-            steps.append(
-                CorePipelineStep(
-                    name="load_price_source_daily_raw_all_from_stooq_zip",
-                    relative_script="cli/load_price_source_daily_raw_all_from_stooq_zip.py",
-                    extra_args=raw_all_args,
-                )
+        price_args: list[str] = []
+        _append_if(price_args, "--truncate", args.truncate_raw)
+        steps.append(
+            CorePipelineStep(
+                name="load_price_source_daily_raw",
+                relative_script="cli/raw/load_price_source_daily_raw.py",
+                extra_args=price_args,
             )
-
-        if orchestrator.script_exists("cli/fetch_price_source_daily_raw_yahoo.py"):
-            yahoo_args: list[str] = []
-            if args.truncate_raw:
-                yahoo_args.append("--truncate")
-            steps.append(
-                CorePipelineStep(
-                    name="fetch_price_source_daily_raw_yahoo",
-                    relative_script="cli/fetch_price_source_daily_raw_yahoo.py",
-                    extra_args=yahoo_args,
-                )
-            )
-
-        if orchestrator.script_exists("cli/filter_price_source_daily_raw_from_all.py"):
-            filter_args: list[str] = []
-            if args.truncate_raw:
-                filter_args.append("--truncate")
-            steps.append(
-                CorePipelineStep(
-                    name="filter_price_source_daily_raw_from_all",
-                    relative_script="cli/filter_price_source_daily_raw_from_all.py",
-                    extra_args=filter_args,
-                )
-            )
+        )
 
     if not args.skip_prices:
         steps.append(
             CorePipelineStep(
                 name="build_prices",
-                relative_script="cli/build_prices.py",
+                relative_script="cli/core/build_prices.py",
             )
         )
 
-    if not args.skip_finra_load and orchestrator.script_exists("cli/load_finra_short_interest_source_raw.py"):
-        finra_load_args: list[str] = []
-        if args.truncate_raw:
-            finra_load_args.append("--truncate")
+    if not args.skip_finra_load:
+        finra_args: list[str] = []
+        _append_if(finra_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
                 name="load_finra_short_interest_source_raw",
-                relative_script="cli/load_finra_short_interest_source_raw.py",
-                extra_args=finra_load_args,
+                relative_script="cli/raw/load_finra_short_interest_source_raw.py",
+                extra_args=finra_args,
             )
         )
 
@@ -207,20 +135,19 @@ def main() -> int:
         steps.append(
             CorePipelineStep(
                 name="build_finra_short_interest",
-                relative_script="cli/build_finra_short_interest.py",
+                relative_script="cli/core/build_finra_short_interest.py",
                 extra_args=["--source-market", args.source_market],
             )
         )
 
-    if not args.skip_news_load and orchestrator.script_exists("cli/load_news_source_raw.py"):
-        news_load_args: list[str] = []
-        if args.truncate_raw:
-            news_load_args.append("--truncate")
+    if not args.skip_news_load:
+        news_args: list[str] = []
+        _append_if(news_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
                 name="load_news_source_raw",
-                relative_script="cli/load_news_source_raw.py",
-                extra_args=news_load_args,
+                relative_script="cli/raw/load_news_source_raw.py",
+                extra_args=news_args,
             )
         )
 
@@ -228,7 +155,7 @@ def main() -> int:
         steps.append(
             CorePipelineStep(
                 name="build_news_raw",
-                relative_script="cli/build_news_raw.py",
+                relative_script="cli/core/build_news_raw.py",
             )
         )
 
@@ -236,7 +163,7 @@ def main() -> int:
         steps.append(
             CorePipelineStep(
                 name="build_news_symbol_candidates",
-                relative_script="cli/build_news_symbol_candidates.py",
+                relative_script="cli/core/build_news_symbol_candidates.py",
             )
         )
 

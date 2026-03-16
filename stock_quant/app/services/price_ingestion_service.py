@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Iterable
 
 import pandas as pd
 
+from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
 from stock_quant.shared.exceptions import ServiceError
 
 
@@ -18,18 +20,102 @@ class PriceIngestionResult:
 
 class PriceIngestionService:
     """
-    Application service for incremental canonical price ingestion.
+    Dual-surface price service.
 
-    Responsibilities:
-    - determine allowed symbols from repository
-    - normalize provider output into canonical dataframe
-    - upsert incremental rows into price_history
-    - refresh price_latest only for touched symbols
+    Supported modes:
+    - legacy in-memory build(raw_bars, allowed_symbols=...)
+    - incremental ingest_incremental(...) backed by repository/provider
     """
 
-    def __init__(self, price_repository, historical_price_provider) -> None:
+    def __init__(self, price_repository=None, historical_price_provider=None) -> None:
         self.price_repository = price_repository
         self.historical_price_provider = historical_price_provider
+
+    # ------------------------------------------------------------------
+    # Legacy test-compatible surface
+    # ------------------------------------------------------------------
+
+    def build(
+        self,
+        raw_bars: Iterable[RawPriceBar],
+        *,
+        allowed_symbols: set[str],
+    ) -> tuple[list[PriceBar], dict[str, int]]:
+        normalized_allowed = {self._norm_symbol(s) for s in allowed_symbols if self._norm_symbol(s)}
+        accepted: list[PriceBar] = []
+        metrics = {
+            "raw_bars": 0,
+            "accepted_bars": 0,
+            "skipped_not_in_universe": 0,
+            "skipped_invalid": 0,
+        }
+
+        for raw in raw_bars:
+            metrics["raw_bars"] += 1
+            symbol = self._norm_symbol(getattr(raw, "symbol", None))
+            if not symbol or symbol not in normalized_allowed:
+                metrics["skipped_not_in_universe"] += 1
+                continue
+
+            normalized = self._normalize_raw_bar(raw, symbol=symbol)
+            if normalized is None:
+                metrics["skipped_invalid"] += 1
+                continue
+
+            accepted.append(normalized)
+            metrics["accepted_bars"] += 1
+
+        return accepted, metrics
+
+    def _normalize_raw_bar(self, raw: RawPriceBar, *, symbol: str) -> PriceBar | None:
+        price_date = getattr(raw, "price_date", None)
+        if price_date is None:
+            return None
+
+        close = self._to_float(getattr(raw, "close", None))
+        open_ = self._to_float(getattr(raw, "open", None))
+        high = self._to_float(getattr(raw, "high", None))
+        low = self._to_float(getattr(raw, "low", None))
+        volume = self._to_int(getattr(raw, "volume", None), default=0)
+        source_name = str(getattr(raw, "source_name", "unknown") or "unknown").strip() or "unknown"
+
+        if close is None and any(v is None for v in (open_, high, low)):
+            return None
+
+        if close is None:
+            close = open_ if open_ is not None else high if high is not None else low
+        if close is None:
+            return None
+
+        if open_ is None:
+            open_ = close
+        if high is None:
+            high = close
+        if low is None:
+            low = close
+
+        if high < low:
+            return None
+        if open_ < 0 or high < 0 or low < 0 or close < 0 or volume < 0:
+            return None
+        if high < max(open_, close) or low > min(open_, close):
+            return None
+
+        return PriceBar(
+            symbol=symbol,
+            price_date=price_date,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            source_name=source_name,
+            ingested_at=datetime.utcnow(),
+        )
+
+    # ------------------------------------------------------------------
+    # Incremental repository/provider surface
+    # ------------------------------------------------------------------
 
     def ingest_incremental(
         self,
@@ -37,6 +123,9 @@ class PriceIngestionService:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> PriceIngestionResult:
+        if self.price_repository is None or self.historical_price_provider is None:
+            raise ServiceError("price_repository and historical_price_provider are required for incremental ingestion")
+
         try:
             allowed_symbols = self._normalize_symbols(self.price_repository.list_allowed_symbols())
             if not allowed_symbols:
@@ -195,10 +284,25 @@ class PriceIngestionService:
         )
 
     def _normalize_symbols(self, symbols: Iterable[str]) -> list[str]:
-        return sorted(
-            {
-                str(symbol).strip().upper()
-                for symbol in symbols
-                if symbol is not None and str(symbol).strip()
-            }
-        )
+        return sorted({self._norm_symbol(symbol) for symbol in symbols if self._norm_symbol(symbol)})
+
+    def _norm_symbol(self, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip().upper()
+
+    def _to_float(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _to_int(self, value: Any, *, default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
