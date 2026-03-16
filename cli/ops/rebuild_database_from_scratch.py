@@ -13,8 +13,8 @@ from stock_quant.infrastructure.config.settings_loader import build_app_config
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Rebuild the DuckDB database from scratch using real raw symbol sources "
-            "and core build pipelines."
+            "Rebuild the DuckDB database from scratch using real raw symbol sources, "
+            "core SEC normalization, and fundamentals construction."
         )
     )
     parser.add_argument(
@@ -58,9 +58,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip build_sec_filings.",
     )
     parser.add_argument(
+        "--skip-fundamentals",
+        action="store_true",
+        help="Skip build_fundamentals.",
+    )
+    parser.add_argument(
         "--allow-adr",
         action="store_true",
-        help="Allow ADR in build_market_universe.",
+        help="Allow ADR in build_market_universe when supported by the CLI.",
     )
     parser.add_argument(
         "--verbose",
@@ -195,12 +200,8 @@ def main() -> int:
             "--verbose",
         ]
         if not args.allow_adr:
-            # Le pipeline par défaut est déjà conservateur, mais on garde
-            # ce flag explicite pour éviter toute ambiguïté produit.
-            pass
-        else:
-            # Le CLI existant utilise --disallow-adr, donc si on veut
-            # autoriser ADR on ne passe rien.
+            # Le CLI existant est conservateur.
+            # On ne passe rien ici tant qu'il n'y a pas un flag positif uniforme.
             pass
         _run_step("BUILD MARKET UNIVERSE", command)
 
@@ -219,11 +220,6 @@ def main() -> int:
 
     # ------------------------------------------------------------------
     # 7) Build SEC filings
-    #
-    # On le laisse optionnel via le flag skip, mais on ne teste pas ici
-    # l'existence de sec_filing_raw_index via Python SQL pour garder
-    # l'orchestrateur simple et orienté produit. Le CLI renverra une erreur
-    # claire si la matière première n'est pas là.
     # ------------------------------------------------------------------
     if not args.skip_sec_filings:
         command = [
@@ -234,6 +230,19 @@ def main() -> int:
             "--verbose",
         ]
         _run_step("BUILD SEC FILINGS", command)
+
+    # ------------------------------------------------------------------
+    # 8) Build fundamentals
+    # ------------------------------------------------------------------
+    if not args.skip_fundamentals:
+        command = [
+            python_bin,
+            str(project_root / "cli" / "core" / "build_fundamentals.py"),
+            "--db-path",
+            str(db_path),
+            "--verbose",
+        ]
+        _run_step("BUILD FUNDAMENTALS", command)
 
     print("===== REBUILD DATABASE COMPLETE =====", flush=True)
     print(f"db_path={db_path}", flush=True)

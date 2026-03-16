@@ -24,7 +24,8 @@ Depuis la racine du repo :
 4. charge `symbol_reference_source_raw`
 5. construit `market_universe`
 6. construit `symbol_reference`
-7. construit `sec_filing` si le raw SEC est déjà présent
+7. construit `sec_filing`
+8. construit `fundamentals`
 
 ## Univers cible
 
@@ -61,6 +62,10 @@ data/symbol_sources/nasdaq/
 - `market_universe`
 - `symbol_reference`
 - `sec_filing`
+- `fundamental_snapshot_quarterly`
+- `fundamental_snapshot_annual`
+- `fundamental_ttm`
+- `fundamental_features_daily`
 
 ## Vérification rapide
 
@@ -70,10 +75,21 @@ Le rebuild est sain si tu obtiens au minimum :
 - `market_universe` peuplée
 - `market_universe` avec des lignes `include_in_universe = TRUE`
 - `symbol_reference` peuplée
-- `sec_filing` reconstruite si `sec_filing_raw_index` existe
+- `sec_filing` reconstruite
+- tables fondamentales peuplées si les faits SEC normalisés existent
 
 ## Commande produit long terme
 
 Pour lancer directement l’orchestrateur :
 
 python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --verbose
+
+## Variantes utiles
+
+Rebuild sans fondamentaux :
+
+python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --skip-fundamentals --verbose
+
+Rebuild en réutilisant déjà les raw téléchargés :
+
+python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --skip-sec-fetch --skip-nasdaq-fetch --verbose
