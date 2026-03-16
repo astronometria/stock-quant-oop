@@ -2,140 +2,78 @@
 
 ## Objectif
 
-Ce document décrit la reconstruction complète de la base `market.duckdb`.
+Reconstruire `market.duckdb` depuis zéro avec des sources réelles stockées localement.
 
-Script principal :
+## Sources de vérité
 
-scripts/rebuild_db_from_scratch.sh
+- `scripts/rebuild_db_from_scratch.sh` = vérité exécutable
+- `docs/DB_REBUILD.md` = vérité humaine
+- `cli/ops/rebuild_database_from_scratch.py` = vérité produit long terme
 
----
+## Commande principale
 
-## Philosophie
+Depuis la racine du repo :
 
-Le projet utilise trois niveaux de vérité :
+./scripts/rebuild_db_from_scratch.sh
 
-script shell = vérité exécutable  
-doc markdown = vérité humaine  
-orchestrateur Python = vérité produit long terme
+## Ce que fait la reconstruction
 
-Principes :
+1. initialise le schéma
+2. télécharge les sources symboles SEC
+3. télécharge les sources symboles NASDAQ
+4. charge `symbol_reference_source_raw`
+5. construit `market_universe`
+6. construit `symbol_reference`
+7. construit `sec_filing` si le raw SEC est déjà présent
 
-- SQL-first
-- sources réelles uniquement
-- snapshots locaux des fichiers raw
-- univers US standard uniquement
+## Univers cible
 
-Exchanges autorisés :
+Actions US standard seulement :
 
-NASDAQ  
-NYSE
+- NASDAQ
+- NYSE
 
 Exclusions :
 
-OTC  
-Pink Sheet  
-ETF  
-ETN  
-ADR  
-Preferred  
-Warrant  
-Right  
-Unit
+- OTC
+- Pink Sheet
+- ETF
+- ETN
+- ADR
+- Preferred
+- Warrant
+- Right
+- Unit
 
----
-
-## Script principal
-
-Pour reconstruire la base complète :
-
-./scripts/rebuild_db_from_scratch.sh
-
----
-
-## Étapes exécutées
-
-1. Initialiser le schéma
-
-python3 cli/core/init_market_db.py --db-path market.duckdb
-
-2. Télécharger les sources symboles
+## Fichiers raw locaux
 
 SEC :
 
-python3 cli/raw/fetch_sec_company_tickers_raw.py
+data/symbol_sources/sec/
 
 NASDAQ :
 
-python3 cli/raw/fetch_nasdaq_symbol_directory_raw.py
+data/symbol_sources/nasdaq/
 
-3. Charger les sources raw
+## Tables coeur attendues
 
-python3 cli/raw/load_symbol_reference_source_raw.py
+- `symbol_reference_source_raw`
+- `market_universe`
+- `symbol_reference`
+- `sec_filing`
 
-Tables utilisées :
+## Vérification rapide
 
-symbol_reference_source_raw
+Le rebuild est sain si tu obtiens au minimum :
 
----
+- `symbol_reference_source_raw` peuplée
+- `market_universe` peuplée
+- `market_universe` avec des lignes `include_in_universe = TRUE`
+- `symbol_reference` peuplée
+- `sec_filing` reconstruite si `sec_filing_raw_index` existe
 
-4. Construire l'univers marché
+## Commande produit long terme
 
-python3 cli/core/build_market_universe.py
+Pour lancer directement l’orchestrateur :
 
-Table :
-
-market_universe
-
----
-
-5. Construire le référentiel symboles
-
-python3 cli/core/build_symbol_reference.py
-
-Table :
-
-symbol_reference
-
----
-
-6. Construire les filings SEC
-
-python3 cli/core/build_sec_filings.py
-
-Table :
-
-sec_filing
-
----
-
-## Vérifications rapides
-
-Compteurs :
-
-SELECT COUNT(*) FROM symbol_reference_source_raw;
-
-SELECT COUNT(*) FROM market_universe;
-
-SELECT COUNT(*) FROM symbol_reference;
-
-SELECT COUNT(*) FROM sec_filing;
-
----
-
-## Résultat attendu
-
-Après reconstruction :
-
-symbol_reference_source_raw ≈ 22k  
-market_universe ≈ 15k  
-market_universe_included ≈ 6k  
-symbol_reference ≈ 6k  
-sec_filing ≈ 44k
-
----
-
-## Commande recommandée
-
-./scripts/rebuild_db_from_scratch.sh
-
-Cette commande est la source de vérité exécutable.
+python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --verbose
