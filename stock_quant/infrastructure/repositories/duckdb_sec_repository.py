@@ -1,18 +1,5 @@
 from __future__ import annotations
 
-# =============================================================================
-# DuckDB SEC repository
-# -----------------------------------------------------------------------------
-# Repository d'accès aux tables SEC dans DuckDB.
-#
-# Ajustements importants dans cette version:
-# - ajout de load_cik_company_map() attendu par BuildSecFilingPipeline
-# - alignement avec le schéma SEC existant + migré
-# - conservation de available_at dans sec_fact_normalized
-# - helpers de lecture utiles pour les services de build
-# - helpers PIT pour futures étapes de recherche quant
-# =============================================================================
-
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
@@ -47,35 +34,72 @@ class DuckDbSecRepository:
         """
         Construit une map CIK -> company_id à partir de symbol_reference.
 
-        Pourquoi:
-        - BuildSecFilingPipeline en a besoin pour enrichir sec_filing.company_id
-        - le repo public appelait cette méthode depuis le pipeline, mais elle
-          n'était pas implémentée dans le repository SEC
+        Stratégie robuste:
+        - si symbol_reference contient company_id, on l'utilise
+        - sinon fallback company_id = cik
 
-        Logique:
-        - on prend les lignes de symbol_reference avec company_id et cik non vides
-        - si plusieurs lignes partagent le même CIK, on garde la première
-          company_id rencontrée après tri stable
+        Pourquoi ce fallback:
+        - certaines versions du schéma n'ont pas de colonne company_id
+        - le pipeline SEC a tout de même besoin d'un identifiant stable
+        - le CIK est un identifiant SEC stable et suffisant pour la chaîne
+          filings -> facts -> fundamentals
         """
+        column_rows = self.con.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'main'
+              AND table_name = 'symbol_reference'
+            ORDER BY ordinal_position
+            """
+        ).fetchall()
+
+        columns = {str(row[0]).strip().lower() for row in column_rows}
+        if "cik" not in columns:
+            return {}
+
+        has_company_id = "company_id" in columns
+
+        if has_company_id:
+            rows = self.con.execute(
+                """
+                SELECT
+                    TRIM(CAST(cik AS VARCHAR)) AS cik,
+                    TRIM(CAST(company_id AS VARCHAR)) AS company_id
+                FROM symbol_reference
+                WHERE cik IS NOT NULL
+                  AND TRIM(CAST(cik AS VARCHAR)) <> ''
+                  AND company_id IS NOT NULL
+                  AND TRIM(CAST(company_id AS VARCHAR)) <> ''
+                ORDER BY cik, company_id
+                """
+            ).fetchall()
+
+            mapping: dict[str, str] = {}
+            for cik, company_id in rows:
+                normalized_cik = str(cik).strip().zfill(10)
+                if normalized_cik not in mapping:
+                    mapping[normalized_cik] = str(company_id).strip()
+            return mapping
+
+        # ---------------------------------------------------------------------
+        # Fallback: company_id = cik
+        # ---------------------------------------------------------------------
         rows = self.con.execute(
             """
-            SELECT
-                TRIM(CAST(cik AS VARCHAR)) AS cik,
-                TRIM(CAST(company_id AS VARCHAR)) AS company_id
+            SELECT DISTINCT
+                TRIM(CAST(cik AS VARCHAR)) AS cik
             FROM symbol_reference
             WHERE cik IS NOT NULL
               AND TRIM(CAST(cik AS VARCHAR)) <> ''
-              AND company_id IS NOT NULL
-              AND TRIM(CAST(company_id AS VARCHAR)) <> ''
-            ORDER BY cik, company_id
+            ORDER BY cik
             """
         ).fetchall()
 
         mapping: dict[str, str] = {}
-        for cik, company_id in rows:
+        for (cik,) in rows:
             normalized_cik = str(cik).strip().zfill(10)
-            if normalized_cik not in mapping:
-                mapping[normalized_cik] = str(company_id).strip()
+            mapping[normalized_cik] = normalized_cik
         return mapping
 
     # =========================================================================
