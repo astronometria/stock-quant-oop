@@ -1,62 +1,33 @@
 """
 market_universe_history_pipeline.py
 
-Pipeline OOP pour construire market_universe_history à partir des listings
-historiques actifs.
+Pipeline standardisé pour construire market_universe_history.
 
-But
----
+Philosophie
+-----------
 
-Brancher proprement le service applicatif de dérivation d'univers
-dans une interface de pipeline standard.
+Ce pipeline reste volontairement mince :
+- pas de logique métier
+- pas de SQL
+- pas de gestion manuelle du timing
+
+Tout cela est délégué respectivement :
+- au service applicatif
+- aux repositories
+- au runner de pipeline partagé
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-
 from stock_quant.app.services.market_universe_history_service import (
     MarketUniverseHistoryService,
 )
-
-
-class PipelineStatus:
-    SUCCESS = "SUCCESS"
-    FAILED = "FAILED"
-
-
-@dataclass
-class MarketUniverseHistoryPipelineResult:
-    pipeline_name: str
-    status: str
-    started_at: str
-    finished_at: str
-    duration_seconds: float
-    rows_read: int
-    rows_written: int
-    rows_skipped: int
-    error_message: str | None
-    metrics: dict
-
-    def summary_dict(self) -> dict:
-        return {
-            "pipeline_name": self.pipeline_name,
-            "status": self.status,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "duration_seconds": self.duration_seconds,
-            "rows_read": self.rows_read,
-            "rows_written": self.rows_written,
-            "rows_skipped": self.rows_skipped,
-            "error_message": self.error_message,
-            "metrics": self.metrics,
-        }
+from stock_quant.shared.pipeline_runner import run_pipeline
 
 
 class BuildMarketUniverseHistoryPipeline:
     """
-    Pipeline de construction de market_universe_history.
+    Pipeline standard pour construire market_universe_history.
     """
 
     def __init__(
@@ -65,52 +36,30 @@ class BuildMarketUniverseHistoryPipeline:
     ) -> None:
         self.service = service
 
-    @staticmethod
-    def _utcnow() -> datetime:
-        return datetime.now(timezone.utc)
-
-    def run(self) -> MarketUniverseHistoryPipelineResult:
+    def run(self):
         """
-        Exécute le pipeline.
+        Exécute le pipeline via le runner standard partagé.
         """
-        started = self._utcnow()
+        return run_pipeline(
+            "build_market_universe_history",
+            lambda: self._execute(),
+        )
 
-        try:
-            result = self.service.rebuild_from_active_listings()
+    def _execute(self) -> dict:
+        """
+        Exécute réellement le service métier puis adapte la sortie
+        au format standard attendu par le runner.
+        """
+        result = self.service.rebuild_from_active_listings()
 
-            finished = self._utcnow()
-            duration_seconds = (finished - started).total_seconds()
-
-            return MarketUniverseHistoryPipelineResult(
-                pipeline_name="build_market_universe_history",
-                status=PipelineStatus.SUCCESS,
-                started_at=started.replace(tzinfo=None).isoformat(),
-                finished_at=finished.replace(tzinfo=None).isoformat(),
-                duration_seconds=duration_seconds,
-                rows_read=result.listings_read,
-                rows_written=result.versions_inserted,
-                rows_skipped=0,
-                error_message=None,
-                metrics={
-                    "listings_read": result.listings_read,
-                    "versions_inserted": result.versions_inserted,
-                    "versions_closed": result.versions_closed,
-                    "versions_unchanged": result.versions_unchanged,
-                },
-            )
-        except Exception as exc:
-            finished = self._utcnow()
-            duration_seconds = (finished - started).total_seconds()
-
-            return MarketUniverseHistoryPipelineResult(
-                pipeline_name="build_market_universe_history",
-                status=PipelineStatus.FAILED,
-                started_at=started.replace(tzinfo=None).isoformat(),
-                finished_at=finished.replace(tzinfo=None).isoformat(),
-                duration_seconds=duration_seconds,
-                rows_read=0,
-                rows_written=0,
-                rows_skipped=0,
-                error_message=str(exc),
-                metrics={},
-            )
+        return {
+            "rows_read": result.listings_read,
+            "rows_written": result.versions_inserted,
+            "rows_skipped": 0,
+            "metrics": {
+                "listings_read": result.listings_read,
+                "versions_inserted": result.versions_inserted,
+                "versions_closed": result.versions_closed,
+                "versions_unchanged": result.versions_unchanged,
+            },
+        }
