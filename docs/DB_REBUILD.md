@@ -25,10 +25,11 @@ STOOQ_SOURCE=/path/to/stooq.zip ./scripts/rebuild_db_from_scratch.sh
 5. construit `market_universe`
 6. construit `symbol_reference`
 7. construit `sec_filing`
-8. construit `fundamentals`
-9. construit les prix historiques via Stooq
-10. applique un refresh daily des prix via Yahoo Finance
-11. exécute le refresh quotidien FINRA
+8. construit `sec_fact_normalized`
+9. construit `fundamentals`
+10. construit les prix historiques via Stooq
+11. applique un refresh daily des prix via Yahoo Finance
+12. exécute le refresh quotidien FINRA
 
 ## Univers cible
 
@@ -53,19 +54,19 @@ Exclusions :
 
 SEC :
 
-data/symbol_sources/sec/
+- data/symbol_sources/sec/
 
 NASDAQ :
 
-data/symbol_sources/nasdaq/
+- data/symbol_sources/nasdaq/
 
 Prix historiques Stooq :
 
-sources explicites passées à `--stooq-source`
+- sources explicites passées à `--stooq-source`
 
 FINRA :
 
-data/raw/finra/short_interest/
+- data/raw/finra/short_interest/
 
 ## Tables coeur attendues
 
@@ -73,6 +74,7 @@ data/raw/finra/short_interest/
 - `market_universe`
 - `symbol_reference`
 - `sec_filing`
+- `sec_fact_normalized`
 - `fundamental_snapshot_quarterly`
 - `fundamental_snapshot_annual`
 - `fundamental_ttm`
@@ -80,8 +82,8 @@ data/raw/finra/short_interest/
 - `price_history`
 - `price_latest`
 - `finra_short_interest_source_raw`
-- `short_interest_history`
-- `short_interest_latest`
+- `finra_short_interest_history`
+- `finra_short_interest_latest`
 - `short_features_daily`
 
 ## Vérification rapide
@@ -93,9 +95,17 @@ Le rebuild est sain si tu obtiens au minimum :
 - `market_universe` avec des lignes `include_in_universe = TRUE`
 - `symbol_reference` peuplée
 - `sec_filing` reconstruite
-- tables fondamentales peuplées si les faits SEC normalisés existent
+- `sec_fact_normalized` peuplée si `sec_xbrl_fact_raw` est disponible
+- tables fondamentales peuplées si `sec_fact_normalized` est disponible
 - `price_history` et `price_latest` peuplées après le backfill Stooq puis le daily Yahoo
 - tables FINRA peuplées si des fichiers FINRA exploitables sont disponibles
+
+## Rappels critiques anti-biais
+
+- Fundamentals : utiliser `available_at`, jamais `period_end_date` seul pour la disponibilité marché
+- Prices : les pipelines de recherche ne doivent jamais lire `price_latest`
+- FINRA : utiliser la date de disponibilité/publication, pas seulement la date économique
+- Universe : le rebuild du projet reste ADR-free
 
 ## Commande produit long terme
 

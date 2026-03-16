@@ -10,21 +10,13 @@ Objectif :
 - bias-aware
 - compatibles OOP
 
-Chaque domaine de données suit exactement les mêmes couches.
-
----
-
-## Architecture générale
-
-Pipeline standard :
+Chaque domaine de données suit exactement les mêmes couches :
 
 raw
 ↓
 normalized
 ↓
 derived / features / serving
-
----
 
 ## 1. Raw layer
 
@@ -37,7 +29,7 @@ But :
 
 Les tables raw ne doivent jamais être modifiées par des pipelines downstream.
 
-Naming convention :
+Convention :
 
     <domain>_*_raw
 
@@ -49,12 +41,11 @@ Exemples :
 - price_source_daily_raw
 - price_source_daily_raw_yahoo
 - finra_short_interest_source_raw
+- finra_daily_short_volume_source_raw
 
 CLI associées :
 
 - cli/raw/*
-
----
 
 ## 2. Normalized layer
 
@@ -66,8 +57,9 @@ But :
 - dédupliquer
 - créer les clés métier
 - intégrer les sources multiples
+- garantir la sécurité PIT
 
-Naming convention :
+Convention :
 
     <domain>_*
 ou
@@ -81,6 +73,12 @@ Exemples :
 - price_history
 - finra_short_interest_history
 
+Règles PIT :
+
+- SEC : utiliser available_at pour la disponibilité marché
+- FINRA : utiliser available_at / publication date pour la disponibilité marché
+- PRICES : price_history est la normalized canonique, price_latest est serving only
+
 Les pipelines downstream doivent lire uniquement les tables normalized.
 
 CLI associées :
@@ -90,8 +88,6 @@ CLI associées :
 Pipelines :
 
 - stock_quant/pipelines/build_*_pipeline.py
-
----
 
 ## 3. Derived / Feature layer
 
@@ -103,7 +99,7 @@ But :
 - features ML
 - latest state
 
-Naming convention :
+Convention :
 
 - *_latest
 - *_features_daily
@@ -121,8 +117,6 @@ Exemples :
 - finra_short_interest_latest
 - short_features_daily
 
----
-
 ## 4. Orchestrators
 
 Les orchestrateurs gèrent :
@@ -130,13 +124,12 @@ Les orchestrateurs gèrent :
 - ordre des pipelines
 - refresh incrémental
 - gestion des sources
+- logging
 
 CLI :
 
 - cli/ops/run_*_daily_refresh.py
 - cli/ops/rebuild_database_from_scratch.py
-
----
 
 ## Domain pipelines
 
@@ -154,8 +147,6 @@ derived
 
 - market_universe
 - universe_membership_history
-
----
 
 ### SEC
 
@@ -176,8 +167,6 @@ derived
 - fundamental_ttm
 - fundamental_features_daily
 
----
-
 ### Prices
 
 raw
@@ -193,8 +182,6 @@ normalized
 derived
 
 - price_latest
-
----
 
 ### FINRA
 
@@ -212,13 +199,13 @@ derived
 - finra_short_interest_latest
 - short_features_daily
 
----
-
-## Rules
+## Hard rules
 
 1. Raw tables are append-only.
 2. Normalized tables must be deterministic and idempotent.
 3. Derived tables must depend only on normalized tables.
-4. No pipeline should read raw tables except normalize pipelines.
-5. SQL-first logic whenever possible.
-6. Python orchestration should remain thin.
+4. No research pipeline should read raw tables.
+5. No backtest / dataset / labeler should read price_latest.
+6. SEC and FINRA availability must use available_at, not economic period date alone.
+7. Python orchestration should remain thin.
+8. SQL-first logic whenever possible.

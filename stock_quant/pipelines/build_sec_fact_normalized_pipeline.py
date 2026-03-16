@@ -10,7 +10,7 @@ class BuildSecFactNormalizedPipeline(BasePipeline):
     """
     Transforme sec_xbrl_fact_raw -> sec_fact_normalized.
 
-    Cette couche constitue la normalized layer pour les facts SEC.
+    Cette couche constitue la normalized layer canonique pour les facts SEC.
     """
 
     pipeline_name = "build_sec_fact_normalized"
