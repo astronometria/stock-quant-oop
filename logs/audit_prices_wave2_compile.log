@@ -1,0 +1,10 @@
+===== DATE =====
+Mon 16 Mar 2026 05:41:48 PM EDT
+===== COMPILE TARGET =====
+
+===== IMPORT CHECK =====
+build canonical OK: <class 'stock_quant.pipelines.build_prices_pipeline.BuildPricesPipeline'>
+build compatibility alias OK: <class 'stock_quant.pipelines.build_prices_pipeline.BuildPricesPipeline'>
+legacy wrapper OK: <class 'stock_quant.pipelines.build_prices_pipeline.BuildPricesPipeline'>
+cli build_prices import OK: <function main at 0x742bb332d630>
+===== DONE =====
