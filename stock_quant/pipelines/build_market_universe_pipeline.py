@@ -1,57 +1,99 @@
 from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.pipelines.base_pipeline import BasePipeline
 from stock_quant.shared.exceptions import PipelineError
 
 
-class BuildMarketUniversePipeline(BasePipeline):
+class BuildMarketUniversePipeline:
+    """
+    Pipeline SQL-first pour construire `market_universe`.
+
+    Convention de refactor
+    ----------------------
+    - ce pipeline consomme désormais un repository déjà branché sur une
+      connexion active DuckDB
+    - il ne dépend plus de `repository.uow`
+    - il reste volontairement mince côté orchestration métier
+    """
+
     pipeline_name = "build_market_universe"
 
-    def __init__(self, repository=None, uow: DuckDbUnitOfWork | None = None, allow_adr: bool = True) -> None:
-        if repository is not None:
-            self.uow = repository.uow
-        else:
-            self.uow = uow
-
-        if self.uow is None:
-            raise ValueError("BuildMarketUniversePipeline requires repository or uow")
-
+    def __init__(self, repository, allow_adr: bool = True) -> None:
+        self.repository = repository
         self.allow_adr = allow_adr
+
         self._metrics: dict[str, int] = {}
         self._written_universe = 0
         self._written_conflicts = 0
 
     @property
     def con(self):
-        if self.uow.connection is None:
+        """
+        Retourne la connexion active DuckDB portée par le repository.
+        """
+        con = getattr(self.repository, "con", None)
+        if con is None:
             raise PipelineError("active DB connection is required")
-        return self.uow.connection
+        return con
 
-    def extract(self):
-        return None
+    def run(self) -> PipelineResult:
+        """
+        Exécute le pipeline complet.
 
-    def transform(self, data):
-        return None
+        Le pipeline suit la structure habituelle :
+        - validate
+        - load
+        - finalize
+        """
+        result = PipelineResult.success(self.pipeline_name)
 
-    def validate(self, data) -> None:
+        try:
+            self.validate()
+            self.load()
+            result = self.finalize(result)
+            return result
+        except Exception as exc:
+            return PipelineResult.failed(
+                pipeline_name=self.pipeline_name,
+                error_message=str(exc),
+            )
+
+    def validate(self) -> None:
+        """
+        Valide la disponibilité de la matière première source.
+        """
         raw_candidates = int(
-            self.con.execute("SELECT COUNT(*) FROM symbol_reference_source_raw").fetchone()[0]
+            self.con.execute(
+                "SELECT COUNT(*) FROM symbol_reference_source_raw"
+            ).fetchone()[0]
         )
         if raw_candidates == 0:
-            raise PipelineError("no raw candidates available in symbol_reference_source_raw")
+            raise PipelineError(
+                "no raw candidates available in symbol_reference_source_raw"
+            )
 
-    def load(self, data) -> None:
+    def load(self) -> None:
+        """
+        Construit `market_universe` et `market_universe_conflicts`.
+
+        Règles :
+        - base : `symbol_reference_source_raw`
+        - normalisation des exchanges
+        - normalisation des security types
+        - exclusion OTC / ETF / preferred / warrant / right / unit
+        - ADR inclus ou exclus selon `allow_adr`
+        - résolution des duplicats par symbole avec ranking explicite
+        """
         con = self.con
 
         raw_candidates = int(
-            con.execute("SELECT COUNT(*) FROM symbol_reference_source_raw").fetchone()[0]
+            con.execute(
+                "SELECT COUNT(*) FROM symbol_reference_source_raw"
+            ).fetchone()[0]
         )
 
         con.execute("DELETE FROM market_universe")
         con.execute("DELETE FROM market_universe_conflicts")
-
         con.execute("DROP TABLE IF EXISTS tmp_universe_candidates")
         con.execute(
             f"""
@@ -63,56 +105,50 @@ class BuildMarketUniversePipeline(BasePipeline):
                     NULLIF(TRIM(cik), '') AS cik,
                     NULLIF(TRIM(exchange_raw), '') AS exchange_raw,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NASDAQ', 'NASDAQGS', 'NASDAQGM', 'NASDAQCM')
-                            THEN 'NASDAQ'
-                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE', 'NYQ')
-                            THEN 'NYSE'
-                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSEARCA', 'NYSE ARCA', 'ARCA')
-                            THEN 'NYSE_ARCA'
-                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSEAMERICAN', 'NYSE AMERICAN', 'AMEX')
-                            THEN 'NYSE_AMERICAN'
-                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) LIKE 'OTC%'
-                            THEN 'OTC'
-                        WHEN NULLIF(TRIM(exchange_raw), '') IS NULL
-                            THEN NULL
+                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NASDAQ', 'NASDAQGS', 'NASDAQGM', 'NASDAQCM') THEN 'NASDAQ'
+                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE', 'NYQ') THEN 'NYSE'
+                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSEARCA', 'NYSE ARCA', 'ARCA') THEN 'NYSE_ARCA'
+                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSEAMERICAN', 'NYSE AMERICAN', 'AMEX') THEN 'NYSE_AMERICAN'
+                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) LIKE 'OTC%%' THEN 'OTC'
+                        WHEN NULLIF(TRIM(exchange_raw), '') IS NULL THEN NULL
                         ELSE UPPER(REPLACE(TRIM(exchange_raw), ' ', '_'))
                     END AS exchange_normalized,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%WARRANT%' THEN 'WARRANT'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ETF%' THEN 'ETF'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ADR%' THEN 'ADR'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%RIGHT%' THEN 'RIGHT'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%UNIT%' THEN 'UNIT'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%PREFERRED%' THEN 'PREFERRED'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%COMMON%' THEN 'COMMON_STOCK'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%WARRANT%%' THEN 'WARRANT'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ETF%%' THEN 'ETF'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ADR%%' THEN 'ADR'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%RIGHT%%' THEN 'RIGHT'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%UNIT%%' THEN 'UNIT'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%PREFERRED%%' THEN 'PREFERRED'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%COMMON%%' THEN 'COMMON_STOCK'
                         ELSE UPPER(REPLACE(TRIM(COALESCE(security_type_raw, 'UNKNOWN')), ' ', '_'))
                     END AS security_type,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%COMMON%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%COMMON%%' THEN TRUE
                         ELSE FALSE
                     END AS is_common_stock,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ADR%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ADR%%' THEN TRUE
                         ELSE FALSE
                     END AS is_adr,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ETF%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ETF%%' THEN TRUE
                         ELSE FALSE
                     END AS is_etf,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%PREFERRED%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%PREFERRED%%' THEN TRUE
                         ELSE FALSE
                     END AS is_preferred,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%WARRANT%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%WARRANT%%' THEN TRUE
                         ELSE FALSE
                     END AS is_warrant,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%RIGHT%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%RIGHT%%' THEN TRUE
                         ELSE FALSE
                     END AS is_right,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%UNIT%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%UNIT%%' THEN TRUE
                         ELSE FALSE
                     END AS is_unit,
                     COALESCE(NULLIF(TRIM(source_name), ''), 'unknown_source') AS source_name,
@@ -137,45 +173,27 @@ class BuildMarketUniversePipeline(BasePipeline):
                 source_name,
                 as_of_date,
                 CASE
-                    WHEN exchange_normalized NOT IN ('NASDAQ', 'NYSE')
-                        THEN FALSE
-                    WHEN is_etf
-                        THEN FALSE
-                    WHEN is_preferred
-                        THEN FALSE
-                    WHEN is_warrant
-                        THEN FALSE
-                    WHEN is_right
-                        THEN FALSE
-                    WHEN is_unit
-                        THEN FALSE
-                    WHEN is_adr AND {str(self.allow_adr).upper()}
-                        THEN TRUE
-                    WHEN is_adr AND NOT {str(self.allow_adr).upper()}
-                        THEN FALSE
-                    WHEN is_common_stock
-                        THEN TRUE
+                    WHEN exchange_normalized NOT IN ('NASDAQ', 'NYSE') THEN FALSE
+                    WHEN is_etf THEN FALSE
+                    WHEN is_preferred THEN FALSE
+                    WHEN is_warrant THEN FALSE
+                    WHEN is_right THEN FALSE
+                    WHEN is_unit THEN FALSE
+                    WHEN is_adr AND {str(self.allow_adr).upper()} THEN TRUE
+                    WHEN is_adr AND NOT {str(self.allow_adr).upper()} THEN FALSE
+                    WHEN is_common_stock THEN TRUE
                     ELSE FALSE
                 END AS include_in_universe,
                 CASE
-                    WHEN exchange_normalized NOT IN ('NASDAQ', 'NYSE')
-                        THEN 'exchange_not_allowed'
-                    WHEN is_etf
-                        THEN 'etf_excluded'
-                    WHEN is_preferred
-                        THEN 'preferred_excluded'
-                    WHEN is_warrant
-                        THEN 'warrant_excluded'
-                    WHEN is_right
-                        THEN 'right_excluded'
-                    WHEN is_unit
-                        THEN 'unit_excluded'
-                    WHEN is_adr AND NOT {str(self.allow_adr).upper()}
-                        THEN 'adr_excluded'
-                    WHEN is_adr AND {str(self.allow_adr).upper()}
-                        THEN NULL
-                    WHEN is_common_stock
-                        THEN NULL
+                    WHEN exchange_normalized NOT IN ('NASDAQ', 'NYSE') THEN 'exchange_not_allowed'
+                    WHEN is_etf THEN 'etf_excluded'
+                    WHEN is_preferred THEN 'preferred_excluded'
+                    WHEN is_warrant THEN 'warrant_excluded'
+                    WHEN is_right THEN 'right_excluded'
+                    WHEN is_unit THEN 'unit_excluded'
+                    WHEN is_adr AND NOT {str(self.allow_adr).upper()} THEN 'adr_excluded'
+                    WHEN is_adr AND {str(self.allow_adr).upper()} THEN NULL
+                    WHEN is_common_stock THEN NULL
                     ELSE 'not_common_stock'
                 END AS exclusion_reason
             FROM normalized
@@ -281,8 +299,8 @@ class BuildMarketUniversePipeline(BasePipeline):
                 CURRENT_TIMESTAMP
             FROM tmp_universe_ranked r
             INNER JOIN tmp_universe_ranked b
-              ON r.symbol = b.symbol
-             AND b.rn = 1
+                ON r.symbol = b.symbol
+               AND b.rn = 1
             WHERE r.rn > 1
             """
         )
@@ -315,6 +333,9 @@ class BuildMarketUniversePipeline(BasePipeline):
         }
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
+        """
+        Alimente le résultat final du pipeline.
+        """
         result.rows_read = int(self._metrics.get("raw_candidates", 0))
         result.rows_written = self._written_universe
         result.metrics.update(self._metrics)
