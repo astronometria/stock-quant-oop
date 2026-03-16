@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
+from stock_quant.pipelines.base_pipeline import BasePipeline
 from stock_quant.shared.exceptions import PipelineError
 
 
-class BuildMarketUniversePipeline:
+class BuildMarketUniversePipeline(BasePipeline):
     """
     Pipeline SQL-first pour construire `market_universe`.
 
-    Convention de refactor
-    ----------------------
-    - ce pipeline consomme désormais un repository déjà branché sur une
-      connexion active DuckDB
-    - il ne dépend plus de `repository.uow`
-    - il reste volontairement mince côté orchestration métier
+    Notes
+    -----
+    - On garde ici un pipeline mince.
+    - Le repository doit désormais exposer directement `con`.
+    - On s'appuie sur BasePipeline.run() du projet pour construire
+      correctement PipelineResult avec PipelineStatus.
     """
 
     pipeline_name = "build_market_universe"
@@ -29,38 +30,28 @@ class BuildMarketUniversePipeline:
     @property
     def con(self):
         """
-        Retourne la connexion active DuckDB portée par le repository.
+        Retourne la connexion DuckDB portée par le repository.
         """
         con = getattr(self.repository, "con", None)
         if con is None:
             raise PipelineError("active DB connection is required")
         return con
 
-    def run(self) -> PipelineResult:
+    def extract(self):
         """
-        Exécute le pipeline complet.
-
-        Le pipeline suit la structure habituelle :
-        - validate
-        - load
-        - finalize
+        Ce pipeline est SQL-first : rien à extraire en Python.
         """
-        result = PipelineResult.success(self.pipeline_name)
+        return None
 
-        try:
-            self.validate()
-            self.load()
-            result = self.finalize(result)
-            return result
-        except Exception as exc:
-            return PipelineResult.failed(
-                pipeline_name=self.pipeline_name,
-                error_message=str(exc),
-            )
-
-    def validate(self) -> None:
+    def transform(self, data):
         """
-        Valide la disponibilité de la matière première source.
+        Pas de transformation Python intermédiaire.
+        """
+        return None
+
+    def validate(self, data) -> None:
+        """
+        Vérifie la présence de matière première.
         """
         raw_candidates = int(
             self.con.execute(
@@ -72,7 +63,7 @@ class BuildMarketUniversePipeline:
                 "no raw candidates available in symbol_reference_source_raw"
             )
 
-    def load(self) -> None:
+    def load(self, data) -> None:
         """
         Construit `market_universe` et `market_universe_conflicts`.
 
@@ -109,46 +100,46 @@ class BuildMarketUniversePipeline:
                         WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSE', 'NYQ') THEN 'NYSE'
                         WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSEARCA', 'NYSE ARCA', 'ARCA') THEN 'NYSE_ARCA'
                         WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) IN ('NYSEAMERICAN', 'NYSE AMERICAN', 'AMEX') THEN 'NYSE_AMERICAN'
-                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) LIKE 'OTC%%' THEN 'OTC'
+                        WHEN UPPER(TRIM(COALESCE(exchange_raw, ''))) LIKE 'OTC%' THEN 'OTC'
                         WHEN NULLIF(TRIM(exchange_raw), '') IS NULL THEN NULL
                         ELSE UPPER(REPLACE(TRIM(exchange_raw), ' ', '_'))
                     END AS exchange_normalized,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%WARRANT%%' THEN 'WARRANT'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ETF%%' THEN 'ETF'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ADR%%' THEN 'ADR'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%RIGHT%%' THEN 'RIGHT'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%UNIT%%' THEN 'UNIT'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%PREFERRED%%' THEN 'PREFERRED'
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%COMMON%%' THEN 'COMMON_STOCK'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%WARRANT%' THEN 'WARRANT'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ETF%' THEN 'ETF'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ADR%' THEN 'ADR'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%RIGHT%' THEN 'RIGHT'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%UNIT%' THEN 'UNIT'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%PREFERRED%' THEN 'PREFERRED'
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%COMMON%' THEN 'COMMON_STOCK'
                         ELSE UPPER(REPLACE(TRIM(COALESCE(security_type_raw, 'UNKNOWN')), ' ', '_'))
                     END AS security_type,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%COMMON%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%COMMON%' THEN TRUE
                         ELSE FALSE
                     END AS is_common_stock,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ADR%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ADR%' THEN TRUE
                         ELSE FALSE
                     END AS is_adr,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%ETF%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%ETF%' THEN TRUE
                         ELSE FALSE
                     END AS is_etf,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%PREFERRED%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%PREFERRED%' THEN TRUE
                         ELSE FALSE
                     END AS is_preferred,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%WARRANT%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%WARRANT%' THEN TRUE
                         ELSE FALSE
                     END AS is_warrant,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%RIGHT%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%RIGHT%' THEN TRUE
                         ELSE FALSE
                     END AS is_right,
                     CASE
-                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%%UNIT%%' THEN TRUE
+                        WHEN UPPER(TRIM(COALESCE(security_type_raw, ''))) LIKE '%UNIT%' THEN TRUE
                         ELSE FALSE
                     END AS is_unit,
                     COALESCE(NULLIF(TRIM(source_name), ''), 'unknown_source') AS source_name,
