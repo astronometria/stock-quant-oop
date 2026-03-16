@@ -15,7 +15,7 @@ except Exception:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Seed the development database with fixture raw data and derived tables."
+        description="Seed the database from real source files only. No fixtures."
     )
     parser.add_argument(
         "--project-root",
@@ -33,19 +33,40 @@ def parse_args() -> argparse.Namespace:
         help="Drop and recreate database objects before seeding.",
     )
     parser.add_argument(
+        "--symbol-source",
+        action="append",
+        dest="symbol_sources",
+        default=[],
+        help="Real symbol reference source file. Repeat this flag.",
+    )
+    parser.add_argument(
         "--include-prices",
         action="store_true",
-        help="Load fixture price raw data and build price tables.",
+        help="Load price raw data and build price tables.",
     )
     parser.add_argument(
         "--include-finra",
         action="store_true",
-        help="Load fixture FINRA raw data and build FINRA tables.",
+        help="Load FINRA raw data and build FINRA tables.",
+    )
+    parser.add_argument(
+        "--finra-source",
+        action="append",
+        dest="finra_sources",
+        default=[],
+        help="Real FINRA raw source path/file/dir/glob. Repeat this flag.",
     )
     parser.add_argument(
         "--include-news",
         action="store_true",
-        help="Load fixture news raw data and build news tables.",
+        help="Load news raw data and build news tables.",
+    )
+    parser.add_argument(
+        "--news-source",
+        action="append",
+        dest="news_sources",
+        default=[],
+        help="Real news raw source file. Repeat this flag.",
     )
     parser.add_argument(
         "--source-market",
@@ -81,8 +102,26 @@ def run_step(name: str, cmd: list[str], project_root: Path) -> None:
         raise SystemExit(f"Step failed: {name} (exit={completed.returncode})")
 
 
+def _extend_repeatable(args: list[str], flag: str, values: list[str]) -> None:
+    for value in values:
+        args.extend([flag, value])
+
+
+def _validate_required_sources(args: argparse.Namespace) -> None:
+    if not args.symbol_sources:
+        raise SystemExit("seed_initial_db requires at least one --symbol-source.")
+
+    if args.include_finra and not args.finra_sources:
+        raise SystemExit("seed_initial_db requires at least one --finra-source when --include-finra is used.")
+
+    if args.include_news and not args.news_sources:
+        raise SystemExit("seed_initial_db requires at least one --news-source when --include-news is used.")
+
+
 def main() -> None:
     args = parse_args()
+    _validate_required_sources(args)
+
     project_root = Path(args.project_root).resolve()
 
     steps: list[tuple[str, list[str]]] = []
@@ -98,6 +137,7 @@ def main() -> None:
         args.db_path,
         args.verbose,
     )
+    _extend_repeatable(symbol_load_cmd, "--source", args.symbol_sources)
     symbol_load_cmd.append("--truncate")
     steps.append(("load_symbol_reference_source_raw", symbol_load_cmd))
 
@@ -137,6 +177,7 @@ def main() -> None:
             args.db_path,
             args.verbose,
         )
+        _extend_repeatable(finra_load_cmd, "--source", args.finra_sources)
         finra_load_cmd.append("--truncate")
         steps.append(("load_finra_short_interest_source_raw", finra_load_cmd))
 
@@ -156,6 +197,7 @@ def main() -> None:
             args.db_path,
             args.verbose,
         )
+        _extend_repeatable(news_load_cmd, "--source", args.news_sources)
         news_load_cmd.append("--truncate")
         steps.append(("load_news_source_raw", news_load_cmd))
         steps.append(

@@ -17,7 +17,10 @@ from stock_quant.infrastructure.providers.symbols.symbol_source_loader import Sy
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Load symbol reference raw rows into DuckDB from fixtures or CSV sources."
+        description=(
+            "Load real symbol reference raw rows into DuckDB from provided source files. "
+            "Prod-only: no implicit fixture fallback."
+        )
     )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument(
@@ -25,88 +28,30 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="sources",
         default=[],
-        help="Optional CSV source path. Repeat this flag for multiple inputs.",
+        help="Source file path. Repeat this flag for multiple inputs.",
     )
-    parser.add_argument("--truncate", action="store_true", help="Delete existing staging rows before insert.")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete existing staging rows before insert.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output.",
+    )
     return parser.parse_args()
 
 
-def build_fixture_frame() -> pd.DataFrame:
-    now = datetime.utcnow()
-    as_of_date = date(2026, 3, 14)
+def _normalize_input_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize provider output into the exact canonical raw schema expected by DuckDB.
 
-    rows = [
-        {
-            "symbol": "AAPL",
-            "company_name": "Apple Inc.",
-            "cik": "0000320193",
-            "exchange_raw": "NASDAQGS",
-            "security_type_raw": "Common Stock",
-            "source_name": "sec_fixture",
-            "as_of_date": as_of_date,
-            "ingested_at": now,
-        },
-        {
-            "symbol": "AAPL",
-            "company_name": "Apple Inc.",
-            "cik": "0000320193",
-            "exchange_raw": "OTCMKTS",
-            "security_type_raw": "Common Stock",
-            "source_name": "otc_fixture",
-            "as_of_date": as_of_date,
-            "ingested_at": now,
-        },
-        {
-            "symbol": "MSFT",
-            "company_name": "Microsoft Corporation",
-            "cik": "0000789019",
-            "exchange_raw": "NASDAQ",
-            "security_type_raw": "Common Stock",
-            "source_name": "sec_fixture",
-            "as_of_date": as_of_date,
-            "ingested_at": now,
-        },
-        {
-            "symbol": "BABA",
-            "company_name": "Alibaba Group Holding Ltd ADR",
-            "cik": "0001577552",
-            "exchange_raw": "NYSE",
-            "security_type_raw": "ADR",
-            "source_name": "sec_fixture",
-            "as_of_date": as_of_date,
-            "ingested_at": now,
-        },
-        {
-            "symbol": "SPY",
-            "company_name": "SPDR S&P 500 ETF Trust",
-            "cik": None,
-            "exchange_raw": "NYSEARCA",
-            "security_type_raw": "ETF",
-            "source_name": "sec_fixture",
-            "as_of_date": as_of_date,
-            "ingested_at": now,
-        },
-        {
-            "symbol": "XYZW",
-            "company_name": "XYZW Acquisition Corp Warrant",
-            "cik": None,
-            "exchange_raw": "NASDAQ",
-            "security_type_raw": "Warrant",
-            "source_name": "sec_fixture",
-            "as_of_date": as_of_date,
-            "ingested_at": now,
-        },
-    ]
-    return pd.DataFrame(rows)
-
-
-def load_source_frame(sources: list[str]) -> pd.DataFrame:
-    loader = SymbolSourceLoader(source_paths=sources)
-    frame = loader.fetch_symbols_frame()
-    if frame.empty:
-        return frame
-
+    Important:
+    - We never synthesize fake rows here.
+    - Missing columns are added as NULL to preserve SQL-first loading.
+    - Symbol normalization happens here once, before staging into DuckDB.
+    """
     frame = frame.copy()
     frame.columns = [str(col).strip() for col in frame.columns]
 
@@ -115,6 +60,8 @@ def load_source_frame(sources: list[str]) -> pd.DataFrame:
         "Security Type": "security_type_raw",
         "source": "source_name",
         "Source": "source_name",
+        "exchange": "exchange_raw",
+        "Exchange": "exchange_raw",
     }
     frame = frame.rename(columns=rename_map)
 
@@ -122,7 +69,7 @@ def load_source_frame(sources: list[str]) -> pd.DataFrame:
         frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
 
     if "source_name" not in frame.columns:
-        frame["source_name"] = "csv_source"
+        frame["source_name"] = "external_source"
 
     if "as_of_date" not in frame.columns:
         frame["as_of_date"] = date.today()
@@ -147,12 +94,36 @@ def load_source_frame(sources: list[str]) -> pd.DataFrame:
     return frame[required].reset_index(drop=True)
 
 
+def load_source_frame(sources: list[str]) -> pd.DataFrame:
+    """
+    Load real source data only.
+
+    Prod rule:
+    - no source => hard failure
+    - empty provider result => hard failure
+    """
+    if not sources:
+        raise SystemExit(
+            "load_symbol_reference_source_raw requires at least one --source in prod mode."
+        )
+
+    loader = SymbolSourceLoader(source_paths=sources)
+    frame = loader.fetch_symbols_frame()
+
+    if frame is None or frame.empty:
+        raise SystemExit(
+            "load_symbol_reference_source_raw received no rows from the provided source files."
+        )
+
+    return _normalize_input_frame(frame)
+
+
 def main() -> int:
     args = parse_args()
     config = build_app_config(db_path=args.db_path)
     config.ensure_directories()
 
-    frame = load_source_frame(args.sources) if args.sources else build_fixture_frame()
+    frame = load_source_frame(args.sources)
 
     session_factory = DuckDbSessionFactory(config.db_path)
     with DuckDbUnitOfWork(session_factory) as uow:
@@ -166,50 +137,54 @@ def main() -> int:
         if args.truncate:
             con.execute(f"DELETE FROM {SYMBOL_REFERENCE_SOURCE_RAW}")
 
-        rows_before = int(con.execute(f"SELECT COUNT(*) FROM {SYMBOL_REFERENCE_SOURCE_RAW}").fetchone()[0])
+        rows_before = int(
+            con.execute(f"SELECT COUNT(*) FROM {SYMBOL_REFERENCE_SOURCE_RAW}").fetchone()[0]
+        )
 
         rows_written = 0
-        if not frame.empty:
-            con.register("tmp_symbol_reference_source_raw_frame", frame)
-            try:
-                con.execute(
-                    f"""
-                    INSERT INTO {SYMBOL_REFERENCE_SOURCE_RAW} (
-                        symbol,
-                        company_name,
-                        cik,
-                        exchange_raw,
-                        security_type_raw,
-                        source_name,
-                        as_of_date,
-                        ingested_at
-                    )
-                    SELECT
-                        UPPER(TRIM(symbol)) AS symbol,
-                        CAST(company_name AS VARCHAR) AS company_name,
-                        CAST(cik AS VARCHAR) AS cik,
-                        CAST(exchange_raw AS VARCHAR) AS exchange_raw,
-                        CAST(security_type_raw AS VARCHAR) AS security_type_raw,
-                        CAST(source_name AS VARCHAR) AS source_name,
-                        CAST(as_of_date AS DATE) AS as_of_date,
-                        CAST(ingested_at AS TIMESTAMP) AS ingested_at
-                    FROM tmp_symbol_reference_source_raw_frame
-                    WHERE symbol IS NOT NULL
-                      AND TRIM(symbol) <> ''
-                    """
+        con.register("tmp_symbol_reference_source_raw_frame", frame)
+        try:
+            con.execute(
+                f"""
+                INSERT INTO {SYMBOL_REFERENCE_SOURCE_RAW} (
+                    symbol,
+                    company_name,
+                    cik,
+                    exchange_raw,
+                    security_type_raw,
+                    source_name,
+                    as_of_date,
+                    ingested_at
                 )
-                rows_written = int(len(frame))
-            finally:
-                try:
-                    con.unregister("tmp_symbol_reference_source_raw_frame")
-                except Exception:
-                    pass
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    CAST(company_name AS VARCHAR) AS company_name,
+                    CAST(cik AS VARCHAR) AS cik,
+                    CAST(exchange_raw AS VARCHAR) AS exchange_raw,
+                    CAST(security_type_raw AS VARCHAR) AS security_type_raw,
+                    CAST(source_name AS VARCHAR) AS source_name,
+                    CAST(as_of_date AS DATE) AS as_of_date,
+                    CAST(ingested_at AS TIMESTAMP) AS ingested_at
+                FROM tmp_symbol_reference_source_raw_frame
+                WHERE symbol IS NOT NULL
+                  AND TRIM(symbol) <> ''
+                """
+            )
+            rows_written = int(len(frame))
+        finally:
+            try:
+                con.unregister("tmp_symbol_reference_source_raw_frame")
+            except Exception:
+                pass
 
-        rows_after = int(con.execute(f"SELECT COUNT(*) FROM {SYMBOL_REFERENCE_SOURCE_RAW}").fetchone()[0])
+        rows_after = int(
+            con.execute(f"SELECT COUNT(*) FROM {SYMBOL_REFERENCE_SOURCE_RAW}").fetchone()[0]
+        )
 
     if args.verbose:
         print(f"[load_symbol_reference_source_raw] db_path={config.db_path}")
-        print(f"[load_symbol_reference_source_raw] source_mode={'csv' if args.sources else 'fixture'}")
+        print("[load_symbol_reference_source_raw] source_mode=real_sources_only")
+        print(f"[load_symbol_reference_source_raw] source_count={len(args.sources)}")
         print(f"[load_symbol_reference_source_raw] rows_before={rows_before}")
         print(f"[load_symbol_reference_source_raw] rows_written={rows_written}")
         print(f"[load_symbol_reference_source_raw] rows_after={rows_after}")

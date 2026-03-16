@@ -17,7 +17,9 @@ from stock_quant.infrastructure.providers.finra.finra_provider import FinraProvi
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load FINRA raw short interest rows into DuckDB.")
+    parser = argparse.ArgumentParser(
+        description="Load real FINRA raw short interest rows into DuckDB. Prod-only: no fixture fallback."
+    )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument(
         "--source",
@@ -48,12 +50,21 @@ def parse_date(value: str | None):
 
 
 def resolve_sources(items: list[str]) -> list[Path]:
+    """
+    Resolve repeated --source values into existing concrete paths.
+
+    Supports:
+    - direct files
+    - directories
+    - globs
+    """
     resolved: list[Path] = []
     for item in items:
         expanded = sorted(glob.glob(str(Path(item).expanduser())))
         if expanded:
             resolved.extend(Path(path).expanduser().resolve() for path in expanded)
             continue
+
         path = Path(item).expanduser().resolve()
         if path.exists():
             resolved.append(path)
@@ -66,55 +77,17 @@ def resolve_sources(items: list[str]) -> list[Path]:
             continue
         seen.add(key)
         unique.append(path)
+
     return unique
 
 
-def build_fixture_frame() -> pd.DataFrame:
-    now = datetime.utcnow()
-    rows = [
-        ("AAPL", "2026-02-28", 12000000, 11000000, 48000000.0, 15000000000, None, "regular", "reg_20260228.csv", "2026-02-28", now),
-        ("AAPL", "2026-03-15", 12500000, 12000000, 50000000.0, 15000000000, None, "regular", "reg_20260315.csv", "2026-03-15", now),
-        ("AAPL", "2026-03-15", 12500000, 12000000, 50000000.0, 15000000000, None, "regular", "reg_20260315.csv", "2026-03-15", now),
-        ("MSFT", "2026-02-28", 8300000, 8100000, 26000000.0, 7400000000, None, "regular", "reg_20260228.csv", "2026-02-28", now),
-        ("MSFT", "2026-03-15", 8700000, 8300000, 25500000.0, 7400000000, None, "regular", "reg_20260315.csv", "2026-03-15", now),
-        ("BABA", "2026-03-15", 14800000, 15000000, 17500000.0, 2600000000, None, "regular", "reg_20260315.csv", "2026-03-15", now),
-        ("SPY", "2026-03-15", 50000, 45000, 120000.0, None, None, "regular", "reg_20260315.csv", "2026-03-15", now),
-        ("OTCM", "2026-03-15", 10000, 9000, 5000.0, 2000000, None, "otc", "otc_20260315.csv", "2026-03-15", now),
-    ]
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "symbol",
-            "settlement_date",
-            "short_interest",
-            "previous_short_interest",
-            "avg_daily_volume",
-            "shares_float",
-            "revision_flag",
-            "source_market",
-            "source_file",
-            "source_date",
-            "ingested_at",
-        ],
-    )
-
-
-def build_source_frame(args: argparse.Namespace) -> pd.DataFrame:
-    sources = resolve_sources(args.sources)
-    if not sources:
-        return build_fixture_frame()
-
-    provider = FinraProvider(source_paths=sources)
-    frame = provider.fetch_short_interest_frame(
-        symbols=args.symbols or None,
-        start_date=parse_date(args.start_date),
-        end_date=parse_date(args.end_date),
-    )
-    if frame.empty:
-        return frame
-
+def normalize_source_frame(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
     frame.columns = [str(col).strip() for col in frame.columns]
+
+    if "symbol" in frame.columns:
+        frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+
     if "ingested_at" not in frame.columns:
         frame["ingested_at"] = datetime.utcnow()
 
@@ -138,6 +111,41 @@ def build_source_frame(args: argparse.Namespace) -> pd.DataFrame:
     return frame[required].reset_index(drop=True)
 
 
+def build_source_frame(args: argparse.Namespace) -> pd.DataFrame:
+    """
+    Real-source loader only.
+
+    Prod rule:
+    - no --source => hard failure
+    - no resolved file => hard failure
+    - provider empty => hard failure
+    """
+    if not args.sources:
+        raise SystemExit(
+            "load_finra_short_interest_source_raw requires at least one --source in prod mode."
+        )
+
+    sources = resolve_sources(args.sources)
+    if not sources:
+        raise SystemExit(
+            "load_finra_short_interest_source_raw could not resolve any existing path from --source."
+        )
+
+    provider = FinraProvider(source_paths=sources)
+    frame = provider.fetch_short_interest_frame(
+        symbols=args.symbols or None,
+        start_date=parse_date(args.start_date),
+        end_date=parse_date(args.end_date),
+    )
+
+    if frame is None or frame.empty:
+        raise SystemExit(
+            "load_finra_short_interest_source_raw received no rows from the provided FINRA source files."
+        )
+
+    return normalize_source_frame(frame)
+
+
 def main() -> int:
     args = parse_args()
     config = build_app_config(db_path=args.db_path)
@@ -157,57 +165,61 @@ def main() -> int:
         if args.truncate or args.replace:
             con.execute(f"DELETE FROM {FINRA_SHORT_INTEREST_SOURCE_RAW}")
 
-        rows_before = int(con.execute(f"SELECT COUNT(*) FROM {FINRA_SHORT_INTEREST_SOURCE_RAW}").fetchone()[0])
+        rows_before = int(
+            con.execute(f"SELECT COUNT(*) FROM {FINRA_SHORT_INTEREST_SOURCE_RAW}").fetchone()[0]
+        )
 
         rows_written = 0
-        if not frame.empty:
-            con.register("tmp_finra_short_interest_frame", frame)
-            try:
-                con.execute(
-                    f"""
-                    INSERT INTO {FINRA_SHORT_INTEREST_SOURCE_RAW} (
-                        symbol,
-                        settlement_date,
-                        short_interest,
-                        previous_short_interest,
-                        avg_daily_volume,
-                        shares_float,
-                        revision_flag,
-                        source_market,
-                        source_file,
-                        source_date,
-                        ingested_at
-                    )
-                    SELECT
-                        UPPER(TRIM(symbol)) AS symbol,
-                        CAST(settlement_date AS DATE) AS settlement_date,
-                        CAST(short_interest AS BIGINT) AS short_interest,
-                        CAST(previous_short_interest AS BIGINT) AS previous_short_interest,
-                        CAST(avg_daily_volume AS DOUBLE) AS avg_daily_volume,
-                        CAST(shares_float AS BIGINT) AS shares_float,
-                        CAST(revision_flag AS VARCHAR) AS revision_flag,
-                        CAST(source_market AS VARCHAR) AS source_market,
-                        CAST(source_file AS VARCHAR) AS source_file,
-                        CAST(source_date AS DATE) AS source_date,
-                        CAST(ingested_at AS TIMESTAMP) AS ingested_at
-                    FROM tmp_finra_short_interest_frame
-                    WHERE symbol IS NOT NULL
-                      AND TRIM(symbol) <> ''
-                      AND settlement_date IS NOT NULL
-                    """
+        con.register("tmp_finra_short_interest_frame", frame)
+        try:
+            con.execute(
+                f"""
+                INSERT INTO {FINRA_SHORT_INTEREST_SOURCE_RAW} (
+                    symbol,
+                    settlement_date,
+                    short_interest,
+                    previous_short_interest,
+                    avg_daily_volume,
+                    shares_float,
+                    revision_flag,
+                    source_market,
+                    source_file,
+                    source_date,
+                    ingested_at
                 )
-                rows_written = int(len(frame))
-            finally:
-                try:
-                    con.unregister("tmp_finra_short_interest_frame")
-                except Exception:
-                    pass
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    CAST(settlement_date AS DATE) AS settlement_date,
+                    CAST(short_interest AS BIGINT) AS short_interest,
+                    CAST(previous_short_interest AS BIGINT) AS previous_short_interest,
+                    CAST(avg_daily_volume AS DOUBLE) AS avg_daily_volume,
+                    CAST(shares_float AS BIGINT) AS shares_float,
+                    CAST(revision_flag AS VARCHAR) AS revision_flag,
+                    CAST(source_market AS VARCHAR) AS source_market,
+                    CAST(source_file AS VARCHAR) AS source_file,
+                    CAST(source_date AS DATE) AS source_date,
+                    CAST(ingested_at AS TIMESTAMP) AS ingested_at
+                FROM tmp_finra_short_interest_frame
+                WHERE symbol IS NOT NULL
+                  AND TRIM(symbol) <> ''
+                  AND settlement_date IS NOT NULL
+                """
+            )
+            rows_written = int(len(frame))
+        finally:
+            try:
+                con.unregister("tmp_finra_short_interest_frame")
+            except Exception:
+                pass
 
-        rows_after = int(con.execute(f"SELECT COUNT(*) FROM {FINRA_SHORT_INTEREST_SOURCE_RAW}").fetchone()[0])
+        rows_after = int(
+            con.execute(f"SELECT COUNT(*) FROM {FINRA_SHORT_INTEREST_SOURCE_RAW}").fetchone()[0]
+        )
 
     if args.verbose:
         print(f"[load_finra_short_interest_source_raw] db_path={config.db_path}")
-        print(f"[load_finra_short_interest_source_raw] source_mode={'provider' if args.sources else 'fixture'}")
+        print("[load_finra_short_interest_source_raw] source_mode=real_sources_only")
+        print(f"[load_finra_short_interest_source_raw] source_count={len(args.sources)}")
         print(f"[load_finra_short_interest_source_raw] rows_before={rows_before}")
         print(f"[load_finra_short_interest_source_raw] rows_written={rows_written}")
         print(f"[load_finra_short_interest_source_raw] rows_after={rows_after}")

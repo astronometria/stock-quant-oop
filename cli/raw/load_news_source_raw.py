@@ -15,14 +15,16 @@ from stock_quant.infrastructure.providers.news.news_source_loader import NewsSou
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load news raw rows into DuckDB from fixtures or CSV sources.")
+    parser = argparse.ArgumentParser(
+        description="Load real news raw rows into DuckDB from provided sources. Prod-only: no fixture fallback."
+    )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument(
         "--source",
         action="append",
         dest="sources",
         default=[],
-        help="Optional CSV source path. Repeat this flag for multiple inputs.",
+        help="Source file path. Repeat this flag for multiple inputs.",
     )
     parser.add_argument("--start-date", default=None, help="Optional start date YYYY-MM-DD.")
     parser.add_argument("--end-date", default=None, help="Optional end date YYYY-MM-DD.")
@@ -38,70 +40,16 @@ def parse_date(value: str | None):
     return date.fromisoformat(value)
 
 
-def build_fixture_frame() -> pd.DataFrame:
-    now = datetime.utcnow()
-    rows = [
-        {
-            "raw_id": 1001,
-            "published_at": datetime(2026, 3, 14, 8, 30, 0),
-            "source_name": "finance.yahoo.com",
-            "title": "Apple launches new enterprise AI tooling for developers",
-            "article_url": "https://example.com/apple",
-            "domain": "finance.yahoo.com",
-            "raw_payload_json": '{"provider":"fixture","topic":"apple"}',
-            "ingested_at": now,
-        },
-        {
-            "raw_id": 1002,
-            "published_at": datetime(2026, 3, 14, 9, 0, 0),
-            "source_name": "reuters.com",
-            "title": "Microsoft expands cloud agreements with major banking clients",
-            "article_url": "https://example.com/msft",
-            "domain": "reuters.com",
-            "raw_payload_json": '{"provider":"fixture","topic":"microsoft"}',
-            "ingested_at": now,
-        },
-        {
-            "raw_id": 1003,
-            "published_at": datetime(2026, 3, 14, 9, 15, 0),
-            "source_name": "finance.yahoo.com",
-            "title": "Alibaba posts stronger commerce growth as BABA ADR rises",
-            "article_url": "https://example.com/baba",
-            "domain": "finance.yahoo.com",
-            "raw_payload_json": '{"provider":"fixture","topic":"alibaba"}',
-            "ingested_at": now,
-        },
-        {
-            "raw_id": 1004,
-            "published_at": datetime(2026, 3, 14, 9, 45, 0),
-            "source_name": "marketwatch.com",
-            "title": "ETF flows accelerate as broad market rally continues",
-            "article_url": "https://example.com/etf",
-            "domain": "marketwatch.com",
-            "raw_payload_json": '{"provider":"fixture","topic":"etf"}',
-            "ingested_at": now,
-        },
-    ]
-    return pd.DataFrame(rows)
-
-
-def load_source_frame(args: argparse.Namespace) -> pd.DataFrame:
-    loader = NewsSourceLoader(source_paths=args.sources)
-    frame = loader.fetch_news_frame(
-        start_date=parse_date(args.start_date),
-        end_date=parse_date(args.end_date),
-        limit=args.limit,
-    )
-    if frame.empty:
-        return frame
-
+def normalize_source_frame(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.copy()
     frame.columns = [str(col).strip() for col in frame.columns]
 
     if "raw_id" not in frame.columns:
-        frame["raw_id"] = range(1, len(frame) + 1)
+        raise SystemExit("load_news_source_raw requires a raw_id column in real-source mode.")
+
     if "ingested_at" not in frame.columns:
         frame["ingested_at"] = datetime.utcnow()
+
     if "raw_payload_json" not in frame.columns:
         frame["raw_payload_json"] = "{}"
 
@@ -122,12 +70,40 @@ def load_source_frame(args: argparse.Namespace) -> pd.DataFrame:
     return frame[required].reset_index(drop=True)
 
 
+def load_source_frame(args: argparse.Namespace) -> pd.DataFrame:
+    """
+    Real-source loader only.
+
+    Prod rule:
+    - no --source => hard failure
+    - provider empty => hard failure
+    """
+    if not args.sources:
+        raise SystemExit(
+            "load_news_source_raw requires at least one --source in prod mode."
+        )
+
+    loader = NewsSourceLoader(source_paths=args.sources)
+    frame = loader.fetch_news_frame(
+        start_date=parse_date(args.start_date),
+        end_date=parse_date(args.end_date),
+        limit=args.limit,
+    )
+
+    if frame is None or frame.empty:
+        raise SystemExit(
+            "load_news_source_raw received no rows from the provided news source files."
+        )
+
+    return normalize_source_frame(frame)
+
+
 def main() -> int:
     args = parse_args()
     config = build_app_config(db_path=args.db_path)
     config.ensure_directories()
 
-    frame = load_source_frame(args) if args.sources else build_fixture_frame()
+    frame = load_source_frame(args)
 
     session_factory = DuckDbSessionFactory(config.db_path)
     with DuckDbUnitOfWork(session_factory) as uow:
@@ -144,47 +120,47 @@ def main() -> int:
         rows_before = int(con.execute(f"SELECT COUNT(*) FROM {NEWS_SOURCE_RAW}").fetchone()[0])
 
         rows_written = 0
-        if not frame.empty:
-            con.register("tmp_news_source_raw_frame", frame)
-            try:
-                con.execute(
-                    f"""
-                    INSERT INTO {NEWS_SOURCE_RAW} (
-                        raw_id,
-                        published_at,
-                        source_name,
-                        title,
-                        article_url,
-                        domain,
-                        raw_payload_json,
-                        ingested_at
-                    )
-                    SELECT
-                        CAST(raw_id AS BIGINT) AS raw_id,
-                        CAST(published_at AS TIMESTAMP) AS published_at,
-                        CAST(source_name AS VARCHAR) AS source_name,
-                        CAST(title AS VARCHAR) AS title,
-                        CAST(article_url AS VARCHAR) AS article_url,
-                        CAST(domain AS VARCHAR) AS domain,
-                        CAST(raw_payload_json AS VARCHAR) AS raw_payload_json,
-                        CAST(ingested_at AS TIMESTAMP) AS ingested_at
-                    FROM tmp_news_source_raw_frame
-                    WHERE raw_id IS NOT NULL
-                      AND published_at IS NOT NULL
-                    """
+        con.register("tmp_news_source_raw_frame", frame)
+        try:
+            con.execute(
+                f"""
+                INSERT INTO {NEWS_SOURCE_RAW} (
+                    raw_id,
+                    published_at,
+                    source_name,
+                    title,
+                    article_url,
+                    domain,
+                    raw_payload_json,
+                    ingested_at
                 )
-                rows_written = int(len(frame))
-            finally:
-                try:
-                    con.unregister("tmp_news_source_raw_frame")
-                except Exception:
-                    pass
+                SELECT
+                    CAST(raw_id AS BIGINT) AS raw_id,
+                    CAST(published_at AS TIMESTAMP) AS published_at,
+                    CAST(source_name AS VARCHAR) AS source_name,
+                    CAST(title AS VARCHAR) AS title,
+                    CAST(article_url AS VARCHAR) AS article_url,
+                    CAST(domain AS VARCHAR) AS domain,
+                    CAST(raw_payload_json AS VARCHAR) AS raw_payload_json,
+                    CAST(ingested_at AS TIMESTAMP) AS ingested_at
+                FROM tmp_news_source_raw_frame
+                WHERE raw_id IS NOT NULL
+                  AND published_at IS NOT NULL
+                """
+            )
+            rows_written = int(len(frame))
+        finally:
+            try:
+                con.unregister("tmp_news_source_raw_frame")
+            except Exception:
+                pass
 
         rows_after = int(con.execute(f"SELECT COUNT(*) FROM {NEWS_SOURCE_RAW}").fetchone()[0])
 
     if args.verbose:
         print(f"[load_news_source_raw] db_path={config.db_path}")
-        print(f"[load_news_source_raw] source_mode={'csv' if args.sources else 'fixture'}")
+        print("[load_news_source_raw] source_mode=real_sources_only")
+        print(f"[load_news_source_raw] source_count={len(args.sources)}")
         print(f"[load_news_source_raw] rows_before={rows_before}")
         print(f"[load_news_source_raw] rows_written={rows_written}")
         print(f"[load_news_source_raw] rows_after={rows_after}")

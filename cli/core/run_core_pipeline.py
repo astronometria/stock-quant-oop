@@ -12,7 +12,7 @@ from stock_quant.app.orchestrators.core_pipeline_orchestrator import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the core stock-quant-oop pipeline in sequence."
+        description="Run the core stock-quant-oop pipeline in sequence using real source data only."
     )
     parser.add_argument(
         "--project-root",
@@ -35,6 +35,27 @@ def parse_args() -> argparse.Namespace:
         choices=["regular", "otc", "both"],
         help="Source market selection passed to supported steps.",
     )
+    parser.add_argument(
+        "--symbol-source",
+        action="append",
+        dest="symbol_sources",
+        default=[],
+        help="Real symbol reference raw source file. Repeat this flag for multiple inputs.",
+    )
+    parser.add_argument(
+        "--finra-source",
+        action="append",
+        dest="finra_sources",
+        default=[],
+        help="Real FINRA raw source path/file/dir/glob. Repeat this flag for multiple inputs.",
+    )
+    parser.add_argument(
+        "--news-source",
+        action="append",
+        dest="news_sources",
+        default=[],
+        help="Real news raw source file. Repeat this flag for multiple inputs.",
+    )
     parser.add_argument("--skip-symbol-load", action="store_true")
     parser.add_argument("--skip-universe", action="store_true")
     parser.add_argument("--skip-symbol-reference", action="store_true")
@@ -50,14 +71,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _append_if(args: list[str], flag: str, condition: bool) -> list[str]:
+def _append_if(args: list[str], flag: str, condition: bool) -> None:
     if condition:
         args.append(flag)
-    return args
+
+
+def _extend_repeatable(args: list[str], flag: str, values: list[str]) -> None:
+    for value in values:
+        args.extend([flag, value])
+
+
+def _validate_required_sources(args: argparse.Namespace) -> None:
+    """
+    Enforce prod-only behavior.
+
+    If a raw load step is enabled, the matching real source(s) must be provided.
+    """
+    if not args.skip_symbol_load and not args.symbol_sources:
+        raise SystemExit(
+            "run_core_pipeline requires at least one --symbol-source when symbol load is enabled."
+        )
+
+    if not args.skip_finra_load and not args.finra_sources:
+        raise SystemExit(
+            "run_core_pipeline requires at least one --finra-source when FINRA raw load is enabled."
+        )
+
+    if not args.skip_news_load and not args.news_sources:
+        raise SystemExit(
+            "run_core_pipeline requires at least one --news-source when news raw load is enabled."
+        )
 
 
 def main() -> int:
     args = parse_args()
+    _validate_required_sources(args)
+
     project_root = Path(args.project_root).expanduser().resolve()
 
     orchestrator = CorePipelineOrchestrator(
@@ -76,6 +125,7 @@ def main() -> int:
 
     if not args.skip_symbol_load:
         symbol_args: list[str] = []
+        _extend_repeatable(symbol_args, "--source", args.symbol_sources)
         _append_if(symbol_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
@@ -122,6 +172,7 @@ def main() -> int:
 
     if not args.skip_finra_load:
         finra_args: list[str] = []
+        _extend_repeatable(finra_args, "--source", args.finra_sources)
         _append_if(finra_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
@@ -142,6 +193,7 @@ def main() -> int:
 
     if not args.skip_news_load:
         news_args: list[str] = []
+        _extend_repeatable(news_args, "--source", args.news_sources)
         _append_if(news_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
