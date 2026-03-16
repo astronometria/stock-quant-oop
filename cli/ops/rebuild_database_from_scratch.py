@@ -14,7 +14,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Rebuild the DuckDB database from scratch using real raw symbol sources, "
-            "core SEC normalization, fundamentals construction, and prices."
+            "core SEC normalization, fundamentals construction, mandatory Stooq price backfill, "
+            "optional Yahoo daily refresh, and future extension points such as FINRA."
         )
     )
     parser.add_argument(
@@ -22,63 +23,38 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to DuckDB database file.",
     )
+
+    # ------------------------------------------------------------------
+    # Core rebuild switches
+    # ------------------------------------------------------------------
+    parser.add_argument("--skip-init", action="store_true", help="Skip schema initialization step.")
+    parser.add_argument("--skip-sec-fetch", action="store_true", help="Skip SEC company tickers raw download.")
+    parser.add_argument("--skip-nasdaq-fetch", action="store_true", help="Skip NASDAQ symbol directory raw download.")
+    parser.add_argument("--skip-raw-load", action="store_true", help="Skip loading symbol_reference_source_raw.")
+    parser.add_argument("--skip-market-universe", action="store_true", help="Skip build_market_universe.")
+    parser.add_argument("--skip-symbol-reference", action="store_true", help="Skip build_symbol_reference.")
+    parser.add_argument("--skip-sec-filings", action="store_true", help="Skip build_sec_filings.")
+    parser.add_argument("--skip-fundamentals", action="store_true", help="Skip build_fundamentals.")
+
+    # ------------------------------------------------------------------
+    # Price-specific switches
+    # ------------------------------------------------------------------
     parser.add_argument(
-        "--skip-init",
+        "--skip-price-backfill",
         action="store_true",
-        help="Skip schema initialization step.",
+        help="Skip mandatory historical Stooq-style price backfill step.",
     )
     parser.add_argument(
-        "--skip-sec-fetch",
+        "--skip-price-daily",
         action="store_true",
-        help="Skip SEC company tickers raw download.",
+        help="Skip Yahoo daily price refresh after historical backfill.",
     )
     parser.add_argument(
-        "--skip-nasdaq-fetch",
-        action="store_true",
-        help="Skip NASDAQ symbol directory raw download.",
-    )
-    parser.add_argument(
-        "--skip-raw-load",
-        action="store_true",
-        help="Skip loading symbol_reference_source_raw.",
-    )
-    parser.add_argument(
-        "--skip-market-universe",
-        action="store_true",
-        help="Skip build_market_universe.",
-    )
-    parser.add_argument(
-        "--skip-symbol-reference",
-        action="store_true",
-        help="Skip build_symbol_reference.",
-    )
-    parser.add_argument(
-        "--skip-sec-filings",
-        action="store_true",
-        help="Skip build_sec_filings.",
-    )
-    parser.add_argument(
-        "--skip-fundamentals",
-        action="store_true",
-        help="Skip build_fundamentals.",
-    )
-    parser.add_argument(
-        "--skip-prices",
-        action="store_true",
-        help="Skip build_prices.",
-    )
-    parser.add_argument(
-        "--price-mode",
-        default="daily",
-        choices=["daily", "backfill"],
-        help="Price build mode.",
-    )
-    parser.add_argument(
-        "--historical-price-source",
+        "--stooq-source",
         action="append",
-        dest="historical_price_sources",
+        dest="stooq_sources",
         default=[],
-        help="Historical price source path. Repeat for multiple inputs when --price-mode=backfill.",
+        help="Historical Stooq source path. Repeat for multiple inputs.",
     )
     parser.add_argument(
         "--price-symbol",
@@ -90,28 +66,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--price-start-date",
         default=None,
-        help="Optional start date for prices (YYYY-MM-DD).",
+        help="Optional start date for prices (YYYY-MM-DD). Applies to daily and can be used for explicit backfill windows.",
     )
     parser.add_argument(
         "--price-end-date",
         default=None,
-        help="Optional end date for prices (YYYY-MM-DD).",
+        help="Optional end date for prices (YYYY-MM-DD). Applies to daily and can be used for explicit backfill windows.",
     )
     parser.add_argument(
         "--price-as-of",
         default=None,
         help="Optional single date for daily price refresh (YYYY-MM-DD).",
     )
+
+    # ------------------------------------------------------------------
+    # Universe behavior
+    # ------------------------------------------------------------------
     parser.add_argument(
         "--allow-adr",
         action="store_true",
         help="Allow ADR in build_market_universe when supported by the CLI.",
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose child command output.",
-    )
+
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose child command output.")
     return parser.parse_args()
 
 
@@ -134,6 +111,23 @@ def _latest_file(directory: Path, pattern: str) -> Path | None:
     return matches[-1]
 
 
+def _extend_with_optional_price_filters(command: list[str], args: argparse.Namespace) -> list[str]:
+    for source in args.stooq_sources:
+        command.extend(["--historical-source", str(source)])
+
+    for symbol in args.price_symbols:
+        command.extend(["--symbol", str(symbol)])
+
+    if args.price_start_date:
+        command.extend(["--start-date", str(args.price_start_date)])
+    if args.price_end_date:
+        command.extend(["--end-date", str(args.price_end_date)])
+    if args.price_as_of:
+        command.extend(["--as-of", str(args.price_as_of)])
+
+    return command
+
+
 def main() -> int:
     args = parse_args()
 
@@ -151,6 +145,9 @@ def main() -> int:
     print(f"project_root={project_root}", flush=True)
     print(f"db_path={db_path}", flush=True)
 
+    # ------------------------------------------------------------------
+    # 1) Init DB schema
+    # ------------------------------------------------------------------
     if not args.skip_init:
         command = [
             python_bin,
@@ -160,6 +157,9 @@ def main() -> int:
         ]
         _run_step("INIT MARKET DB", command)
 
+    # ------------------------------------------------------------------
+    # 2) Fetch raw symbol sources to local disk
+    # ------------------------------------------------------------------
     if not args.skip_sec_fetch:
         command = [
             python_bin,
@@ -176,6 +176,9 @@ def main() -> int:
         ]
         _run_step("FETCH NASDAQ SYMBOL DIRECTORY RAW", command)
 
+    # ------------------------------------------------------------------
+    # 3) Resolve latest local raw symbol files
+    # ------------------------------------------------------------------
     sec_file = _latest_file(sec_dir, "sec_company_tickers_*.csv")
     nasdaqlisted_file = _latest_file(nasdaq_dir, "nasdaqlisted_*.csv")
     otherlisted_file = _latest_file(nasdaq_dir, "otherlisted_*.csv")
@@ -185,6 +188,9 @@ def main() -> int:
     print(f"nasdaqlisted_file={nasdaqlisted_file}", flush=True)
     print(f"otherlisted_file={otherlisted_file}", flush=True)
 
+    # ------------------------------------------------------------------
+    # 4) Load symbol_reference_source_raw from real local raw files
+    # ------------------------------------------------------------------
     if not args.skip_raw_load:
         missing_files: list[str] = []
         if sec_file is None:
@@ -216,6 +222,9 @@ def main() -> int:
         ]
         _run_step("LOAD SYMBOL_REFERENCE_SOURCE_RAW", command)
 
+    # ------------------------------------------------------------------
+    # 5) Build market_universe
+    # ------------------------------------------------------------------
     if not args.skip_market_universe:
         command = [
             python_bin,
@@ -225,9 +234,13 @@ def main() -> int:
             "--verbose",
         ]
         if not args.allow_adr:
+            # Current CLI remains conservative by default.
             pass
         _run_step("BUILD MARKET UNIVERSE", command)
 
+    # ------------------------------------------------------------------
+    # 6) Build symbol_reference
+    # ------------------------------------------------------------------
     if not args.skip_symbol_reference:
         command = [
             python_bin,
@@ -238,6 +251,9 @@ def main() -> int:
         ]
         _run_step("BUILD SYMBOL REFERENCE", command)
 
+    # ------------------------------------------------------------------
+    # 7) Build SEC filings
+    # ------------------------------------------------------------------
     if not args.skip_sec_filings:
         command = [
             python_bin,
@@ -248,6 +264,9 @@ def main() -> int:
         ]
         _run_step("BUILD SEC FILINGS", command)
 
+    # ------------------------------------------------------------------
+    # 8) Build fundamentals
+    # ------------------------------------------------------------------
     if not args.skip_fundamentals:
         command = [
             python_bin,
@@ -258,19 +277,44 @@ def main() -> int:
         ]
         _run_step("BUILD FUNDAMENTALS", command)
 
-    if not args.skip_prices:
+    # ------------------------------------------------------------------
+    # 9) Historical price backfill is part of the rebuild.
+    #
+    # This is essential for a real from-scratch rebuild because daily Yahoo
+    # refresh alone is not sufficient to reconstruct long history.
+    # ------------------------------------------------------------------
+    if not args.skip_price_backfill:
+        if not args.stooq_sources:
+            raise SystemExit(
+                "historical Stooq price sources are required for rebuild; "
+                "pass at least one --stooq-source or explicitly use --skip-price-backfill"
+            )
+
         command = [
             python_bin,
             str(project_root / "cli" / "core" / "build_prices.py"),
             "--db-path",
             str(db_path),
             "--mode",
-            args.price_mode,
+            "backfill",
             "--verbose",
         ]
+        command = _extend_with_optional_price_filters(command, args)
+        _run_step("BUILD PRICES BACKFILL", command)
 
-        for source in args.historical_price_sources:
-            command.extend(["--historical-source", str(source)])
+    # ------------------------------------------------------------------
+    # 10) Daily price refresh after historical backfill
+    # ------------------------------------------------------------------
+    if not args.skip_price_daily:
+        command = [
+            python_bin,
+            str(project_root / "cli" / "core" / "build_prices.py"),
+            "--db-path",
+            str(db_path),
+            "--mode",
+            "daily",
+            "--verbose",
+        ]
 
         for symbol in args.price_symbols:
             command.extend(["--symbol", str(symbol)])
@@ -282,7 +326,7 @@ def main() -> int:
         if args.price_as_of:
             command.extend(["--as-of", str(args.price_as_of)])
 
-        _run_step("BUILD PRICES", command)
+        _run_step("BUILD PRICES DAILY", command)
 
     print("===== REBUILD DATABASE COMPLETE =====", flush=True)
     print(f"db_path={db_path}", flush=True)

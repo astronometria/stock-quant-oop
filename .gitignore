@@ -8,18 +8,19 @@ __pycache__/
 venv/
 .venv/
 
-# data files
-data/
-*.duckdb
-
 # pytest
 .pytest_cache/
 
 # backup files
 *.bak
 
-# logs
+# large local data artifacts
+data/
+*.duckdb
+
+# logs:
+# ignore everything by default, but keep important rebuild/audit logs versionable
 logs/*
 !logs/.gitkeep
-!logs/*audit*
 !logs/*rebuild*
+!logs/*audit*
