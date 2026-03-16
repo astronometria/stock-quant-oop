@@ -407,7 +407,7 @@ class BuildDatasetBuilderPipeline(BasePipeline):
             {
                 "filter_source": "universe_membership_history",
                 "survivor_bias_aware": True,
-                "dataset_builder_pipeline": self.pipeline_name,
+                "dataset_pipeline": self.pipeline_name,
                 "dataset_name": self.dataset_name,
                 "dataset_version": self.dataset_version,
             },

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # =============================================================================
-# sec_pipeline.py
+# build_sec_filings_pipeline.py
 # -----------------------------------------------------------------------------
 # Pipeline de construction de la table sec_filing à partir de sec_filing_raw_index.
 #
