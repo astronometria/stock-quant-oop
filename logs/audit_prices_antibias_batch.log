@@ -1,3 +1,13 @@
+===== DATE =====
+Mon 16 Mar 2026 07:08:30 PM EDT
+===== COMPILE TARGET =====
+
+===== IMPORT CHECK =====
+pipeline OK: <class 'stock_quant.pipelines.build_prices_pipeline.BuildPricesPipeline'>
+cli build_prices OK: <function main at 0x789979f395a0>
+cli run_price_daily_refresh OK: <function main at 0x789979f39870>
+
+===== DOC CHECK =====
 # Price Pipeline
 
 ## Objectif
@@ -87,3 +97,4 @@ price_source_daily_raw_all
 price_history
 ↓
 price_latest
+===== DONE =====

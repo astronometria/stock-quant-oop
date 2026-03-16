@@ -35,9 +35,12 @@ class LegacyBuildPricesResult:
     """
     Résultat du chemin SQL-first historique.
 
-    Ce chemin reste utile quand des prix raw sont déjà chargés dans DuckDB
-    et qu'on veut reconstruire `price_history` / `price_latest` à partir
-    de la staging existante.
+    Ce chemin est toléré pour compatibilité opérationnelle lorsque la staging raw
+    existe déjà dans DuckDB.
+
+    Règle importante :
+    - la sortie normalized canonique reste `price_history`
+    - `price_latest` est une table de serving only
     """
     raw_bars: int
     allowed_symbols: int
@@ -49,7 +52,10 @@ class LegacyBuildPricesResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build price_history and price_latest from staged raw prices or incremental providers."
+        description=(
+            "Build price_history and price_latest from staged raw prices or incremental providers. "
+            "Normalized canonical table is price_history; price_latest is serving only."
+        )
     )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument(
@@ -147,15 +153,15 @@ def _run_legacy_sql_first_build(
     requested_symbols: list[str],
 ) -> LegacyBuildPricesResult:
     """
-    Chemin SQL-first historique :
-    - lit `price_source_daily_raw` déjà chargé
-    - filtre avec les symboles inclus
-    - normalise via PriceIngestionService.build(...)
-    - persiste dans `price_history` / `price_latest`
+    Chemin SQL-first historique.
 
-    Ce chemin reste utile pour :
-    - bootstrap depuis une staging raw locale
-    - reconstruction idempotente depuis des fichiers déjà chargés
+    Usage :
+    - bootstrap depuis une staging raw locale déjà peuplée
+    - reconstruction idempotente depuis raw existant
+
+    Règle anti-biais :
+    - la sortie normalized reste `price_history`
+    - `price_latest` ne doit pas être lu par les pipelines de recherche
     """
     raw_bars = repository.load_raw_price_bars()
     if not raw_bars:
@@ -199,7 +205,9 @@ def _run_incremental_build(
     - backfill via HistoricalPriceProvider
     - daily via YfinancePriceProvider
 
-    Ce chemin est le chemin produit cible pour un pipeline prix OOP homogène.
+    Contrat :
+    - Stooq/local history = rebuild / bootstrap
+    - Yahoo daily = refresh
     """
     if mode == "backfill":
         if not historical_source:
@@ -236,6 +244,8 @@ def main() -> int:
         print(f"[build_prices] mode={args.mode}")
         print(f"[build_prices] historical_source_count={len(args.historical_source)}")
         print(f"[build_prices] symbols_count={len(args.symbols)}")
+        print("[build_prices] normalized_table=price_history")
+        print("[build_prices] derived_table=price_latest (serving only)")
 
     start_date = args.start_date
     end_date = args.end_date
@@ -249,7 +259,7 @@ def main() -> int:
     session_factory = DuckDbSessionFactory(config.db_path)
 
     # ------------------------------------------------------------------
-    # Pass 1: évolution / validation du schéma de base
+    # Pass 1: validation / évolution du schéma de base
     # ------------------------------------------------------------------
     with DuckDbUnitOfWork(session_factory) as uow:
         MasterDataSchemaManager(uow).initialize()
@@ -281,6 +291,8 @@ def main() -> int:
                 "status": "SUCCESS",
                 "mode": args.mode,
                 "path": "sql_first_staging",
+                "normalized_table": "price_history",
+                "derived_table": "price_latest",
                 **asdict(result),
             }
         else:
@@ -296,6 +308,8 @@ def main() -> int:
                 "status": "SUCCESS",
                 "mode": args.mode,
                 "path": "incremental_provider",
+                "normalized_table": "price_history",
+                "derived_table": "price_latest",
                 "requested_symbols": result.requested_symbols,
                 "fetched_symbols": result.fetched_symbols,
                 "written_price_history_rows": result.written_price_history_rows,

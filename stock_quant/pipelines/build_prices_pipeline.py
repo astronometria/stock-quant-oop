@@ -13,35 +13,36 @@ from stock_quant.shared.exceptions import PipelineError
 @dataclass(slots=True)
 class BuildPricesPipelineResult:
     """
-    Résultat canonique du pipeline prix incrémental.
+    Résultat canonique du pipeline prix.
 
-    Notes
-    -----
-    - on garde une structure simple et stable pour l'orchestrateur daily
-    - le pipeline reste mince et délègue la logique métier au service
+    Contrat métier
+    --------------
+    - `price_history` = normalized canonique
+    - `price_latest` = serving only
+    - le pipeline ne doit jamais promouvoir `price_latest` comme source de recherche
     """
     requested_symbols: int
     fetched_symbols: int
     written_price_history_rows: int
     price_latest_rows_after_refresh: int
+    start_date: str | None = None
+    end_date: str | None = None
 
 
 class BuildPricesPipeline:
     """
-    Pipeline canonique des prix.
+    Pipeline canonique du domaine prix.
 
     Responsabilités
     ----------------
     - déléguer l'ingestion incrémentale à PriceIngestionService
-    - exposer un contrat pipeline stable
-    - rester compatible avec le refresh daily et le backfill provider-based
+    - exposer un contrat stable au CLI / orchestrateur
+    - garder un design homogène avec le reste du codebase
 
-    Propriétés recherchées
-    ----------------------
-    - OOP homogène avec les autres domaines
-    - incrémental
-    - universe-aware via le repository utilisé par le service
-    - idempotent côté upsert repository
+    Notes anti-biais
+    ----------------
+    - `price_history` est la seule table normalized canonique
+    - `price_latest` ne doit jamais servir aux backtests / features
     """
 
     pipeline_name = "build_prices"
@@ -76,14 +77,13 @@ class BuildPricesPipeline:
             fetched_symbols=result.fetched_symbols,
             written_price_history_rows=result.written_price_history_rows,
             price_latest_rows_after_refresh=result.price_latest_rows_after_refresh,
+            start_date=result.start_date,
+            end_date=result.end_date,
         )
 
 
 # ----------------------------------------------------------------------
-# Alias de compatibilité interne
-#
-# Permet une migration progressive du repo vers le nom canonique
-# sans casser trop de code local pendant la transition.
+# Aliases de compatibilité
 # ----------------------------------------------------------------------
 PricesPipelineResult = BuildPricesPipelineResult
 PricesPipeline = BuildPricesPipeline
