@@ -35,7 +35,7 @@ def test_symbol_reference_repository_roundtrip(tmp_path: Path) -> None:
         SchemaManager(uow).initialize(drop_existing=True)
         seed_market_universe(uow)
 
-        repo = DuckDbSymbolReferenceRepository(uow)
+        repo = DuckDbSymbolReferenceRepository(uow.connection)
 
         included = repo.load_included_universe_entries()
         assert len(included) == 1

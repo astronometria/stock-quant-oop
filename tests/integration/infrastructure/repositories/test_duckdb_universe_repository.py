@@ -17,7 +17,7 @@ def test_universe_repository_roundtrip(tmp_path: Path) -> None:
 
     with DuckDbUnitOfWork(session_factory) as uow:
         SchemaManager(uow).initialize(drop_existing=True)
-        repo = DuckDbUniverseRepository(uow)
+        repo = DuckDbUniverseRepository(uow.connection)
 
         entries = [
             UniverseEntry(
@@ -104,7 +104,7 @@ def test_universe_repository_load_raw_candidates(tmp_path: Path) -> None:
             ],
         )
 
-        repo = DuckDbUniverseRepository(uow)
+        repo = DuckDbUniverseRepository(uow.connection)
         rows = repo.load_raw_candidates()
 
         assert len(rows) == 2
