@@ -8,23 +8,31 @@ from __future__ import annotations
 #   - sec_filing_raw_index
 #   - sec_xbrl_fact_raw
 #
-# Philosophie:
-# - parsing JSON en Python mince
-# - écriture batch SQL vers DuckDB
-# - idempotence contrôlée par option truncate_before_load
-# - progression tqdm visible sur les fichiers
+# Correctif important de cette version:
+# - companyfacts n'utilise plus executemany() ligne par ligne
+# - les faits sont désormais écrits en CSV temporaire par gros chunks
+# - DuckDB charge ensuite ces chunks en bulk
 #
-# Important:
-# - on ne fait PAS ici la normalisation métier finale
-# - on ne construit PAS ici sec_filing / sec_fact_normalized
-# - cette couche ne fait que peupler le raw layer
+# Pourquoi:
+# - le profiling a montré que lecture disque + json.loads + itération Python
+#   sont très rapides
+# - le vrai goulot est l'insertion DuckDB via executemany()
+# - COPY / read_csv_auto est beaucoup plus adapté à un volume massif
+#
+# Philosophie:
+# - parsing Python mince
+# - staging disque temporaire
+# - bulk load SQL-first vers DuckDB
+# - progression tqdm visible
 # =============================================================================
 
+import csv
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from duckdb import DuckDBPyConnection
 from tqdm import tqdm
@@ -53,12 +61,22 @@ class SecBulkDiskLoader:
         con: DuckDBPyConnection,
         data_root: str | Path,
         insert_batch_size: int = 5000,
+        companyfacts_csv_chunk_rows: int = 250_000,
     ) -> None:
         self._con = con
         self._data_root = Path(data_root).expanduser()
         self._submissions_root = self._data_root / "sec" / "bulk" / "submissions"
         self._companyfacts_root = self._data_root / "sec" / "bulk" / "companyfacts"
         self._insert_batch_size = int(insert_batch_size)
+
+        # ---------------------------------------------------------------------
+        # Taille de chunk CSV pour companyfacts.
+        #
+        # Idée:
+        # - assez gros pour amortir le coût SQL
+        # - pas trop gros pour éviter un staging monstrueux en RAM
+        # ---------------------------------------------------------------------
+        self._companyfacts_csv_chunk_rows = int(companyfacts_csv_chunk_rows)
 
     # =========================================================================
     # API publique
@@ -129,8 +147,7 @@ class SecBulkDiskLoader:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
-                # On ignore les fichiers illisibles pour ne pas stopper un bulk
-                # de centaines de milliers de fichiers.
+                # On ignore les fichiers illisibles pour ne pas stopper un bulk.
                 continue
 
             cik = self._normalize_cik(payload.get("cik"))
@@ -158,7 +175,11 @@ class SecBulkDiskLoader:
                     continue
 
                 primary_document = self._value_at(primary_documents, idx)
-                filing_url = self._build_filing_url(cik=cik, accession_number=accession_number, primary_document=primary_document)
+                filing_url = self._build_filing_url(
+                    cik=cik,
+                    accession_number=accession_number,
+                    primary_document=primary_document,
+                )
 
                 batch.append(
                     (
@@ -211,13 +232,19 @@ class SecBulkDiskLoader:
     # Companyfacts -> sec_xbrl_fact_raw
     # =========================================================================
     def _load_companyfacts(self, *, limit_ciks: int | None) -> tuple[int, int]:
+        """
+        Charge les companyfacts avec une stratégie bulk:
+        - parsing JSON
+        - écriture CSV temporaire par chunk
+        - INSERT ... SELECT depuis read_csv_auto(...)
+        """
         files = sorted(self._companyfacts_root.rglob("CIK*.json"))
         if limit_ciks is not None:
             files = files[: int(limit_ciks)]
 
-        batch: list[tuple[Any, ...]] = []
         files_seen = 0
         rows_written = 0
+        chunk_rows_buffer: list[tuple[Any, ...]] = []
         ingested_at = datetime.utcnow()
 
         for path in tqdm(
@@ -241,82 +268,162 @@ class SecBulkDiskLoader:
             # Structure companyfacts:
             # facts -> taxonomy -> concept -> units -> unit_name -> [facts...]
             # -----------------------------------------------------------------
-            for taxonomy, taxonomy_payload in facts_root.items():
-                if not isinstance(taxonomy_payload, dict):
-                    continue
-
-                for concept, concept_payload in taxonomy_payload.items():
-                    if not isinstance(concept_payload, dict):
+            if isinstance(facts_root, dict):
+                for taxonomy, taxonomy_payload in facts_root.items():
+                    if not isinstance(taxonomy_payload, dict):
                         continue
 
-                    units_payload = concept_payload.get("units") or {}
-                    if not isinstance(units_payload, dict):
-                        continue
-
-                    for unit_name, fact_items in units_payload.items():
-                        if not isinstance(fact_items, list):
+                    for concept, concept_payload in taxonomy_payload.items():
+                        if not isinstance(concept_payload, dict):
                             continue
 
-                        for fact_item in fact_items:
-                            if not isinstance(fact_item, dict):
+                        units_payload = concept_payload.get("units") or {}
+                        if not isinstance(units_payload, dict):
+                            continue
+
+                        for unit_name, fact_items in units_payload.items():
+                            if not isinstance(fact_items, list):
                                 continue
 
-                            value_text, value_numeric = self._split_text_and_numeric_value(fact_item.get("val"))
+                            for fact_item in fact_items:
+                                if not isinstance(fact_item, dict):
+                                    continue
 
-                            batch.append(
-                                (
-                                    self._clean_str(fact_item.get("accn")),
-                                    cik,
-                                    self._clean_str(taxonomy),
-                                    self._clean_str(concept),
-                                    self._clean_str(unit_name),
-                                    self._parse_date(fact_item.get("end")),
-                                    self._parse_date(fact_item.get("start")),
-                                    self._parse_int(fact_item.get("fy")),
-                                    self._clean_str(fact_item.get("fp")),
-                                    self._clean_str(fact_item.get("frame")),
-                                    value_text,
-                                    value_numeric,
-                                    "sec_bulk_companyfacts",
-                                    str(path),
-                                    ingested_at,
+                                value_text, value_numeric = self._split_text_and_numeric_value(
+                                    fact_item.get("val")
                                 )
-                            )
 
-                            if len(batch) >= self._insert_batch_size:
-                                rows_written += self._flush_companyfacts_batch(batch)
-                                batch = []
+                                chunk_rows_buffer.append(
+                                    (
+                                        self._clean_str(fact_item.get("accn")),
+                                        cik,
+                                        self._clean_str(taxonomy),
+                                        self._clean_str(concept),
+                                        self._clean_str(unit_name),
+                                        self._parse_date(fact_item.get("end")),
+                                        self._parse_date(fact_item.get("start")),
+                                        self._parse_int(fact_item.get("fy")),
+                                        self._clean_str(fact_item.get("fp")),
+                                        self._clean_str(fact_item.get("frame")),
+                                        value_text,
+                                        value_numeric,
+                                        "sec_bulk_companyfacts",
+                                        str(path),
+                                        ingested_at,
+                                    )
+                                )
 
-        if batch:
-            rows_written += self._flush_companyfacts_batch(batch)
+                                if len(chunk_rows_buffer) >= self._companyfacts_csv_chunk_rows:
+                                    rows_written += self._flush_companyfacts_csv_chunk(chunk_rows_buffer)
+                                    chunk_rows_buffer = []
+
+        if chunk_rows_buffer:
+            rows_written += self._flush_companyfacts_csv_chunk(chunk_rows_buffer)
 
         return files_seen, rows_written
 
-    def _flush_companyfacts_batch(self, batch: list[tuple[Any, ...]]) -> int:
-        self._con.executemany(
-            """
-            INSERT INTO sec_xbrl_fact_raw (
-                accession_number,
-                cik,
-                taxonomy,
-                concept,
-                unit,
-                period_end_date,
-                period_start_date,
-                fiscal_year,
-                fiscal_period,
-                frame,
-                value_text,
-                value_numeric,
-                source_name,
-                source_file,
-                ingested_at
+    def _flush_companyfacts_csv_chunk(self, rows: list[tuple[Any, ...]]) -> int:
+        """
+        Écrit un gros chunk en CSV temporaire puis le charge en masse avec DuckDB.
+
+        C'est ici que se trouve le gain de performance principal:
+        - moins d'aller-retours Python -> DuckDB
+        - DuckDB lit un flux tabulaire massif optimisé
+        """
+        if not rows:
+            return 0
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            suffix=".csv",
+            delete=True,
+        ) as tmp:
+            writer = csv.writer(tmp)
+
+            # Header explicite pour permettre un read_csv_auto bien stable.
+            writer.writerow(
+                [
+                    "accession_number",
+                    "cik",
+                    "taxonomy",
+                    "concept",
+                    "unit",
+                    "period_end_date",
+                    "period_start_date",
+                    "fiscal_year",
+                    "fiscal_period",
+                    "frame",
+                    "value_text",
+                    "value_numeric",
+                    "source_name",
+                    "source_file",
+                    "ingested_at",
+                ]
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            batch,
-        )
-        return len(batch)
+
+            for row in rows:
+                writer.writerow(row)
+
+            tmp.flush()
+
+            # -----------------------------------------------------------------
+            # Chargement bulk via DuckDB.
+            #
+            # all_varchar=False:
+            # - laisse DuckDB typer les colonnes simples
+            # - compatible avec notre projection explicite ci-dessous
+            #
+            # On fait un INSERT ... SELECT pour contrôler exactement l'ordre
+            # et éviter toute surprise si la table évolue.
+            # -----------------------------------------------------------------
+            self._con.execute(
+                """
+                INSERT INTO sec_xbrl_fact_raw (
+                    accession_number,
+                    cik,
+                    taxonomy,
+                    concept,
+                    unit,
+                    period_end_date,
+                    period_start_date,
+                    fiscal_year,
+                    fiscal_period,
+                    frame,
+                    value_text,
+                    value_numeric,
+                    source_name,
+                    source_file,
+                    ingested_at
+                )
+                SELECT
+                    accession_number,
+                    cik,
+                    taxonomy,
+                    concept,
+                    unit,
+                    CAST(period_end_date AS DATE),
+                    CAST(period_start_date AS DATE),
+                    CAST(fiscal_year AS INTEGER),
+                    fiscal_period,
+                    frame,
+                    value_text,
+                    CAST(value_numeric AS DOUBLE),
+                    source_name,
+                    source_file,
+                    CAST(ingested_at AS TIMESTAMP)
+                FROM read_csv_auto(
+                    ?,
+                    header = TRUE,
+                    all_varchar = TRUE,
+                    ignore_errors = FALSE
+                )
+                """,
+                [tmp.name],
+            )
+
+        return len(rows)
 
     # =========================================================================
     # Helpers
