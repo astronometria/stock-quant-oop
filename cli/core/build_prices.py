@@ -9,21 +9,36 @@ from typing import Iterable
 
 import pandas as pd
 
-from stock_quant.app.orchestrators.price_daily_refresh_orchestrator import PriceDailyRefreshOrchestrator
+from stock_quant.app.orchestrators.price_daily_refresh_orchestrator import (
+    PriceDailyRefreshOrchestrator,
+)
 from stock_quant.app.services.price_ingestion_service import PriceIngestionService
 from stock_quant.infrastructure.config.settings_loader import build_app_config
 from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
 from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.providers.prices.historical_price_provider import HistoricalPriceProvider
-from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
-from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
-from stock_quant.pipelines.prices_pipeline import PricesPipeline
+from stock_quant.infrastructure.providers.prices.historical_price_provider import (
+    HistoricalPriceProvider,
+)
+from stock_quant.infrastructure.providers.prices.yfinance_price_provider import (
+    YfinancePriceProvider,
+)
+from stock_quant.infrastructure.repositories.duckdb_price_repository import (
+    DuckDbPriceRepository,
+)
+from stock_quant.pipelines.build_prices_pipeline import BuildPricesPipeline
 from stock_quant.shared.exceptions import PipelineError, ServiceError
 
 
 @dataclass(slots=True)
 class LegacyBuildPricesResult:
+    """
+    Résultat du chemin SQL-first historique.
+
+    Ce chemin reste utile quand des prix raw sont déjà chargés dans DuckDB
+    et qu'on veut reconstruire `price_history` / `price_latest` à partir
+    de la staging existante.
+    """
     raw_bars: int
     allowed_symbols: int
     written_price_history_rows: int
@@ -37,7 +52,12 @@ def parse_args() -> argparse.Namespace:
         description="Build price_history and price_latest from staged raw prices or incremental providers."
     )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
-    parser.add_argument("--mode", default="daily", choices=["daily", "backfill"], help="Price build mode.")
+    parser.add_argument(
+        "--mode",
+        default="daily",
+        choices=["daily", "backfill"],
+        help="Price build mode.",
+    )
     parser.add_argument(
         "--historical-source",
         action="append",
@@ -53,7 +73,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default=None, help="Optional start date (YYYY-MM-DD).")
     parser.add_argument("--end-date", default=None, help="Optional end date (YYYY-MM-DD).")
-    parser.add_argument("--as-of", default=None, help="Optional single target date (YYYY-MM-DD) for daily mode.")
+    parser.add_argument(
+        "--as-of",
+        default=None,
+        help="Optional single target date (YYYY-MM-DD) for daily mode.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     return parser.parse_args()
 
@@ -65,19 +89,36 @@ def _parse_iso_date(value: str | None) -> date | None:
 
 
 def _normalize_symbols(values: Iterable[str] | None) -> list[str]:
-    return sorted({str(v).strip().upper() for v in (values or []) if v is not None and str(v).strip()})
+    return sorted(
+        {
+            str(v).strip().upper()
+            for v in (values or [])
+            if v is not None and str(v).strip()
+        }
+    )
 
 
 class ProviderFrameAdapter:
     """
-    Adapte les providers orientés DataFrame au contrat attendu par PriceIngestionService.
+    Adapte les providers orientés DataFrame au contrat attendu
+    par PriceIngestionService.
+
+    Modes
+    -----
+    - daily    -> provider daily (Yahoo)
+    - backfill -> provider historique (Stooq/local files)
     """
 
     def __init__(self, provider, mode: str) -> None:
         self._provider = provider
         self._mode = mode
 
-    def fetch_prices(self, symbols: list[str], start_date: str | None, end_date: str | None) -> pd.DataFrame:
+    def fetch_prices(
+        self,
+        symbols: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
         if self._mode == "daily":
             as_of = _parse_iso_date(end_date or start_date)
             frame_method = getattr(self._provider, "fetch_daily_prices_frame", None)
@@ -106,11 +147,15 @@ def _run_legacy_sql_first_build(
     requested_symbols: list[str],
 ) -> LegacyBuildPricesResult:
     """
-    Chemin SQL-first historique:
-    - lit price_source_daily_raw déjà chargé
+    Chemin SQL-first historique :
+    - lit `price_source_daily_raw` déjà chargé
     - filtre avec les symboles inclus
     - normalise via PriceIngestionService.build(...)
-    - persiste dans price_history / price_latest
+    - persiste dans `price_history` / `price_latest`
+
+    Ce chemin reste utile pour :
+    - bootstrap depuis une staging raw locale
+    - reconstruction idempotente depuis des fichiers déjà chargés
     """
     raw_bars = repository.load_raw_price_bars()
     if not raw_bars:
@@ -118,7 +163,8 @@ def _run_legacy_sql_first_build(
 
     allowed_symbols = repository.load_included_symbols()
     if requested_symbols:
-        allowed_symbols = {symbol for symbol in allowed_symbols if symbol in set(requested_symbols)}
+        requested_set = set(requested_symbols)
+        allowed_symbols = {symbol for symbol in allowed_symbols if symbol in requested_set}
 
     service = PriceIngestionService()
     normalized_entries, metrics = service.build(
@@ -149,9 +195,11 @@ def _run_incremental_build(
     end_date: str | None,
 ):
     """
-    Chemin incrémental moderne:
+    Chemin incrémental moderne :
     - backfill via HistoricalPriceProvider
     - daily via YfinancePriceProvider
+
+    Ce chemin est le chemin produit cible pour un pipeline prix OOP homogène.
     """
     if mode == "backfill":
         if not historical_source:
@@ -166,7 +214,7 @@ def _run_incremental_build(
         price_repository=repository,
         historical_price_provider=adapter,
     )
-    pipeline = PricesPipeline(price_ingestion_service=service)
+    pipeline = BuildPricesPipeline(price_ingestion_service=service)
     orchestrator = PriceDailyRefreshOrchestrator(prices_pipeline=pipeline)
 
     return orchestrator.run_daily_refresh(
@@ -178,6 +226,7 @@ def _run_incremental_build(
 
 def main() -> int:
     args = parse_args()
+
     config = build_app_config(db_path=args.db_path)
     config.ensure_directories()
 
@@ -190,19 +239,28 @@ def main() -> int:
 
     start_date = args.start_date
     end_date = args.end_date
+
     if args.mode == "daily" and args.as_of:
         start_date = args.as_of
         end_date = args.as_of
 
     requested_symbols = _normalize_symbols(args.symbols)
+
     session_factory = DuckDbSessionFactory(config.db_path)
 
-    # Pass 1: évolution / validation de schéma
+    # ------------------------------------------------------------------
+    # Pass 1: évolution / validation du schéma de base
+    # ------------------------------------------------------------------
     with DuckDbUnitOfWork(session_factory) as uow:
         MasterDataSchemaManager(uow).initialize()
 
+    # ------------------------------------------------------------------
     # Pass 2: build réel
+    # ------------------------------------------------------------------
     with DuckDbUnitOfWork(session_factory) as uow:
+        if uow.connection is None:
+            raise PipelineError("missing active DB connection")
+
         repository = DuckDbPriceRepository(uow.connection)
 
         staged_raw_rows = _count_staged_raw_rows(repository)
@@ -210,7 +268,9 @@ def main() -> int:
 
         if args.verbose:
             print(f"[build_prices] staged_raw_rows={staged_raw_rows}")
-            print(f"[build_prices] path={'sql_first_staging' if use_sql_first_staging else 'incremental_provider'}")
+            print(
+                f"[build_prices] path={'sql_first_staging' if use_sql_first_staging else 'incremental_provider'}"
+            )
 
         if use_sql_first_staging:
             result = _run_legacy_sql_first_build(
@@ -244,8 +304,8 @@ def main() -> int:
                 "end_date": result.end_date,
             }
 
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return 0
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
