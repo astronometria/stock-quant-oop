@@ -17,13 +17,13 @@ class MasterDataService:
         con = self.con
 
         price_symbol_count = int(
-            con.execute("SELECT COUNT(DISTINCT symbol) FROM price_history").fetchone()[0]
+            con.repository_execute("SELECT COUNT(DISTINCT symbol) FROM price_history").fetchone()[0]
         )
 
-        con.execute("DROP TABLE IF EXISTS tmp_old_instrument_master")
-        con.execute("DROP TABLE IF EXISTS tmp_old_ticker_history")
+        con.repository_execute("DROP TABLE IF EXISTS tmp_old_instrument_master")
+        con.repository_execute("DROP TABLE IF EXISTS tmp_old_ticker_history")
 
-        con.execute(
+        con.repository_execute(
             """
             CREATE TEMP TABLE tmp_old_instrument_master AS
             SELECT *
@@ -31,7 +31,7 @@ class MasterDataService:
             """
         )
 
-        con.execute(
+        con.repository_execute(
             """
             CREATE TEMP TABLE tmp_old_ticker_history AS
             SELECT *
@@ -39,11 +39,11 @@ class MasterDataService:
             """
         )
 
-        con.execute("DELETE FROM instrument_identifier_map")
-        con.execute("DELETE FROM ticker_history")
-        con.execute("DELETE FROM instrument_master")
+        con.repository_execute("DELETE FROM instrument_identifier_map")
+        con.repository_execute("DELETE FROM ticker_history")
+        con.repository_execute("DELETE FROM instrument_master")
 
-        con.execute(
+        con.repository_execute(
             """
             INSERT INTO instrument_master (
                 instrument_id,
@@ -88,7 +88,7 @@ class MasterDataService:
             """
         )
 
-        con.execute(
+        con.repository_execute(
             """
             INSERT INTO ticker_history (
                 instrument_id,
@@ -122,7 +122,7 @@ class MasterDataService:
             """
         )
 
-        con.execute(
+        con.repository_execute(
             """
             INSERT INTO instrument_identifier_map (
                 instrument_id,
@@ -142,13 +142,13 @@ class MasterDataService:
         )
 
         instrument_master_rows = int(
-            con.execute("SELECT COUNT(*) FROM instrument_master").fetchone()[0]
+            con.repository_execute("SELECT COUNT(*) FROM instrument_master").fetchone()[0]
         )
         ticker_history_rows = int(
-            con.execute("SELECT COUNT(*) FROM ticker_history").fetchone()[0]
+            con.repository_execute("SELECT COUNT(*) FROM ticker_history").fetchone()[0]
         )
         identifier_map_rows = int(
-            con.execute("SELECT COUNT(*) FROM instrument_identifier_map").fetchone()[0]
+            con.repository_execute("SELECT COUNT(*) FROM instrument_identifier_map").fetchone()[0]
         )
 
         return {

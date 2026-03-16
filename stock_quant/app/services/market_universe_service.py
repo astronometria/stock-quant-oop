@@ -1,19 +1,45 @@
 from __future__ import annotations
 
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+from stock_quant.shared.exceptions import RepositoryError
 
 
-class ResearchUniverseService:
+class MarketUniverseService:
+    """
+    Service SQL-first pour construire le snapshot courant de l'univers de recherche
+    de façon conservatrice à partir des tables raw et master data déjà présentes.
+
+    Notes d'architecture
+    --------------------
+    - On garde volontairement le SQL direct ici pour la rapidité d'itération.
+    - Ce service manipule directement `uow.connection`.
+    - Le but principal est de fournir un état cohérent et traçable de
+      `research_universe` ainsi qu'un historique dans `universe_membership_history`.
+    - On conserve une compatibilité avec l'ancien nom logique
+      `ResearchUniverseService` à la fin du fichier.
+    """
+
     def __init__(self, uow: DuckDbUnitOfWork) -> None:
         self.uow = uow
 
     @property
     def con(self):
+        """
+        Retourne la connexion active DuckDB portée par le UnitOfWork.
+        """
         if self.uow.connection is None:
-            raise RuntimeError("active DB connection is required")
+            raise RepositoryError("active DB connection is required")
         return self.uow.connection
 
     def _resolve_snapshot_date(self) -> object:
+        """
+        Résout la date snapshot de référence pour l'univers de recherche.
+
+        Stratégie :
+        - on se base sur la dernière date disponible dans `price_source_daily_raw_all`
+          pour les actions US régulières (`STOCK` sur NASDAQ/NYSE/NYSEMKT)
+        - cela donne une date cohérente avec la fraîcheur de la matière première prix
+        """
         row = self.con.execute(
             """
             SELECT MAX(price_date)
@@ -22,12 +48,27 @@ class ResearchUniverseService:
               AND venue_group IN ('NASDAQ', 'NYSE', 'NYSEMKT')
             """
         ).fetchone()
+
         snapshot_date = row[0] if row else None
         if snapshot_date is None:
-            raise RuntimeError("unable to resolve research universe snapshot date from price_source_daily_raw_all")
+            raise RuntimeError(
+                "unable to resolve research universe snapshot date from "
+                "price_source_daily_raw_all"
+            )
         return snapshot_date
 
     def _build_current_snapshot(self) -> dict[str, int]:
+        """
+        Reconstruit complètement le snapshot courant `research_universe`.
+
+        Politique conservatrice :
+        - base : actions `STOCK` de `price_source_daily_raw_all`
+        - exclusion auto des ADR
+        - exclusion auto des suffixes dérivés R/U/W
+        - application des overrides manuels les plus récents
+
+        Retourne des métriques utiles au pipeline.
+        """
         con = self.con
 
         con.execute("DELETE FROM research_universe")
@@ -38,6 +79,12 @@ class ResearchUniverseService:
         con.execute("DROP TABLE IF EXISTS tmp_manual_overrides")
         con.execute("DROP TABLE IF EXISTS tmp_research_universe_base")
 
+        # ------------------------------------------------------------------
+        # Base actions régulières :
+        # on part des symboles réellement présents dans la source prix brute
+        # en gardant un seul enregistrement par symbole avec une priorité
+        # venue_group simple et explicite.
+        # ------------------------------------------------------------------
         con.execute(
             """
             CREATE TEMP TABLE tmp_stock_base AS
@@ -71,6 +118,9 @@ class ResearchUniverseService:
             """
         )
 
+        # ------------------------------------------------------------------
+        # ADR : on détecte les ADR via instrument_master.
+        # ------------------------------------------------------------------
         con.execute(
             """
             CREATE TEMP TABLE tmp_adr_symbols AS
@@ -82,6 +132,13 @@ class ResearchUniverseService:
             """
         )
 
+        # ------------------------------------------------------------------
+        # Candidats suffixés :
+        # suffixes typiques à exclure automatiquement :
+        # - R = right
+        # - U = unit
+        # - W = warrant
+        # ------------------------------------------------------------------
         con.execute(
             """
             CREATE TEMP TABLE tmp_suffix_candidates AS
@@ -109,6 +166,10 @@ class ResearchUniverseService:
             """
         )
 
+        # ------------------------------------------------------------------
+        # Overrides manuels :
+        # on prend le plus récent par symbole.
+        # ------------------------------------------------------------------
         con.execute(
             """
             CREATE TEMP TABLE tmp_manual_overrides AS
@@ -133,6 +194,10 @@ class ResearchUniverseService:
             """
         )
 
+        # ------------------------------------------------------------------
+        # Base enrichie :
+        # on prépare les décisions automatiques avant application des overrides.
+        # ------------------------------------------------------------------
         con.execute(
             """
             CREATE TEMP TABLE tmp_research_universe_base AS
@@ -163,6 +228,9 @@ class ResearchUniverseService:
             """
         )
 
+        # ------------------------------------------------------------------
+        # Snapshot courant final avec application des overrides.
+        # ------------------------------------------------------------------
         con.execute(
             """
             INSERT INTO research_universe (
@@ -212,9 +280,12 @@ class ResearchUniverseService:
 
         stock_base_count = int(con.execute("SELECT COUNT(*) FROM tmp_stock_base").fetchone()[0])
         adr_count = int(con.execute("SELECT COUNT(*) FROM tmp_adr_symbols").fetchone()[0])
-        suffix_exclusion_count = int(con.execute("SELECT COUNT(*) FROM tmp_suffix_exclusions").fetchone()[0])
-        manual_override_count = int(con.execute("SELECT COUNT(*) FROM tmp_manual_overrides").fetchone()[0])
-
+        suffix_exclusion_count = int(
+            con.execute("SELECT COUNT(*) FROM tmp_suffix_exclusions").fetchone()[0]
+        )
+        manual_override_count = int(
+            con.execute("SELECT COUNT(*) FROM tmp_manual_overrides").fetchone()[0]
+        )
         manual_exclusion_count = int(
             con.execute(
                 """
@@ -225,7 +296,6 @@ class ResearchUniverseService:
                 """
             ).fetchone()[0]
         )
-
         included_count = int(
             con.execute(
                 """
@@ -235,7 +305,6 @@ class ResearchUniverseService:
                 """
             ).fetchone()[0]
         )
-
         total_rows = int(con.execute("SELECT COUNT(*) FROM research_universe").fetchone()[0])
 
         return {
@@ -250,6 +319,14 @@ class ResearchUniverseService:
         }
 
     def _refresh_membership_history(self, snapshot_date: object) -> dict[str, int]:
+        """
+        Met à jour `universe_membership_history` pour l'univers de recherche.
+
+        Stratégie :
+        - on fabrique un snapshot temporaire de l'état courant
+        - on ferme les lignes actives devenues obsolètes
+        - on insère les nouvelles variantes non encore actives
+        """
         con = self.con
 
         con.execute("DROP TABLE IF EXISTS tmp_research_universe_history_snapshot")
@@ -277,8 +354,7 @@ class ResearchUniverseService:
                 ON UPPER(TRIM(im.symbol)) = UPPER(TRIM(ru.symbol))
             WHERE ru.symbol IS NOT NULL
               AND TRIM(ru.symbol) <> ''
-            """
-            ,
+            """,
             [snapshot_date],
         )
 
@@ -292,6 +368,8 @@ class ResearchUniverseService:
             ).fetchone()[0]
         )
 
+        # Sécurité : si on relance le même snapshot, on supprime d'abord les lignes
+        # déjà écrites pour cette date afin de garder l'opération idempotente.
         con.execute(
             """
             DELETE FROM universe_membership_history
@@ -301,6 +379,7 @@ class ResearchUniverseService:
             [snapshot_date],
         )
 
+        # Ferme les lignes actives qui ne correspondent plus à l'état courant.
         con.execute(
             """
             UPDATE universe_membership_history AS h
@@ -308,13 +387,13 @@ class ResearchUniverseService:
             WHERE LOWER(TRIM(h.universe_name)) IN ('research', 'research_universe')
               AND h.effective_to IS NULL
               AND NOT EXISTS (
-                  SELECT 1
-                  FROM tmp_research_universe_history_snapshot s
-                  WHERE s.instrument_id = h.instrument_id
-                    AND LOWER(TRIM(s.universe_name)) = LOWER(TRIM(h.universe_name))
-                    AND UPPER(TRIM(s.membership_status)) = UPPER(TRIM(h.membership_status))
-                    AND COALESCE(TRIM(s.reason), '') = COALESCE(TRIM(h.reason), '')
-              )
+                    SELECT 1
+                    FROM tmp_research_universe_history_snapshot s
+                    WHERE s.instrument_id = h.instrument_id
+                      AND LOWER(TRIM(s.universe_name)) = LOWER(TRIM(h.universe_name))
+                      AND UPPER(TRIM(s.membership_status)) = UPPER(TRIM(h.membership_status))
+                      AND COALESCE(TRIM(s.reason), '') = COALESCE(TRIM(h.reason), '')
+                )
             """,
             [snapshot_date],
         )
@@ -326,14 +405,14 @@ class ResearchUniverseService:
                 FROM tmp_research_universe_history_snapshot s
                 WHERE s.instrument_id IS NOT NULL
                   AND NOT EXISTS (
-                      SELECT 1
-                      FROM universe_membership_history h
-                      WHERE h.instrument_id = s.instrument_id
-                        AND LOWER(TRIM(h.universe_name)) = LOWER(TRIM(s.universe_name))
-                        AND h.effective_to IS NULL
-                        AND UPPER(TRIM(h.membership_status)) = UPPER(TRIM(s.membership_status))
-                        AND COALESCE(TRIM(h.reason), '') = COALESCE(TRIM(s.reason), '')
-                  )
+                        SELECT 1
+                        FROM universe_membership_history h
+                        WHERE h.instrument_id = s.instrument_id
+                          AND LOWER(TRIM(h.universe_name)) = LOWER(TRIM(s.universe_name))
+                          AND h.effective_to IS NULL
+                          AND UPPER(TRIM(h.membership_status)) = UPPER(TRIM(s.membership_status))
+                          AND COALESCE(TRIM(h.reason), '') = COALESCE(TRIM(s.reason), '')
+                    )
                 """
             ).fetchone()[0]
         )
@@ -366,14 +445,14 @@ class ResearchUniverseService:
             FROM tmp_research_universe_history_snapshot s
             WHERE s.instrument_id IS NOT NULL
               AND NOT EXISTS (
-                  SELECT 1
-                  FROM universe_membership_history h
-                  WHERE h.instrument_id = s.instrument_id
-                    AND LOWER(TRIM(h.universe_name)) = LOWER(TRIM(s.universe_name))
-                    AND h.effective_to IS NULL
-                    AND UPPER(TRIM(h.membership_status)) = UPPER(TRIM(s.membership_status))
-                    AND COALESCE(TRIM(h.reason), '') = COALESCE(TRIM(s.reason), '')
-              )
+                    SELECT 1
+                    FROM universe_membership_history h
+                    WHERE h.instrument_id = s.instrument_id
+                      AND LOWER(TRIM(h.universe_name)) = LOWER(TRIM(s.universe_name))
+                      AND h.effective_to IS NULL
+                      AND UPPER(TRIM(h.membership_status)) = UPPER(TRIM(s.membership_status))
+                      AND COALESCE(TRIM(h.reason), '') = COALESCE(TRIM(s.reason), '')
+                )
             """
         )
 
@@ -421,6 +500,14 @@ class ResearchUniverseService:
         }
 
     def rebuild_conservative_research_universe(self) -> dict[str, int]:
+        """
+        Point d'entrée principal du service.
+
+        1. reconstruit le snapshot courant
+        2. résout la snapshot date
+        3. met à jour l'historique d'appartenance
+        4. fusionne les métriques
+        """
         snapshot_metrics = self._build_current_snapshot()
         snapshot_date = self._resolve_snapshot_date()
         history_metrics = self._refresh_membership_history(snapshot_date)
@@ -428,3 +515,7 @@ class ResearchUniverseService:
         merged = dict(snapshot_metrics)
         merged.update(history_metrics)
         return merged
+
+
+# Compatibilité temporaire avec l'ancien nom utilisé dans certaines parties du repo.
+ResearchUniverseService = MarketUniverseService
