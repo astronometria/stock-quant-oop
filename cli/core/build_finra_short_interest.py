@@ -36,7 +36,7 @@ def main() -> int:
         schema_manager = SchemaManager(uow)
         schema_manager.validate()
 
-        repository = DuckDbShortInterestRepository(uow)
+        repository = DuckDbShortInterestRepository(uow.connection)
         pipeline = BuildFinraShortInterestPipeline(
             repository=repository,
             source_market=args.source_market,

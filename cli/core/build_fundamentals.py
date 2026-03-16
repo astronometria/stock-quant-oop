@@ -37,7 +37,7 @@ def main() -> int:
         fundamentals_schema = FundamentalsSchemaManager(uow)
         fundamentals_schema.initialize()
 
-        repository = DuckDbFundamentalsRepository(uow)
+        repository = DuckDbFundamentalsRepository(uow.connection)
         pipeline = BuildFundamentalsPipeline(repository=repository)
         result = pipeline.run()
 

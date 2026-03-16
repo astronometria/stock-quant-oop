@@ -14,7 +14,6 @@ from stock_quant.infrastructure.db.table_names import (
     FINRA_SHORT_INTEREST_SOURCE_RAW,
     FINRA_SHORT_INTEREST_SOURCES,
 )
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
@@ -29,10 +28,14 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
     - preserve existing method names for pipeline compatibility
     """
 
-    def __init__(self, uow: DuckDbUnitOfWork) -> None:
-        self.uow = uow
+    def __init__(self, con: Any) -> None:
+        self.con = con
 
-    @property
+    def _require_connection(self):
+        if self.con is None:
+            raise RepositoryError("active DB connection is required")
+        return self.con
+
     def con(self):
         if self.uow.connection is None:
             raise RepositoryError("active DB connection is required")

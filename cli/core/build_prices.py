@@ -203,7 +203,7 @@ def main() -> int:
 
     # Pass 2: build réel
     with DuckDbUnitOfWork(session_factory) as uow:
-        repository = DuckDbPriceRepository(uow)
+        repository = DuckDbPriceRepository(uow.connection)
 
         staged_raw_rows = _count_staged_raw_rows(repository)
         use_sql_first_staging = args.mode == "daily" and staged_raw_rows > 0

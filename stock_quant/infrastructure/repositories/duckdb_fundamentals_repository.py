@@ -24,7 +24,6 @@ from datetime import datetime
 from typing import Any
 
 from stock_quant.domain.entities.fundamental import FundamentalFeatureDaily, FundamentalSnapshot
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
@@ -38,10 +37,14 @@ class DuckDbFundamentalsRepository:
     - garde une logique simple, déterministe et idempotente
     """
 
-    def __init__(self, uow: DuckDbUnitOfWork) -> None:
-        self.uow = uow
+    def __init__(self, con: Any) -> None:
+        self.con = con
 
-    @property
+    def _require_connection(self):
+        if self.con is None:
+            raise RepositoryError("active DB connection is required")
+        return self.con
+
     def con(self):
         """
         Expose la connexion active.

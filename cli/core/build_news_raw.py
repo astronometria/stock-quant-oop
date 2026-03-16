@@ -34,7 +34,7 @@ def main() -> int:
         schema_manager = SchemaManager(uow)
         schema_manager.validate()
 
-        repository = DuckDbNewsRepository(uow)
+        repository = DuckDbNewsRepository(uow.connection)
         pipeline = BuildNewsRawPipeline(repository=repository)
         result = pipeline.run()
 

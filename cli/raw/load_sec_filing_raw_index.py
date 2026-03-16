@@ -38,7 +38,7 @@ def main() -> int:
         schema = SecSchemaManager(uow)
         schema.initialize()
 
-        repository = DuckDbSecRepository(uow)
+        repository = DuckDbSecRepository(uow.connection)
         written = repository.replace_sec_filing_raw_index(rows)
 
     result = {
