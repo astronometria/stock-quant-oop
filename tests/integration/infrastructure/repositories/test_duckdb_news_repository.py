@@ -36,7 +36,7 @@ def test_news_repository_roundtrip(tmp_path: Path) -> None:
         SchemaManager(uow).initialize(drop_existing=True)
         seed_symbol_reference(uow)
 
-        repo = DuckDbNewsRepository(uow)
+        repo = DuckDbNewsRepository(uow.connection)
 
         uow.connection.executemany(
             f"""

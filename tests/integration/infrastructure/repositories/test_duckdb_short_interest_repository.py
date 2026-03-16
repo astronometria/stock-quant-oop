@@ -35,7 +35,7 @@ def test_short_interest_repository_roundtrip_and_latest(tmp_path: Path) -> None:
     with DuckDbUnitOfWork(session_factory) as uow:
         SchemaManager(uow).initialize(drop_existing=True)
         seed_market_universe(uow)
-        repo = DuckDbShortInterestRepository(uow)
+        repo = DuckDbShortInterestRepository(uow.connection)
 
         uow.connection.executemany(
             f"""

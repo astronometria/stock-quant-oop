@@ -36,7 +36,7 @@ def test_price_repository_roundtrip_and_latest(tmp_path: Path) -> None:
         SchemaManager(uow).initialize(drop_existing=True)
         seed_market_universe(uow)
 
-        repo = DuckDbPriceRepository(uow)
+        repo = DuckDbPriceRepository(uow.connection)
 
         uow.connection.executemany(
             f"""
