@@ -8,10 +8,18 @@ __pycache__/
 venv/
 .venv/
 
-logs/
+# data files
 data/
 *.duckdb
 
+# pytest
 .pytest_cache/
 
+# backup files
 *.bak
+
+# logs
+logs/*
+!logs/.gitkeep
+!logs/*audit*
+!logs/*rebuild*
