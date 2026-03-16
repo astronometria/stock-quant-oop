@@ -2,23 +2,48 @@ from __future__ import annotations
 
 from typing import Any
 
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
 class DuckDbPipelineRunRepository:
-    def __init__(self, uow: DuckDbUnitOfWork) -> None:
-        self.uow = uow
+    """
+    Repository DuckDB pour les écritures et nettoyages liés au suivi des runs.
 
-    @property
-    def con(self):
-        if self.uow.connection is None:
+    Convention de refactor importante
+    ---------------------------------
+    Ce repository prend désormais une connexion DuckDB active (`con`) et non
+    plus un UnitOfWork.
+
+    Pourquoi
+    --------
+    - homogénéiser tous les repositories du projet
+    - éviter le mélange `repository(uow)` vs `repository(uow.connection)`
+    - garder les repositories focalisés uniquement sur la persistance SQL
+
+    Le UnitOfWork reste géré au niveau CLI / pipeline / service.
+    """
+
+    def __init__(self, con: Any) -> None:
+        self.con = con
+
+    def _require_connection(self):
+        """
+        Vérifie qu'une connexion active est bien disponible.
+        """
+        if self.con is None:
             raise RepositoryError("active DB connection is required")
-        return self.uow.connection
+        return self.con
 
     def insert_pipeline_run(self, payload: dict[str, Any]) -> int:
+        """
+        Insère une ligne dans `pipeline_runs`.
+
+        Retourne 1 si l'insertion a réussi.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(
+            con.execute(
                 """
                 INSERT INTO pipeline_runs (
                     pipeline_name,
@@ -52,8 +77,13 @@ class DuckDbPipelineRunRepository:
             raise RepositoryError(f"failed to insert pipeline_runs: {exc}") from exc
 
     def delete_dataset_version(self, dataset_name: str, dataset_version: str) -> int:
+        """
+        Supprime les lignes correspondant à un dataset versionné donné.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(
+            con.execute(
                 """
                 DELETE FROM dataset_versions
                 WHERE dataset_name = ? AND dataset_version = ?
@@ -65,8 +95,13 @@ class DuckDbPipelineRunRepository:
             raise RepositoryError(f"failed to delete dataset_versions rows: {exc}") from exc
 
     def delete_experiment_runs(self, experiment_name: str) -> int:
+        """
+        Supprime les runs d'expérience correspondant au nom fourni.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(
+            con.execute(
                 """
                 DELETE FROM experiment_runs
                 WHERE experiment_name = ?
@@ -78,8 +113,13 @@ class DuckDbPipelineRunRepository:
             raise RepositoryError(f"failed to delete experiment_runs rows: {exc}") from exc
 
     def delete_backtest_runs(self, backtest_name: str) -> int:
+        """
+        Supprime les runs de backtest correspondant au nom fourni.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(
+            con.execute(
                 """
                 DELETE FROM backtest_runs
                 WHERE backtest_name = ?
@@ -91,8 +131,13 @@ class DuckDbPipelineRunRepository:
             raise RepositoryError(f"failed to delete backtest_runs rows: {exc}") from exc
 
     def delete_llm_runs(self, run_name: str) -> int:
+        """
+        Supprime les runs LLM correspondant au nom logique fourni.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(
+            con.execute(
                 """
                 DELETE FROM llm_runs
                 WHERE run_name = ?

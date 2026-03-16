@@ -1,29 +1,55 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from stock_quant.domain.entities.universe import RawUniverseCandidate, UniverseConflict, UniverseEntry
+from stock_quant.domain.entities.universe import (
+    RawUniverseCandidate,
+    UniverseConflict,
+    UniverseEntry,
+)
 from stock_quant.domain.ports.repositories import UniverseRepositoryPort
-from stock_quant.infrastructure.db.table_names import MARKET_UNIVERSE, MARKET_UNIVERSE_CONFLICTS, SYMBOL_REFERENCE_SOURCE_RAW
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+from stock_quant.infrastructure.db.table_names import (
+    MARKET_UNIVERSE,
+    MARKET_UNIVERSE_CONFLICTS,
+    SYMBOL_REFERENCE_SOURCE_RAW,
+)
 from stock_quant.shared.exceptions import RepositoryError
 
 
 class DuckDbUniverseRepository(UniverseRepositoryPort):
-    def __init__(self, uow: DuckDbUnitOfWork) -> None:
-        self.uow = uow
+    """
+    Repository DuckDB de l'univers de marché courant.
 
-    @property
-    def con(self):
-        if self.uow.connection is None:
+    Convention de refactor
+    ----------------------
+    Ce repository prend désormais une connexion DuckDB active (`con`)
+    au lieu d'un UnitOfWork.
+    """
+
+    def __init__(self, con: Any) -> None:
+        self.con = con
+
+    def _require_connection(self):
+        """
+        Vérifie la disponibilité d'une connexion active.
+        """
+        if self.con is None:
             raise RepositoryError("active DB connection is required")
-        return self.uow.connection
+        return self.con
 
     def replace_universe(self, entries: list[UniverseEntry]) -> int:
+        """
+        Remplace complètement le contenu de `market_universe`.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(f"DELETE FROM {MARKET_UNIVERSE}")
+            con.execute(f"DELETE FROM {MARKET_UNIVERSE}")
+
             if not entries:
                 return 0
+
             rows = [
                 (
                     e.symbol,
@@ -47,12 +73,28 @@ class DuckDbUniverseRepository(UniverseRepositoryPort):
                 )
                 for e in entries
             ]
-            self.con.executemany(
+
+            con.executemany(
                 f"""
                 INSERT INTO {MARKET_UNIVERSE} (
-                    symbol, company_name, cik, exchange_raw, exchange_normalized, security_type,
-                    include_in_universe, exclusion_reason, is_common_stock, is_adr, is_etf,
-                    is_preferred, is_warrant, is_right, is_unit, source_name, as_of_date, created_at
+                    symbol,
+                    company_name,
+                    cik,
+                    exchange_raw,
+                    exchange_normalized,
+                    security_type,
+                    include_in_universe,
+                    exclusion_reason,
+                    is_common_stock,
+                    is_adr,
+                    is_etf,
+                    is_preferred,
+                    is_warrant,
+                    is_right,
+                    is_unit,
+                    source_name,
+                    as_of_date,
+                    created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -63,10 +105,17 @@ class DuckDbUniverseRepository(UniverseRepositoryPort):
             raise RepositoryError(f"failed to replace universe table: {exc}") from exc
 
     def replace_conflicts(self, conflicts: list[UniverseConflict]) -> int:
+        """
+        Remplace complètement le contenu de `market_universe_conflicts`.
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(f"DELETE FROM {MARKET_UNIVERSE_CONFLICTS}")
+            con.execute(f"DELETE FROM {MARKET_UNIVERSE_CONFLICTS}")
+
             if not conflicts:
                 return 0
+
             rows = [
                 (
                     c.symbol,
@@ -78,10 +127,16 @@ class DuckDbUniverseRepository(UniverseRepositoryPort):
                 )
                 for c in conflicts
             ]
-            self.con.executemany(
+
+            con.executemany(
                 f"""
                 INSERT INTO {MARKET_UNIVERSE_CONFLICTS} (
-                    symbol, chosen_source, rejected_source, reason, payload_json, created_at
+                    symbol,
+                    chosen_source,
+                    rejected_source,
+                    reason,
+                    payload_json,
+                    created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
@@ -89,16 +144,38 @@ class DuckDbUniverseRepository(UniverseRepositoryPort):
             )
             return len(rows)
         except Exception as exc:
-            raise RepositoryError(f"failed to replace universe conflicts table: {exc}") from exc
+            raise RepositoryError(
+                f"failed to replace universe conflicts table: {exc}"
+            ) from exc
 
     def fetch_all_universe_entries(self) -> list[UniverseEntry]:
+        """
+        Charge toutes les lignes courantes de `market_universe`.
+        """
+        con = self._require_connection()
+
         try:
-            rows = self.con.execute(
+            rows = con.execute(
                 f"""
                 SELECT
-                    symbol, company_name, cik, exchange_raw, exchange_normalized, security_type,
-                    include_in_universe, exclusion_reason, is_common_stock, is_adr, is_etf,
-                    is_preferred, is_warrant, is_right, is_unit, source_name, as_of_date, created_at
+                    symbol,
+                    company_name,
+                    cik,
+                    exchange_raw,
+                    exchange_normalized,
+                    security_type,
+                    include_in_universe,
+                    exclusion_reason,
+                    is_common_stock,
+                    is_adr,
+                    is_etf,
+                    is_preferred,
+                    is_warrant,
+                    is_right,
+                    is_unit,
+                    source_name,
+                    as_of_date,
+                    created_at
                 FROM {MARKET_UNIVERSE}
                 ORDER BY symbol
                 """
@@ -128,13 +205,19 @@ class DuckDbUniverseRepository(UniverseRepositoryPort):
                         created_at=row[17] or datetime.utcnow(),
                     )
                 )
+
             return out
         except Exception as exc:
             raise RepositoryError(f"failed to fetch universe entries: {exc}") from exc
 
     def load_raw_candidates(self) -> list[RawUniverseCandidate]:
+        """
+        Charge les candidats bruts depuis `symbol_reference_source_raw`.
+        """
+        con = self._require_connection()
+
         try:
-            rows = self.con.execute(
+            rows = con.execute(
                 f"""
                 SELECT
                     symbol,
@@ -162,6 +245,7 @@ class DuckDbUniverseRepository(UniverseRepositoryPort):
                         as_of_date=row[6],
                     )
                 )
+
             return out
         except Exception as exc:
             raise RepositoryError(f"failed to load raw universe candidates: {exc}") from exc

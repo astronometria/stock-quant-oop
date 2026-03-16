@@ -1,28 +1,54 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from stock_quant.domain.entities.symbol_reference import SymbolReferenceEntry
 from stock_quant.domain.entities.universe import UniverseEntry
 from stock_quant.domain.ports.repositories import SymbolReferenceRepositoryPort
 from stock_quant.infrastructure.db.table_names import MARKET_UNIVERSE, SYMBOL_REFERENCE
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
 class DuckDbSymbolReferenceRepository(SymbolReferenceRepositoryPort):
-    def __init__(self, uow: DuckDbUnitOfWork) -> None:
-        self.uow = uow
+    """
+    Repository DuckDB de la table `symbol_reference`.
 
-    @property
-    def con(self):
-        if self.uow.connection is None:
+    Convention de refactor
+    ----------------------
+    Ce repository prend désormais une connexion DuckDB active (`con`).
+
+    Pourquoi
+    --------
+    - aligner tout le repo sur une seule convention
+    - garder le UnitOfWork hors des repositories
+    - simplifier les tests et l'injection de dépendances
+    """
+
+    def __init__(self, con: Any) -> None:
+        self.con = con
+
+    def _require_connection(self):
+        """
+        Vérifie la disponibilité d'une connexion active.
+        """
+        if self.con is None:
             raise RepositoryError("active DB connection is required")
-        return self.uow.connection
+        return self.con
 
     def replace_symbol_reference(self, entries: list[SymbolReferenceEntry]) -> int:
+        """
+        Remplace complètement le contenu de `symbol_reference`.
+
+        Note :
+        - comportement volontairement destructif pour la table courante
+        - l'historisation PIT vit dans la nouvelle couche history
+        """
+        con = self._require_connection()
+
         try:
-            self.con.execute(f"DELETE FROM {SYMBOL_REFERENCE}")
+            con.execute(f"DELETE FROM {SYMBOL_REFERENCE}")
+
             if not entries:
                 return 0
 
@@ -42,7 +68,7 @@ class DuckDbSymbolReferenceRepository(SymbolReferenceRepositoryPort):
                 for e in entries
             ]
 
-            self.con.executemany(
+            con.executemany(
                 f"""
                 INSERT INTO {SYMBOL_REFERENCE} (
                     symbol,
@@ -65,8 +91,16 @@ class DuckDbSymbolReferenceRepository(SymbolReferenceRepositoryPort):
             raise RepositoryError(f"failed to replace symbol_reference: {exc}") from exc
 
     def load_included_universe_entries(self) -> list[UniverseEntry]:
+        """
+        Charge les lignes de `market_universe` incluses dans l'univers.
+
+        Ces lignes servent ensuite à construire la table courante
+        `symbol_reference`.
+        """
+        con = self._require_connection()
+
         try:
-            rows = self.con.execute(
+            rows = con.execute(
                 f"""
                 SELECT
                     symbol,
@@ -117,6 +151,7 @@ class DuckDbSymbolReferenceRepository(SymbolReferenceRepositoryPort):
                         created_at=row[17] or datetime.utcnow(),
                     )
                 )
+
             return out
         except Exception as exc:
             raise RepositoryError(f"failed to load included universe entries: {exc}") from exc
