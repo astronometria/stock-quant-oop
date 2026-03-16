@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Rebuild the DuckDB database from scratch using real raw symbol sources, "
-            "core SEC normalization, and fundamentals construction."
+            "core SEC normalization, fundamentals construction, and prices."
         )
     )
     parser.add_argument(
@@ -61,6 +61,46 @@ def parse_args() -> argparse.Namespace:
         "--skip-fundamentals",
         action="store_true",
         help="Skip build_fundamentals.",
+    )
+    parser.add_argument(
+        "--skip-prices",
+        action="store_true",
+        help="Skip build_prices.",
+    )
+    parser.add_argument(
+        "--price-mode",
+        default="daily",
+        choices=["daily", "backfill"],
+        help="Price build mode.",
+    )
+    parser.add_argument(
+        "--historical-price-source",
+        action="append",
+        dest="historical_price_sources",
+        default=[],
+        help="Historical price source path. Repeat for multiple inputs when --price-mode=backfill.",
+    )
+    parser.add_argument(
+        "--price-symbol",
+        action="append",
+        dest="price_symbols",
+        default=[],
+        help="Optional symbol filter for prices. Repeat for multiple symbols.",
+    )
+    parser.add_argument(
+        "--price-start-date",
+        default=None,
+        help="Optional start date for prices (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--price-end-date",
+        default=None,
+        help="Optional end date for prices (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--price-as-of",
+        default=None,
+        help="Optional single date for daily price refresh (YYYY-MM-DD).",
     )
     parser.add_argument(
         "--allow-adr",
@@ -111,9 +151,6 @@ def main() -> int:
     print(f"project_root={project_root}", flush=True)
     print(f"db_path={db_path}", flush=True)
 
-    # ------------------------------------------------------------------
-    # 1) Init DB schema
-    # ------------------------------------------------------------------
     if not args.skip_init:
         command = [
             python_bin,
@@ -123,9 +160,6 @@ def main() -> int:
         ]
         _run_step("INIT MARKET DB", command)
 
-    # ------------------------------------------------------------------
-    # 2) Fetch raw symbol sources to local disk
-    # ------------------------------------------------------------------
     if not args.skip_sec_fetch:
         command = [
             python_bin,
@@ -142,9 +176,6 @@ def main() -> int:
         ]
         _run_step("FETCH NASDAQ SYMBOL DIRECTORY RAW", command)
 
-    # ------------------------------------------------------------------
-    # 3) Resolve latest local raw files
-    # ------------------------------------------------------------------
     sec_file = _latest_file(sec_dir, "sec_company_tickers_*.csv")
     nasdaqlisted_file = _latest_file(nasdaq_dir, "nasdaqlisted_*.csv")
     otherlisted_file = _latest_file(nasdaq_dir, "otherlisted_*.csv")
@@ -154,9 +185,6 @@ def main() -> int:
     print(f"nasdaqlisted_file={nasdaqlisted_file}", flush=True)
     print(f"otherlisted_file={otherlisted_file}", flush=True)
 
-    # ------------------------------------------------------------------
-    # 4) Load symbol_reference_source_raw from real local raw files
-    # ------------------------------------------------------------------
     if not args.skip_raw_load:
         missing_files: list[str] = []
         if sec_file is None:
@@ -188,9 +216,6 @@ def main() -> int:
         ]
         _run_step("LOAD SYMBOL_REFERENCE_SOURCE_RAW", command)
 
-    # ------------------------------------------------------------------
-    # 5) Build market_universe
-    # ------------------------------------------------------------------
     if not args.skip_market_universe:
         command = [
             python_bin,
@@ -200,14 +225,9 @@ def main() -> int:
             "--verbose",
         ]
         if not args.allow_adr:
-            # Le CLI existant est conservateur.
-            # On ne passe rien ici tant qu'il n'y a pas un flag positif uniforme.
             pass
         _run_step("BUILD MARKET UNIVERSE", command)
 
-    # ------------------------------------------------------------------
-    # 6) Build symbol_reference
-    # ------------------------------------------------------------------
     if not args.skip_symbol_reference:
         command = [
             python_bin,
@@ -218,9 +238,6 @@ def main() -> int:
         ]
         _run_step("BUILD SYMBOL REFERENCE", command)
 
-    # ------------------------------------------------------------------
-    # 7) Build SEC filings
-    # ------------------------------------------------------------------
     if not args.skip_sec_filings:
         command = [
             python_bin,
@@ -231,9 +248,6 @@ def main() -> int:
         ]
         _run_step("BUILD SEC FILINGS", command)
 
-    # ------------------------------------------------------------------
-    # 8) Build fundamentals
-    # ------------------------------------------------------------------
     if not args.skip_fundamentals:
         command = [
             python_bin,
@@ -243,6 +257,32 @@ def main() -> int:
             "--verbose",
         ]
         _run_step("BUILD FUNDAMENTALS", command)
+
+    if not args.skip_prices:
+        command = [
+            python_bin,
+            str(project_root / "cli" / "core" / "build_prices.py"),
+            "--db-path",
+            str(db_path),
+            "--mode",
+            args.price_mode,
+            "--verbose",
+        ]
+
+        for source in args.historical_price_sources:
+            command.extend(["--historical-source", str(source)])
+
+        for symbol in args.price_symbols:
+            command.extend(["--symbol", str(symbol)])
+
+        if args.price_start_date:
+            command.extend(["--start-date", str(args.price_start_date)])
+        if args.price_end_date:
+            command.extend(["--end-date", str(args.price_end_date)])
+        if args.price_as_of:
+            command.extend(["--as-of", str(args.price_as_of)])
+
+        _run_step("BUILD PRICES", command)
 
     print("===== REBUILD DATABASE COMPLETE =====", flush=True)
     print(f"db_path={db_path}", flush=True)

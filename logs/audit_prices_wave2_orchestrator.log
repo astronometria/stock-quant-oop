@@ -1,3 +1,17 @@
+===== DATE =====
+Mon 16 Mar 2026 05:48:55 PM EDT
+===== COMPILE TARGET =====
+
+===== HELP CHECK =====
+8:                                        [--skip-fundamentals] [--skip-prices]
+9:                                        [--price-mode {daily,backfill}]
+10:                                        [--historical-price-source HISTORICAL_PRICE_SOURCES]
+33:  --skip-prices         Skip build_prices.
+34:  --price-mode {daily,backfill}
+36:  --historical-price-source HISTORICAL_PRICE_SOURCES
+38:                        inputs when --price-mode=backfill.
+
+===== DOC CHECK =====
 # DB Rebuild
 
 ## Objectif
@@ -109,3 +123,4 @@ python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --price
 Rebuild avec backfill historique prix :
 
 python3 cli/ops/rebuild_database_from_scratch.py --db-path market.duckdb --price-mode backfill --historical-price-source /path/to/stooq.zip --verbose
+===== DONE =====
