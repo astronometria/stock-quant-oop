@@ -1,58 +1,90 @@
 from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.pipelines.base_pipeline import BasePipeline
 from stock_quant.shared.exceptions import PipelineError
 
 
 class BuildSymbolReferencePipeline(BasePipeline):
+    """
+    Pipeline SQL-first pour construire `symbol_reference` à partir de
+    `market_universe`.
+
+    Convention
+    ----------
+    - le repository doit désormais exposer directement `con`
+    - on n'utilise plus `repository.uow`
+    - le pipeline reste mince et délègue le cycle de vie à BasePipeline
+    """
+
     pipeline_name = "build_symbol_reference"
 
-    def __init__(self, repository=None, uow: DuckDbUnitOfWork | None = None) -> None:
-        if repository is not None:
-            self.uow = repository.uow
-        else:
-            self.uow = uow
-
-        if self.uow is None:
-            raise ValueError("BuildSymbolReferencePipeline requires repository or uow")
-
+    def __init__(self, repository) -> None:
+        self.repository = repository
         self._metrics: dict[str, int] = {}
         self._rows_written = 0
 
     @property
     def con(self):
-        if self.uow.connection is None:
+        """
+        Retourne la connexion DuckDB portée par le repository.
+        """
+        con = getattr(self.repository, "con", None)
+        if con is None:
             raise PipelineError("active DB connection is required")
-        return self.uow.connection
+        return con
 
     def extract(self):
+        """
+        Pipeline SQL-first : rien à extraire en Python.
+        """
         return None
 
     def transform(self, data):
+        """
+        Pipeline SQL-first : pas de transformation Python intermédiaire.
+        """
         return None
 
     def validate(self, data) -> None:
+        """
+        Vérifie qu'il y a bien des lignes incluses dans market_universe.
+        """
         input_entries = int(
             self.con.execute(
-                "SELECT COUNT(*) FROM market_universe WHERE include_in_universe = TRUE"
+                """
+                SELECT COUNT(*)
+                FROM market_universe
+                WHERE include_in_universe = TRUE
+                """
             ).fetchone()[0]
         )
+
         if input_entries == 0:
             raise PipelineError("no included market_universe rows available")
 
     def load(self, data) -> None:
+        """
+        Construit `symbol_reference` depuis `market_universe`.
+
+        Règles :
+        - on ne prend que les lignes incluses
+        - on normalise `company_name_clean`
+        - on construit un `aliases_json` minimal avec une variante stripped
+        """
         con = self.con
 
         input_entries = int(
             con.execute(
-                "SELECT COUNT(*) FROM market_universe WHERE include_in_universe = TRUE"
+                """
+                SELECT COUNT(*)
+                FROM market_universe
+                WHERE include_in_universe = TRUE
+                """
             ).fetchone()[0]
         )
 
         con.execute("DELETE FROM symbol_reference")
-
         con.execute("DROP TABLE IF EXISTS tmp_symbol_reference_base")
         con.execute(
             """
@@ -67,7 +99,7 @@ class BuildSymbolReferencePipeline(BasePipeline):
                     UPPER(
                         REGEXP_REPLACE(
                             REGEXP_REPLACE(TRIM(company_name), '[^A-Za-z0-9 ]+', ' ', 'g'),
-                            '\s+',
+                            '\\s+',
                             ' ',
                             'g'
                         )
@@ -112,58 +144,76 @@ class BuildSymbolReferencePipeline(BasePipeline):
                                                                                             REGEXP_REPLACE(
                                                                                                 REGEXP_REPLACE(
                                                                                                     company_name_clean,
-                                                                                                    ' INCORPORATED$', '',
+                                                                                                    ' INCORPORATED$',
+                                                                                                    '',
                                                                                                     'g'
                                                                                                 ),
-                                                                                                ' INC$', '',
+                                                                                                ' INC$',
+                                                                                                '',
                                                                                                 'g'
                                                                                             ),
-                                                                                            ' CORPORATION$', '',
+                                                                                            ' CORPORATION$',
+                                                                                            '',
                                                                                             'g'
                                                                                         ),
-                                                                                        ' CORP$', '',
+                                                                                        ' CORP$',
+                                                                                        '',
                                                                                         'g'
                                                                                     ),
-                                                                                    ' COMPANY$', '',
+                                                                                    ' COMPANY$',
+                                                                                    '',
                                                                                     'g'
                                                                                 ),
-                                                                                ' CO$', '',
+                                                                                ' CO$',
+                                                                                '',
                                                                                 'g'
                                                                             ),
-                                                                            ' LIMITED$', '',
+                                                                            ' LIMITED$',
+                                                                            '',
                                                                             'g'
                                                                         ),
-                                                                        ' LTD$', '',
+                                                                        ' LTD$',
+                                                                        '',
                                                                         'g'
                                                                     ),
-                                                                    ' HOLDINGS$', '',
+                                                                    ' HOLDINGS$',
+                                                                    '',
                                                                     'g'
                                                                 ),
-                                                                ' HOLDING$', '',
+                                                                ' HOLDING$',
+                                                                '',
                                                                 'g'
                                                             ),
-                                                            ' GROUP$', '',
+                                                            ' GROUP$',
+                                                            '',
                                                             'g'
                                                         ),
-                                                        ' PLC$', '',
+                                                        ' PLC$',
+                                                        '',
                                                         'g'
                                                     ),
-                                                    ' SA$', '',
+                                                    ' SA$',
+                                                    '',
                                                     'g'
                                                 ),
-                                                ' NV$', '',
+                                                ' NV$',
+                                                '',
                                                 'g'
                                             ),
-                                            ' AG$', '',
+                                            ' AG$',
+                                            '',
                                             'g'
                                         ),
-                                        ' LP$', '',
+                                        ' LP$',
+                                        '',
                                         'g'
                                     ),
-                                    ' LLC$', '',
+                                    ' LLC$',
+                                    '',
                                     'g'
                                 ),
-                                ' ADR$', '',
+                                ' ADR$',
+                                '',
                                 'g'
                             ),
                             ' ADS$',
@@ -226,9 +276,7 @@ class BuildSymbolReferencePipeline(BasePipeline):
                     ELSE FALSE
                 END AS symbol_match_enabled,
                 CASE
-                    WHEN company_name_clean IS NOT NULL
-                         AND LENGTH(company_name_clean) >= 3
-                    THEN TRUE
+                    WHEN company_name_clean IS NOT NULL AND LENGTH(company_name_clean) >= 3 THEN TRUE
                     ELSE FALSE
                 END AS name_match_enabled,
                 CURRENT_TIMESTAMP
@@ -236,15 +284,25 @@ class BuildSymbolReferencePipeline(BasePipeline):
             """
         )
 
-        output_entries = int(con.execute("SELECT COUNT(*) FROM symbol_reference").fetchone()[0])
+        output_entries = int(
+            con.execute("SELECT COUNT(*) FROM symbol_reference").fetchone()[0]
+        )
         name_match_enabled_count = int(
             con.execute(
-                "SELECT COUNT(*) FROM symbol_reference WHERE name_match_enabled = TRUE"
+                """
+                SELECT COUNT(*)
+                FROM symbol_reference
+                WHERE name_match_enabled = TRUE
+                """
             ).fetchone()[0]
         )
         symbol_match_enabled_count = int(
             con.execute(
-                "SELECT COUNT(*) FROM symbol_reference WHERE symbol_match_enabled = TRUE"
+                """
+                SELECT COUNT(*)
+                FROM symbol_reference
+                WHERE symbol_match_enabled = TRUE
+                """
             ).fetchone()[0]
         )
 
@@ -257,6 +315,9 @@ class BuildSymbolReferencePipeline(BasePipeline):
         }
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
+        """
+        Injecte les métriques finales dans le résultat pipeline.
+        """
         result.rows_read = int(self._metrics.get("input_entries", 0))
         result.rows_written = self._rows_written
         result.metrics.update(self._metrics)
