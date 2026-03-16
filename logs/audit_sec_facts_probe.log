@@ -1,0 +1,323 @@
+===== DATE =====
+Mon 16 Mar 2026 06:44:53 PM EDT
+===== SEC FACT FILES =====
+cli/debug/profile_sec_companyfacts_loader.py
+
+===== FUNDAMENTALS RELATED FILES =====
+cli/core/build_fundamentals.py
+cli/core/build_sec_filings.py
+cli/core/init_fundamentals_foundation.py
+cli/ops/run_sec_fundamentals_daily.py
+cli/raw/load_sec_filing_raw_index.py
+stock_quant/app/services/sec_filing_service.py
+stock_quant/app/services/sec_filings_service.py
+stock_quant/domain/entities/fundamental.py
+stock_quant/domain/entities/sec_filing.py
+stock_quant/infrastructure/db/fundamentals_schema.py
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py
+stock_quant/pipelines/build_fundamentals_pipeline.py
+stock_quant/pipelines/build_sec_filings_pipeline.py
+stock_quant/pipelines/fundamentals_pipeline.py
+
+===== GREP sec_fact_normalized =====
+cli/ops/run_sec_load_bulk_raw.py:18:# - raw -> sec_fact_normalized
+cli/ops/run_sec_load_bulk_raw.py.bak:18:# - raw -> sec_fact_normalized
+stock_quant/pipelines/fundamentals_pipeline.py.bak:45:        sec_fact_rows = int(con.execute("SELECT COUNT(*) FROM sec_fact_normalized").fetchone()[0])
+stock_quant/pipelines/fundamentals_pipeline.py.bak:68:            FROM sec_fact_normalized sfn
+stock_quant/pipelines/build_fundamentals_pipeline.py:48:            "sec_fact_rows": self.repository.load_sec_fact_normalized_rows(),
+stock_quant/pipelines/build_fundamentals_pipeline.py:98:            raise PipelineError("no sec_fact_normalized rows available")
+stock_quant/infrastructure/providers/sec/sec_bulk_disk_loader.py.bak:19:# - on ne construit PAS ici sec_filing / sec_fact_normalized
+stock_quant/infrastructure/db/sec_schema.py:75:        self._create_sec_fact_normalized()
+stock_quant/infrastructure/db/sec_schema.py:82:        self._migrate_sec_fact_normalized()
+stock_quant/infrastructure/db/sec_schema.py:181:    def _create_sec_fact_normalized(self) -> None:
+stock_quant/infrastructure/db/sec_schema.py:184:            CREATE TABLE IF NOT EXISTS sec_fact_normalized (
+stock_quant/infrastructure/db/sec_schema.py:228:    def _migrate_sec_fact_normalized(self) -> None:
+stock_quant/infrastructure/db/sec_schema.py:229:        self._add_column_if_missing("sec_fact_normalized", "available_at", "TIMESTAMP")
+stock_quant/infrastructure/db/sec_schema.py:230:        self._add_column_if_missing("sec_fact_normalized", "created_at", "TIMESTAMP")
+stock_quant/infrastructure/db/sec_schema.py:231:        self._add_column_if_missing("sec_fact_normalized", "company_id", "VARCHAR")
+stock_quant/infrastructure/db/sec_schema.py:232:        self._add_column_if_missing("sec_fact_normalized", "cik", "VARCHAR")
+stock_quant/infrastructure/db/sec_schema.py:271:            "idx_sec_fact_normalized_company_period",
+stock_quant/infrastructure/db/sec_schema.py:272:            "sec_fact_normalized",
+stock_quant/infrastructure/db/sec_schema.py:276:            "idx_sec_fact_normalized_company_available_at",
+stock_quant/infrastructure/db/sec_schema.py:277:            "sec_fact_normalized",
+stock_quant/infrastructure/db/sec_schema.py:281:            "idx_sec_fact_normalized_concept_period",
+stock_quant/infrastructure/db/sec_schema.py:282:            "sec_fact_normalized",
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py:517:    def insert_sec_fact_normalized(
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py:541:            INSERT INTO sec_fact_normalized (
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py:559:    def load_sec_fact_normalized_rows(self) -> list[dict[str, Any]]:
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py:575:            FROM sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py.bak:11:# - conservation de available_at dans sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py.bak:493:    def insert_sec_fact_normalized(
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py.bak:517:            INSERT INTO sec_fact_normalized (
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py.bak:535:    def load_sec_fact_normalized_rows(self) -> list[dict[str, Any]]:
+stock_quant/infrastructure/repositories/duckdb_sec_repository.py.bak:551:            FROM sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py.bak:55:    def load_sec_fact_normalized_rows(self) -> list[dict[str, Any]]:
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py.bak:70:                FROM sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py.bak:91:            raise RepositoryError(f"failed to load sec_fact_normalized rows: {exc}") from exc
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:12:# 1) charge available_at depuis sec_fact_normalized quand présent
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:105:    def load_sec_fact_normalized_rows(self) -> list[dict[str, Any]]:
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:110:        - remonte available_at quand la colonne existe dans sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:128:                  AND table_name = 'sec_fact_normalized'
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:151:                    FROM sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:189:                FROM sec_fact_normalized
+stock_quant/infrastructure/repositories/duckdb_fundamentals_repository.py:211:            raise RepositoryError(f"failed to load sec_fact_normalized rows: {exc}") from exc
+
+===== TABLES LIKE SEC / FUNDAMENTAL / FINRA =====
+┌─────────────────────────────────┐
+│              name               │
+│             varchar             │
+├─────────────────────────────────┤
+│ company_master                  │
+│ finra_short_interest_history    │
+│ finra_short_interest_latest     │
+│ finra_short_interest_source_raw │
+│ finra_short_interest_sources    │
+│ fundamental_features_daily      │
+│ fundamental_snapshot_annual     │
+│ fundamental_snapshot_quarterly  │
+│ fundamental_ttm                 │
+│ instrument_identifier_map       │
+│ instrument_master               │
+│ market_universe                 │
+│ market_universe_conflicts       │
+│ news_articles_raw               │
+│ news_source_raw                 │
+│ news_symbol_candidates          │
+│ price_history                   │
+│ price_latest                    │
+│ price_source_daily_raw          │
+│ price_source_daily_raw_all      │
+│ price_source_daily_raw_yahoo    │
+│ sec_fact_normalized             │
+│ sec_filing                      │
+│ sec_filing_document             │
+│ sec_filing_raw_document         │
+│ sec_filing_raw_index            │
+│ sec_xbrl_fact_raw               │
+│ symbol_reference                │
+│ symbol_reference_source_raw     │
+│ ticker_history                  │
+│ universe_membership_history     │
+├─────────────────────────────────┤
+│             31 rows             │
+└─────────────────────────────────┘
+
+===== COUNT SEC FACT TABLE IF EXISTS =====
+┌──────────────────────────┐
+│ sec_fact_normalized_rows │
+│          int64           │
+├──────────────────────────┤
+│                        0 │
+└──────────────────────────┘
+
+===== COUNT POSSIBLE FINRA TABLES =====
+
+===== SHOW run_sec_fundamentals_daily =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run SEC + fundamentals daily flow using staged SEC raw filing index files."
+    )
+    parser.add_argument(
+        "--project-root",
+        default=str(Path(__file__).resolve().parents[2]),
+        help="Project root directory.",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Optional DuckDB path passed to child steps.",
+    )
+    parser.add_argument(
+        "--sec-source",
+        action="append",
+        dest="sec_sources",
+        default=[],
+        help="SEC raw index CSV source path. Repeat this flag for multiple files.",
+    )
+    parser.add_argument(
+        "--skip-load",
+        action="store_true",
+        help="Skip raw SEC index load step and rebuild from already-loaded SEC raw tables.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output for child commands when supported.",
+    )
+    return parser.parse_args()
+
+
+def build_base_command(project_root: Path, script_rel: str, db_path: str | None, verbose: bool) -> list[str]:
+    cmd = [sys.executable, str(project_root / script_rel)]
+    if db_path:
+        cmd.extend(["--db-path", db_path])
+    if verbose:
+        cmd.append("--verbose")
+    return cmd
+
+
+def run_step(name: str, cmd: list[str], project_root: Path) -> None:
+    completed = subprocess.run(cmd, cwd=project_root, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(f"Step failed: {name} (exit={completed.returncode})")
+
+
+def main() -> None:
+    args = parse_args()
+    project_root = Path(args.project_root).resolve()
+
+    steps: list[tuple[str, list[str]]] = []
+
+    if not args.skip_load:
+        load_cmd = build_base_command(
+            project_root,
+            "cli/raw/load_sec_filing_raw_index.py",
+            args.db_path,
+            args.verbose,
+        )
+        for src in args.sec_sources:
+            load_cmd.extend(["--source", str(Path(src).expanduser().resolve())])
+        steps.append(("load_sec_filing_raw_index", load_cmd))
+
+    build_sec_cmd = build_base_command(
+        project_root,
+        "cli/core/build_sec_filings.py",
+        args.db_path,
+        args.verbose,
+    )
+    steps.append(("build_sec_filings", build_sec_cmd))
+
+    build_fund_cmd = build_base_command(
+        project_root,
+        "cli/core/build_fundamentals.py",
+        args.db_path,
+        args.verbose,
+    )
+    steps.append(("build_fundamentals", build_fund_cmd))
+
+    status_cmd = build_base_command(
+        project_root,
+        "cli/pipeline_status.py",
+        args.db_path,
+        False,
+    )
+    steps.append(("pipeline_status", status_cmd))
+
+    print("===== RUN SEC + FUNDAMENTALS DAILY START =====", flush=True)
+    print(f"PROJECT ROOT: {project_root}", flush=True)
+    print(f"DB PATH: {args.db_path or '(default)'}", flush=True)
+    print(f"SEC SOURCES: {len(args.sec_sources)}", flush=True)
+    print(f"SKIP LOAD: {args.skip_load}", flush=True)
+
+    for name, cmd in tqdm(steps, desc="sec fundamentals daily", unit="step", dynamic_ncols=True):
+        print(f"\n===== RUN STEP: {name} =====", flush=True)
+        print("COMMAND:", " ".join(cmd), flush=True)
+        run_step(name, cmd, project_root)
+        print(f"===== STEP OK: {name} =====", flush=True)
+
+    print("\n===== RUN SEC + FUNDAMENTALS DAILY DONE =====", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+===== SHOW build_fundamentals =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.fundamentals_schema import FundamentalsSchemaManager
+from stock_quant.infrastructure.db.sec_schema import SecSchemaManager
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+from stock_quant.infrastructure.repositories.duckdb_fundamentals_repository import (
+    DuckDbFundamentalsRepository,
+)
+from stock_quant.pipelines.build_fundamentals_pipeline import BuildFundamentalsPipeline
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse les arguments CLI.
+
+    Ce point d'entrée reste volontairement mince :
+    - préparation config
+    - validation / initialisation schéma
+    - injection repository
+    - exécution du pipeline
+    """
+    parser = argparse.ArgumentParser(
+        description="Build fundamentals snapshots and daily features from normalized SEC data."
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Path to DuckDB database file.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    """
+    Exécute la construction des fondamentaux.
+
+    Préconditions métier :
+    - les tables SEC de base doivent exister
+    - `sec_filing` et les faits normalisés doivent déjà être disponibles
+    """
+    args = parse_args()
+
+    config = build_app_config(db_path=args.db_path)
+    config.ensure_directories()
+
+    if args.verbose:
+        print(f"[build_fundamentals] project_root={config.project_root}")
+        print(f"[build_fundamentals] db_path={config.db_path}")
+
+    session_factory = DuckDbSessionFactory(config.db_path)
+
+    with DuckDbUnitOfWork(session_factory) as uow:
+        # ------------------------------------------------------------------
+        # On s'assure que les schémas nécessaires existent avant le build.
+        # ------------------------------------------------------------------
+        SecSchemaManager(uow).initialize()
+        FundamentalsSchemaManager(uow).initialize()
+
+        if uow.connection is None:
+            raise RuntimeError("missing active DB connection")
+
+        repository = DuckDbFundamentalsRepository(uow.connection)
+        pipeline = BuildFundamentalsPipeline(repository=repository)
+        result = pipeline.run()
+
+    print(json.dumps(result.summary_dict(), indent=2, sort_keys=True))
+    return 0 if result.status.value == "SUCCESS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+===== DONE =====
