@@ -1,0 +1,2194 @@
+===== DATE =====
+Mon 16 Mar 2026 04:15:13 PM EDT
+===== SHOW PRICE CORE CLI =====
+
+===== FILE: cli/core/build_prices.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict, dataclass
+from datetime import date
+from typing import Iterable
+
+import pandas as pd
+
+from stock_quant.app.orchestrators.price_daily_refresh_orchestrator import PriceDailyRefreshOrchestrator
+from stock_quant.app.services.price_ingestion_service import PriceIngestionService
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaManager
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+from stock_quant.infrastructure.providers.prices.historical_price_provider import HistoricalPriceProvider
+from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
+from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
+from stock_quant.pipelines.prices_pipeline import PricesPipeline
+from stock_quant.shared.exceptions import PipelineError, ServiceError
+
+
+@dataclass(slots=True)
+class LegacyBuildPricesResult:
+    raw_bars: int
+    allowed_symbols: int
+    written_price_history_rows: int
+    price_latest_rows_after_refresh: int
+    skipped_not_in_universe: int
+    skipped_invalid: int
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build price_history and price_latest from staged raw prices or incremental providers."
+    )
+    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
+    parser.add_argument("--mode", default="daily", choices=["daily", "backfill"], help="Price build mode.")
+    parser.add_argument(
+        "--historical-source",
+        action="append",
+        default=[],
+        help="Historical source path(s). Repeat for multiple CSV/ZIP/directories when mode=backfill.",
+    )
+    parser.add_argument(
+        "--symbol",
+        action="append",
+        dest="symbols",
+        default=[],
+        help="Optional symbol filter. Repeat for multiple symbols.",
+    )
+    parser.add_argument("--start-date", default=None, help="Optional start date (YYYY-MM-DD).")
+    parser.add_argument("--end-date", default=None, help="Optional end date (YYYY-MM-DD).")
+    parser.add_argument("--as-of", default=None, help="Optional single target date (YYYY-MM-DD) for daily mode.")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
+    return parser.parse_args()
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if value is None or not str(value).strip():
+        return None
+    return date.fromisoformat(str(value).strip())
+
+
+def _normalize_symbols(values: Iterable[str] | None) -> list[str]:
+    return sorted({str(v).strip().upper() for v in (values or []) if v is not None and str(v).strip()})
+
+
+class ProviderFrameAdapter:
+    """
+    Adapte les providers orientés DataFrame au contrat attendu par PriceIngestionService.
+    """
+
+    def __init__(self, provider, mode: str) -> None:
+        self._provider = provider
+        self._mode = mode
+
+    def fetch_prices(self, symbols: list[str], start_date: str | None, end_date: str | None) -> pd.DataFrame:
+        if self._mode == "daily":
+            as_of = _parse_iso_date(end_date or start_date)
+            frame_method = getattr(self._provider, "fetch_daily_prices_frame", None)
+            if callable(frame_method):
+                return frame_method(symbols=symbols, as_of=as_of)
+            raise ServiceError("daily provider does not support fetch_daily_prices_frame")
+
+        start = _parse_iso_date(start_date)
+        end = _parse_iso_date(end_date)
+        frame_method = getattr(self._provider, "fetch_history_frame", None)
+        if callable(frame_method):
+            return frame_method(symbols=symbols, start_date=start, end_date=end)
+        raise ServiceError("historical provider does not support fetch_history_frame")
+
+
+def _count_staged_raw_rows(repository: DuckDbPriceRepository) -> int:
+    try:
+        return len(repository.load_raw_price_bars())
+    except Exception:
+        return 0
+
+
+def _run_legacy_sql_first_build(
+    repository: DuckDbPriceRepository,
+    *,
+    requested_symbols: list[str],
+) -> LegacyBuildPricesResult:
+    """
+    Chemin SQL-first historique:
+    - lit price_source_daily_raw déjà chargé
+    - filtre avec les symboles inclus
+    - normalise via PriceIngestionService.build(...)
+    - persiste dans price_history / price_latest
+    """
+    raw_bars = repository.load_raw_price_bars()
+    if not raw_bars:
+        raise PipelineError("no raw price bars available in price_source_daily_raw")
+
+    allowed_symbols = repository.load_included_symbols()
+    if requested_symbols:
+        allowed_symbols = {symbol for symbol in allowed_symbols if symbol in set(requested_symbols)}
+
+    service = PriceIngestionService()
+    normalized_entries, metrics = service.build(
+        raw_bars,
+        allowed_symbols=allowed_symbols,
+    )
+
+    written_rows = repository.replace_price_history(normalized_entries)
+    latest_rows = repository.rebuild_price_latest()
+
+    return LegacyBuildPricesResult(
+        raw_bars=int(metrics.get("raw_bars", 0)),
+        allowed_symbols=len(allowed_symbols),
+        written_price_history_rows=written_rows,
+        price_latest_rows_after_refresh=latest_rows,
+        skipped_not_in_universe=int(metrics.get("skipped_not_in_universe", 0)),
+        skipped_invalid=int(metrics.get("skipped_invalid", 0)),
+    )
+
+
+def _run_incremental_build(
+    repository: DuckDbPriceRepository,
+    *,
+    mode: str,
+    historical_source: list[str],
+    requested_symbols: list[str],
+    start_date: str | None,
+    end_date: str | None,
+):
+    """
+    Chemin incrémental moderne:
+    - backfill via HistoricalPriceProvider
+    - daily via YfinancePriceProvider
+    """
+    if mode == "backfill":
+        if not historical_source:
+            raise PipelineError("--historical-source is required when --mode=backfill")
+        provider = HistoricalPriceProvider(source_paths=historical_source)
+        adapter = ProviderFrameAdapter(provider=provider, mode="backfill")
+    else:
+        provider = YfinancePriceProvider()
+        adapter = ProviderFrameAdapter(provider=provider, mode="daily")
+
+    service = PriceIngestionService(
+        price_repository=repository,
+        historical_price_provider=adapter,
+    )
+    pipeline = PricesPipeline(price_ingestion_service=service)
+    orchestrator = PriceDailyRefreshOrchestrator(prices_pipeline=pipeline)
+
+    return orchestrator.run_daily_refresh(
+        symbols=requested_symbols or None,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    config = build_app_config(db_path=args.db_path)
+    config.ensure_directories()
+
+    if args.verbose:
+        print(f"[build_prices] project_root={config.project_root}")
+        print(f"[build_prices] db_path={config.db_path}")
+        print(f"[build_prices] mode={args.mode}")
+        print(f"[build_prices] historical_source_count={len(args.historical_source)}")
+        print(f"[build_prices] symbols_count={len(args.symbols)}")
+
+    start_date = args.start_date
+    end_date = args.end_date
+    if args.mode == "daily" and args.as_of:
+        start_date = args.as_of
+        end_date = args.as_of
+
+    requested_symbols = _normalize_symbols(args.symbols)
+    session_factory = DuckDbSessionFactory(config.db_path)
+
+    # Pass 1: évolution / validation de schéma
+    with DuckDbUnitOfWork(session_factory) as uow:
+        MasterDataSchemaManager(uow).initialize()
+
+    # Pass 2: build réel
+    with DuckDbUnitOfWork(session_factory) as uow:
+        repository = DuckDbPriceRepository(uow.connection)
+
+        staged_raw_rows = _count_staged_raw_rows(repository)
+        use_sql_first_staging = args.mode == "daily" and staged_raw_rows > 0
+
+        if args.verbose:
+            print(f"[build_prices] staged_raw_rows={staged_raw_rows}")
+            print(f"[build_prices] path={'sql_first_staging' if use_sql_first_staging else 'incremental_provider'}")
+
+        if use_sql_first_staging:
+            result = _run_legacy_sql_first_build(
+                repository,
+                requested_symbols=requested_symbols,
+            )
+            payload = {
+                "status": "SUCCESS",
+                "mode": args.mode,
+                "path": "sql_first_staging",
+                **asdict(result),
+            }
+        else:
+            result = _run_incremental_build(
+                repository,
+                mode=args.mode,
+                historical_source=args.historical_source,
+                requested_symbols=requested_symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            payload = {
+                "status": "SUCCESS",
+                "mode": args.mode,
+                "path": "incremental_provider",
+                "requested_symbols": result.requested_symbols,
+                "fetched_symbols": result.fetched_symbols,
+                "written_price_history_rows": result.written_price_history_rows,
+                "price_latest_rows_after_refresh": result.price_latest_rows_after_refresh,
+                "start_date": result.start_date,
+                "end_date": result.end_date,
+            }
+
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (PipelineError, ServiceError) as exc:
+        print(json.dumps({"status": "FAILED", "error": str(exc)}, indent=2, sort_keys=True))
+        raise SystemExit(1)
+
+===== FILE: cli/ops/run_price_daily_refresh.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the daily price refresh pipeline directly through the new incremental OOP build_prices flow."
+    )
+    parser.add_argument(
+        "--project-root",
+        default=str(Path(__file__).resolve().parents[2]),
+        help="Project root directory.",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Optional DuckDB path passed to child steps.",
+    )
+    parser.add_argument(
+        "--symbol",
+        action="append",
+        dest="symbols",
+        default=[],
+        help="Optional symbol filter. Repeat for multiple symbols.",
+    )
+    parser.add_argument(
+        "--as-of",
+        default=None,
+        help="Optional single target date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="Optional start date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="Optional end date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output for child commands when supported.",
+    )
+    return parser.parse_args()
+
+
+def build_base_command(project_root: Path, script_name: str, db_path: str | None, verbose: bool) -> list[str]:
+    cmd = [sys.executable, str(project_root / "cli" / script_name)]
+    if db_path:
+        cmd.extend(["--db-path", db_path])
+    if verbose:
+        cmd.append("--verbose")
+    return cmd
+
+
+def run_step(name: str, cmd: list[str], project_root: Path) -> None:
+    completed = subprocess.run(cmd, cwd=project_root, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(f"Step failed: {name} (exit={completed.returncode})")
+
+
+def main() -> None:
+    args = parse_args()
+    project_root = Path(args.project_root).resolve()
+
+    steps: list[tuple[str, list[str]]] = []
+
+    build_cmd = build_base_command(
+        project_root,
+        "build_prices.py",
+        args.db_path,
+        args.verbose,
+    )
+    build_cmd.extend(["--mode", "daily"])
+
+    for symbol in args.symbols:
+        build_cmd.extend(["--symbol", symbol])
+
+    if args.as_of:
+        build_cmd.extend(["--as-of", args.as_of])
+    else:
+        if args.start_date:
+            build_cmd.extend(["--start-date", args.start_date])
+        if args.end_date:
+            build_cmd.extend(["--end-date", args.end_date])
+
+    steps.append(("build_prices_daily_incremental", build_cmd))
+
+    status_cmd = build_base_command(
+        project_root,
+        "pipeline_status.py",
+        args.db_path,
+        False,
+    )
+    steps.append(("pipeline_status", status_cmd))
+
+    print("===== RUN PRICE DAILY REFRESH START =====", flush=True)
+    print(f"PROJECT ROOT: {project_root}", flush=True)
+    print(f"DB PATH: {args.db_path or '(default)'}", flush=True)
+
+    for name, cmd in tqdm(steps, desc="price daily refresh", unit="step", dynamic_ncols=True):
+        print(f"\n===== RUN STEP: {name} =====", flush=True)
+        print("COMMAND:", " ".join(cmd), flush=True)
+        run_step(name, cmd, project_root)
+        print(f"===== STEP OK: {name} =====", flush=True)
+
+    print("\n===== RUN PRICE DAILY REFRESH DONE =====", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+===== FILE: cli/raw/fetch_price_source_daily_raw_yahoo.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import time
+
+import pandas as pd
+import yfinance as yf
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.schema_manager import SchemaManager
+from stock_quant.infrastructure.db.table_names import (
+    MARKET_UNIVERSE,
+    PRICE_LATEST,
+    PRICE_SOURCE_DAILY_RAW_YAHOO,
+)
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--db-path", default=None)
+    p.add_argument("--max-symbols", type=int, default=None)
+    p.add_argument("--sleep", type=float, default=0.5)
+    p.add_argument("--retries", type=int, default=3)
+    p.add_argument("--verbose", action="store_true")
+    return p.parse_args()
+
+
+def normalize_download_df(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def main():
+    args = parse_args()
+    config = build_app_config(db_path=args.db_path)
+
+    session_factory = DuckDbSessionFactory(config.db_path)
+
+    inserted = 0
+    skipped = 0
+    errors = 0
+
+    with DuckDbUnitOfWork(session_factory) as uow:
+        schema_manager = SchemaManager(uow)
+        schema_manager.validate()
+
+        con = uow.connection
+        if con is None:
+            raise RuntimeError("missing active connection")
+
+        rows = con.execute(
+            f"""
+            SELECT mu.symbol,
+                   COALESCE(
+                       (SELECT MAX(price_date) FROM {PRICE_SOURCE_DAILY_RAW_YAHOO} y WHERE y.symbol = mu.symbol),
+                       (SELECT MAX(latest_price_date) FROM {PRICE_LATEST} l WHERE l.symbol = mu.symbol)
+                   )
+            FROM {MARKET_UNIVERSE} mu
+            WHERE mu.include_in_universe = TRUE
+            ORDER BY mu.symbol
+            """
+        ).fetchall()
+
+        if args.max_symbols:
+            rows = rows[: args.max_symbols]
+
+        for symbol, last_date in tqdm(rows, desc="fetch yahoo", unit="sym", dynamic_ncols=True):
+            if last_date:
+                start = last_date + dt.timedelta(days=1)
+            else:
+                start = dt.date(1980, 1, 1)
+
+            end = dt.date.today()
+
+            if start > end:
+                skipped += 1
+                continue
+
+            success = False
+
+            for attempt in range(args.retries):
+                try:
+                    df = yf.download(
+                        symbol,
+                        start=start.isoformat(),
+                        end=(end + dt.timedelta(days=1)).isoformat(),
+                        progress=False,
+                        auto_adjust=False,
+                    )
+
+                    df = normalize_download_df(df)
+
+                    if df.empty:
+                        skipped += 1
+                        success = True
+                        break
+
+                    rows_to_insert = []
+
+                    for idx, r in df.iterrows():
+                        try:
+                            open_v = float(r["Open"])
+                            high_v = float(r["High"])
+                            low_v = float(r["Low"])
+                            close_v = float(r["Close"])
+                            vol_v = int(r["Volume"])
+                        except Exception:
+                            continue
+
+                        rows_to_insert.append(
+                            (
+                                symbol,
+                                idx.date(),
+                                open_v,
+                                high_v,
+                                low_v,
+                                close_v,
+                                vol_v,
+                                "yahoo_daily_live",
+                            )
+                        )
+
+                    if not rows_to_insert:
+                        skipped += 1
+                        success = True
+                        break
+
+                    con.execute("DROP TABLE IF EXISTS yahoo_fetch_stage")
+                    con.execute(
+                        """
+                        CREATE TEMP TABLE yahoo_fetch_stage (
+                            symbol VARCHAR,
+                            price_date DATE,
+                            open DOUBLE,
+                            high DOUBLE,
+                            low DOUBLE,
+                            close DOUBLE,
+                            volume BIGINT,
+                            source_name VARCHAR
+                        )
+                        """
+                    )
+
+                    con.executemany(
+                        """
+                        INSERT INTO yahoo_fetch_stage (
+                            symbol,
+                            price_date,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            source_name
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows_to_insert,
+                    )
+
+                    before_count = con.execute(
+                        f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW_YAHOO}"
+                    ).fetchone()[0]
+
+                    con.execute(
+                        f"""
+                        INSERT INTO {PRICE_SOURCE_DAILY_RAW_YAHOO} (
+                            symbol,
+                            price_date,
+                            open,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            source_name,
+                            fetched_at
+                        )
+                        SELECT
+                            s.symbol,
+                            s.price_date,
+                            s.open,
+                            s.high,
+                            s.low,
+                            s.close,
+                            s.volume,
+                            s.source_name,
+                            CURRENT_TIMESTAMP
+                        FROM yahoo_fetch_stage s
+                        LEFT JOIN {PRICE_SOURCE_DAILY_RAW_YAHOO} y
+                          ON y.symbol = s.symbol
+                         AND y.price_date = s.price_date
+                        WHERE y.symbol IS NULL
+                        """
+                    )
+
+                    after_count = con.execute(
+                        f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW_YAHOO}"
+                    ).fetchone()[0]
+
+                    inserted += int(after_count - before_count)
+                    success = True
+                    break
+
+                except Exception:
+                    time.sleep(2 * (attempt + 1))
+
+            if not success:
+                errors += 1
+                if args.verbose:
+                    print(f"fetch error: {symbol}")
+
+            time.sleep(args.sleep)
+
+    print(
+        f"Yahoo fetch summary: inserted_rows={inserted} skipped_symbols={skipped} errors={errors}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+===== FILE: cli/raw/load_price_source_daily_raw_yahoo_csv.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.schema_manager import SchemaManager
+from stock_quant.infrastructure.db.table_names import PRICE_SOURCE_DAILY_RAW_YAHOO
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Load Yahoo daily CSV into price_source_daily_raw_yahoo."
+    )
+    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
+    parser.add_argument(
+        "--csv-path",
+        required=True,
+        help="Path to Yahoo daily CSV.",
+    )
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete existing Yahoo raw rows before load.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    config = build_app_config(db_path=args.db_path)
+    config.ensure_directories()
+
+    csv_path = Path(args.csv_path).expanduser().resolve()
+    if not csv_path.exists():
+        raise SystemExit(f"csv file not found: {csv_path}")
+
+    session_factory = DuckDbSessionFactory(config.db_path)
+
+    with DuckDbUnitOfWork(session_factory) as uow:
+        schema_manager = SchemaManager(uow)
+        schema_manager.validate()
+
+        con = uow.connection
+        if con is None:
+            raise RuntimeError("missing active connection")
+
+        if args.truncate:
+            con.execute(f"DELETE FROM {PRICE_SOURCE_DAILY_RAW_YAHOO}")
+
+        con.execute(
+            f"""
+            CREATE TEMP TABLE yahoo_csv_stage AS
+            SELECT
+                UPPER(TRIM(symbol)) AS symbol,
+                CAST(price_date AS DATE) AS price_date,
+                CAST(open AS DOUBLE) AS open,
+                CAST(high AS DOUBLE) AS high,
+                CAST(low AS DOUBLE) AS low,
+                CAST(close AS DOUBLE) AS close,
+                CAST(volume AS BIGINT) AS volume,
+                COALESCE(NULLIF(TRIM(source_name), ''), 'yahoo_daily') AS source_name
+            FROM read_csv_auto(
+                '{csv_path}',
+                header = true
+            )
+            """
+        )
+
+        con.execute(
+            f"""
+            INSERT INTO {PRICE_SOURCE_DAILY_RAW_YAHOO} (
+                symbol,
+                price_date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source_name,
+                fetched_at
+            )
+            SELECT
+                symbol,
+                price_date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source_name,
+                CURRENT_TIMESTAMP
+            FROM yahoo_csv_stage
+            """
+        )
+
+        total_rows = con.execute(
+            f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW_YAHOO}"
+        ).fetchone()[0]
+
+    if args.verbose:
+        print(f"[load_price_source_daily_raw_yahoo_csv] db_path={config.db_path}")
+        print(f"[load_price_source_daily_raw_yahoo_csv] csv_path={csv_path}")
+        print(f"[load_price_source_daily_raw_yahoo_csv] total_rows={total_rows}")
+
+    print(
+        "Loaded Yahoo daily CSV into price_source_daily_raw_yahoo: "
+        f"total_rows={total_rows} csv_path={csv_path}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+===== FILE: cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.schema_manager import SchemaManager
+from stock_quant.infrastructure.db.table_names import PRICE_SOURCE_DAILY_RAW_ALL
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Load the full Stooq zip archive into price_source_daily_raw_all."
+    )
+    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
+    parser.add_argument(
+        "--zip-path",
+        default="~/stock-quant/data/download/stooq/d_us_txt.zip",
+        help="Path to Stooq zip archive.",
+    )
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete existing bronze price rows before insert.",
+    )
+    parser.add_argument(
+        "--limit-files",
+        type=int,
+        default=0,
+        help="Maximum number of txt files to parse. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--limit-rows",
+        type=int,
+        default=0,
+        help="Maximum number of rows to insert. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--exclude-etfs",
+        action="store_true",
+        help="Skip files under ETF directories.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50000,
+        help="Insert batch size.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output.",
+    )
+    return parser.parse_args()
+
+
+def normalize_symbol(ticker: str) -> str:
+    raw = ticker.strip().upper()
+    if raw.endswith(".US"):
+        raw = raw[:-3]
+    return raw
+
+
+def infer_asset_class(source_path: str) -> str:
+    low = source_path.lower()
+    if "etfs" in low:
+        return "ETF"
+    if "stocks" in low:
+        return "STOCK"
+    return "UNKNOWN"
+
+
+def infer_venue_group(source_path: str) -> str:
+    parts = Path(source_path).parts
+    if len(parts) >= 2:
+        return parts[-2].upper()
+    return "UNKNOWN"
+
+
+def iter_members(zf: zipfile.ZipFile, exclude_etfs: bool) -> list[str]:
+    members = [
+        name
+        for name in zf.namelist()
+        if name.lower().endswith(".txt") and not name.endswith("/")
+    ]
+    if exclude_etfs:
+        members = [name for name in members if "etfs" not in name.lower()]
+    members.sort()
+    return members
+
+
+def parse_member_text(
+    text: str,
+    source_path: str,
+    ingested_at: datetime,
+) -> list[tuple]:
+    rows: list[tuple] = []
+    reader = csv.DictReader(io.StringIO(text))
+    asset_class = infer_asset_class(source_path)
+    venue_group = infer_venue_group(source_path)
+
+    for record in reader:
+        try:
+            period = (record.get("<PER>") or "").strip().upper()
+            if period != "D":
+                continue
+
+            symbol = normalize_symbol(record["<TICKER>"])
+            yyyymmdd = (record["<DATE>"] or "").strip()
+            if len(yyyymmdd) != 8 or not yyyymmdd.isdigit():
+                continue
+
+            price_date = f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+            open_price = float(record["<OPEN>"])
+            high_price = float(record["<HIGH>"])
+            low_price = float(record["<LOW>"])
+            close_price = float(record["<CLOSE>"])
+            volume = int(float(record["<VOL>"]))
+        except Exception:
+            continue
+
+        rows.append(
+            (
+                symbol,
+                price_date,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
+                "stooq_zip_full",
+                source_path,
+                asset_class,
+                venue_group,
+                ingested_at,
+            )
+        )
+    return rows
+
+
+def flush_batch(con, batch: list[tuple]) -> int:
+    if not batch:
+        return 0
+
+    con.executemany(
+        f"""
+        INSERT INTO {PRICE_SOURCE_DAILY_RAW_ALL} (
+            symbol,
+            price_date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            source_name,
+            source_path,
+            asset_class,
+            venue_group,
+            ingested_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        batch,
+    )
+    inserted = len(batch)
+    batch.clear()
+    return inserted
+
+
+def main() -> int:
+    args = parse_args()
+    config = build_app_config(db_path=args.db_path)
+    config.ensure_directories()
+
+    zip_path = Path(args.zip_path).expanduser().resolve()
+    if not zip_path.exists():
+        raise SystemExit(f"zip file not found: {zip_path}")
+
+    now = datetime.utcnow()
+    parsed_files = 0
+    inserted_rows = 0
+    distinct_symbols: set[str] = set()
+    batch: list[tuple] = []
+
+    session_factory = DuckDbSessionFactory(config.db_path)
+
+    with DuckDbUnitOfWork(session_factory) as uow:
+        schema_manager = SchemaManager(uow)
+        schema_manager.validate()
+
+        con = uow.connection
+        if con is None:
+            raise RuntimeError("missing active connection")
+
+        if args.truncate:
+            con.execute(f"DELETE FROM {PRICE_SOURCE_DAILY_RAW_ALL}")
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            members = iter_members(zf, exclude_etfs=args.exclude_etfs)
+            if args.limit_files > 0:
+                members = members[:args.limit_files]
+
+            for member in tqdm(members, desc="stooq bronze files", unit="file", dynamic_ncols=True):
+                try:
+                    text = zf.read(member).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                rows = parse_member_text(text, source_path=member, ingested_at=now)
+                if not rows:
+                    continue
+
+                if args.limit_rows > 0:
+                    remaining = args.limit_rows - inserted_rows - len(batch)
+                    if remaining <= 0:
+                        break
+                    rows = rows[:remaining]
+
+                for row in rows:
+                    batch.append(row)
+                    distinct_symbols.add(row[0])
+
+                parsed_files += 1
+
+                if len(batch) >= args.batch_size:
+                    inserted_rows += flush_batch(con, batch)
+
+                if args.limit_rows > 0 and inserted_rows >= args.limit_rows:
+                    break
+
+            inserted_rows += flush_batch(con, batch)
+
+        total_rows = con.execute(f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW_ALL}").fetchone()[0]
+
+    if args.verbose:
+        print(f"[load_price_source_daily_raw_all_from_stooq_zip] db_path={config.db_path}")
+        print(f"[load_price_source_daily_raw_all_from_stooq_zip] zip_path={zip_path}")
+        print(f"[load_price_source_daily_raw_all_from_stooq_zip] parsed_files={parsed_files}")
+        print(f"[load_price_source_daily_raw_all_from_stooq_zip] distinct_symbols={len(distinct_symbols)}")
+        print(f"[load_price_source_daily_raw_all_from_stooq_zip] inserted_rows={inserted_rows}")
+        print(f"[load_price_source_daily_raw_all_from_stooq_zip] total_rows={total_rows}")
+
+    print(
+        "Loaded price_source_daily_raw_all from full Stooq zip: "
+        f"parsed_files={parsed_files} distinct_symbols={len(distinct_symbols)} "
+        f"inserted_rows={inserted_rows} total_rows={total_rows}"
+    )
+
+===== FILE: cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+# =============================================================================
+# load_price_source_daily_raw_all_from_stooq_dir.py
+#
+# Objectif
+# --------
+# Charger l'historique complet Stooq déjà décompressé depuis le disque vers la
+# table bronze `price_source_daily_raw_all`.
+#
+# Cette version est adaptée au layout réel du projet:
+#   ~/stock-quant-oop/data/raw/stooq/daily/us
+#
+# Pourquoi ce script existe
+# -------------------------
+# Le zip Stooq a déjà été extrait sur disque. On veut donc:
+# - éviter de relire le zip si les fichiers txt sont déjà présents
+# - garder une ingestion "prod-only"
+# - pousser un maximum de logique en SQL / DuckDB
+# - conserver Python mince: découverte fichiers + parsing texte simple +
+#   batching des inserts
+#
+# Philosophie SQL-first
+# ---------------------
+# On n'essaie pas ici de faire trop "d'intelligence métier" en Python.
+# Python:
+# - découvre les fichiers
+# - parse chaque fichier texte Stooq
+# - accumule des batches
+# - insert dans DuckDB
+#
+# DuckDB / étapes aval:
+# - filtrage effectif
+# - déduplication
+# - construction price_history / price_latest
+#
+# Notes importantes
+# -----------------
+# - Aucun fixture.
+# - Aucun fallback vers un ancien dossier stock-quant.
+# - On travaille uniquement avec le layout stock-quant-oop.
+# - Les symboles Stooq sont normalisés en uppercase sans suffixe ".US".
+# - Les fichiers ETF peuvent être exclus avec --exclude-etfs.
+#
+# Format Stooq attendu
+# --------------------
+# Les fichiers contiennent habituellement des colonnes comme:
+#   <TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>
+#
+# On ne garde que:
+# - périodes journalières (<PER> == D)
+# - OHLCV
+#
+# Très commenté volontairement pour faciliter la maintenance par d'autres
+# développeurs.
+# =============================================================================
+
+import argparse
+import csv
+import io
+from datetime import datetime
+from pathlib import Path
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.schema_manager import SchemaManager
+from stock_quant.infrastructure.db.table_names import PRICE_SOURCE_DAILY_RAW_ALL
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
+try:
+    from tqdm import tqdm
+except Exception:
+    # Fallback très léger si tqdm n'est pas disponible.
+    # On garde la même signature minimale pour éviter de casser le script.
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+# -----------------------------------------------------------------------------
+# Helpers de parsing / arguments
+# -----------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    """
+    Parse les arguments CLI.
+
+    Points importants:
+    - --root-dir pointe par défaut sur le nouveau layout réel du projet.
+    - --truncate efface uniquement la table bronze cible.
+    - --limit-files et --limit-rows servent surtout au probe / debug.
+    - --batch-size permet de contrôler le compromis mémoire / vitesse.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Load the full extracted Stooq directory into price_source_daily_raw_all "
+            "using the real stock-quant-oop raw directory layout."
+        )
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Path to DuckDB database file.",
+    )
+    parser.add_argument(
+        "--root-dir",
+        default="~/stock-quant-oop/data/raw/stooq/daily/us",
+        help="Extracted Stooq root directory.",
+    )
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete existing bronze price rows before insert.",
+    )
+    parser.add_argument(
+        "--limit-files",
+        type=int,
+        default=0,
+        help="Maximum number of txt files to parse. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--limit-rows",
+        type=int,
+        default=0,
+        help="Maximum number of rows to insert. 0 means no limit.",
+    )
+    parser.add_argument(
+        "--exclude-etfs",
+        action="store_true",
+        help="Skip files under ETF directories.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50000,
+        help="Insert batch size.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output.",
+    )
+    return parser.parse_args()
+
+
+# -----------------------------------------------------------------------------
+# Helpers de normalisation
+# -----------------------------------------------------------------------------
+def normalize_symbol(ticker: str) -> str:
+    """
+    Convertit un ticker Stooq vers le format canonique interne.
+
+    Exemples:
+    - 'aapl.us' -> 'AAPL'
+    - 'msft'    -> 'MSFT'
+
+    Pourquoi:
+    - stabiliser les jointures futures
+    - éviter les doublons liés à la casse
+    """
+    raw = ticker.strip().upper()
+    if raw.endswith(".US"):
+        raw = raw[:-3]
+    return raw
+
+
+def infer_asset_class(source_path: str) -> str:
+    """
+    Déduit une classe d'actif grossière depuis le chemin source.
+
+    Exemple:
+    - '.../nasdaq etfs/spy.us.txt'   -> ETF
+    - '.../nyse stocks/ko.us.txt'    -> STOCK
+
+    Cette information bronze est utile pour les étapes aval sans avoir à
+    reparcourir l'arborescence d'origine.
+    """
+    low = source_path.lower()
+    if "etfs" in low:
+        return "ETF"
+    if "stocks" in low:
+        return "STOCK"
+    return "UNKNOWN"
+
+
+def infer_venue_group(source_path: str) -> str:
+    """
+    Déduit le groupe de marché depuis le parent du fichier.
+
+    Exemple:
+    - .../nasdaq stocks/aapl.us.txt   -> NASDAQ STOCKS
+    - .../nyse etfs/spy.us.txt        -> NYSE ETFS
+
+    On garde volontairement une logique simple et explicite.
+    """
+    parent = Path(source_path).parent.name.strip()
+    return parent.upper() if parent else "UNKNOWN"
+
+
+# -----------------------------------------------------------------------------
+# Découverte des fichiers
+# -----------------------------------------------------------------------------
+def iter_txt_files(root_dir: Path, exclude_etfs: bool) -> list[Path]:
+    """
+    Retourne tous les fichiers Stooq .txt sous root_dir.
+
+    Règles:
+    - parcours récursif
+    - tri stable pour reproductibilité
+    - exclusion optionnelle des ETF
+    """
+    files = [p for p in root_dir.rglob("*.txt") if p.is_file()]
+    files.sort()
+
+    if exclude_etfs:
+        files = [p for p in files if "etfs" not in str(p).lower()]
+
+    return files
+
+
+# -----------------------------------------------------------------------------
+# Parsing d'un fichier texte Stooq
+# -----------------------------------------------------------------------------
+def parse_member_text(
+    text: str,
+    source_path: str,
+    ingested_at: datetime,
+) -> list[tuple]:
+    """
+    Parse le contenu d'un fichier txt Stooq vers des tuples prêts à insérer.
+
+    Colonnes produites pour price_source_daily_raw_all:
+    - symbol
+    - price_date
+    - open
+    - high
+    - low
+    - close
+    - volume
+    - source_name
+    - source_path
+    - asset_class
+    - venue_group
+    - ingested_at
+
+    Stratégie de robustesse:
+    - ignorer les lignes invalides
+    - ne garder que les lignes daily (<PER> == D)
+    - ne pas faire échouer tout le fichier pour une seule ligne corrompue
+    """
+    rows: list[tuple] = []
+
+    reader = csv.DictReader(io.StringIO(text))
+    asset_class = infer_asset_class(source_path)
+    venue_group = infer_venue_group(source_path)
+
+    for record in reader:
+        try:
+            # On ne conserve que les séries journalières.
+            period = (record.get("<PER>") or "").strip().upper()
+            if period != "D":
+
+===== FILE: cli/raw/rebuild_price_source_daily_raw_effective.py =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
+from stock_quant.infrastructure.db.schema_manager import SchemaManager
+from stock_quant.infrastructure.db.table_names import (
+    MARKET_UNIVERSE,
+    PRICE_SOURCE_DAILY_RAW,
+    PRICE_SOURCE_DAILY_RAW_ALL,
+    PRICE_SOURCE_DAILY_RAW_YAHOO,
+)
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rebuild effective price_source_daily_raw from Stooq bronze + Yahoo daily raw, with Yahoo priority."
+    )
+    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
+    parser.add_argument(
+        "--truncate",
+        action="store_true",
+        help="Delete existing effective staging rows before rebuild.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    config = build_app_config(db_path=args.db_path)
+    config.ensure_directories()
+
+    session_factory = DuckDbSessionFactory(config.db_path)
+
+    with DuckDbUnitOfWork(session_factory) as uow:
+        schema_manager = SchemaManager(uow)
+        schema_manager.validate()
+
+        con = uow.connection
+        if con is None:
+            raise RuntimeError("missing active connection")
+
+        bronze_rows = con.execute(
+            f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW_ALL}"
+        ).fetchone()[0]
+
+        yahoo_rows = con.execute(
+            f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW_YAHOO}"
+        ).fetchone()[0]
+
+        included_symbols = con.execute(
+            f"SELECT COUNT(*) FROM {MARKET_UNIVERSE} WHERE include_in_universe = TRUE"
+        ).fetchone()[0]
+
+        if args.truncate:
+            con.execute(f"DELETE FROM {PRICE_SOURCE_DAILY_RAW}")
+
+        con.execute(
+            f"""
+            INSERT INTO {PRICE_SOURCE_DAILY_RAW} (
+                symbol,
+                price_date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source_name,
+                ingested_at
+            )
+            WITH stooq_filtered AS (
+                SELECT
+                    a.symbol,
+                    a.price_date,
+                    a.open,
+                    a.high,
+                    a.low,
+                    a.close,
+                    a.volume,
+                    a.source_name,
+                    a.ingested_at AS effective_ts,
+                    1 AS source_priority,
+                    a.source_path AS source_tiebreak
+                FROM {PRICE_SOURCE_DAILY_RAW_ALL} a
+                INNER JOIN {MARKET_UNIVERSE} mu
+                    ON a.symbol = mu.symbol
+                WHERE mu.include_in_universe = TRUE
+            ),
+            yahoo_filtered AS (
+                SELECT
+                    y.symbol,
+                    y.price_date,
+                    y.open,
+                    y.high,
+                    y.low,
+                    y.close,
+                    y.volume,
+                    COALESCE(y.source_name, 'yahoo_daily') AS source_name,
+                    y.fetched_at AS effective_ts,
+                    2 AS source_priority,
+                    'yahoo' AS source_tiebreak
+                FROM {PRICE_SOURCE_DAILY_RAW_YAHOO} y
+                INNER JOIN {MARKET_UNIVERSE} mu
+                    ON y.symbol = mu.symbol
+                WHERE mu.include_in_universe = TRUE
+            ),
+            unioned AS (
+                SELECT * FROM stooq_filtered
+                UNION ALL
+                SELECT * FROM yahoo_filtered
+            ),
+            ranked AS (
+                SELECT
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    source_name,
+                    effective_ts,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol, price_date
+                        ORDER BY
+                            source_priority DESC,
+                            effective_ts DESC,
+                            source_tiebreak DESC
+                    ) AS rn
+                FROM unioned
+            )
+            SELECT
+                symbol,
+                price_date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source_name,
+                effective_ts AS ingested_at
+            FROM ranked
+            WHERE rn = 1
+            """
+        )
+
+        effective_rows = con.execute(
+            f"SELECT COUNT(*) FROM {PRICE_SOURCE_DAILY_RAW}"
+        ).fetchone()[0]
+
+        yahoo_wins = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {PRICE_SOURCE_DAILY_RAW}
+            WHERE source_name LIKE 'yahoo%'
+            """
+        ).fetchone()[0]
+
+    if args.verbose:
+        print(f"[rebuild_price_source_daily_raw_effective] db_path={config.db_path}")
+        print(f"[rebuild_price_source_daily_raw_effective] bronze_rows={bronze_rows}")
+        print(f"[rebuild_price_source_daily_raw_effective] yahoo_rows={yahoo_rows}")
+        print(f"[rebuild_price_source_daily_raw_effective] included_symbols={included_symbols}")
+        print(f"[rebuild_price_source_daily_raw_effective] effective_rows={effective_rows}")
+        print(f"[rebuild_price_source_daily_raw_effective] yahoo_selected_rows={yahoo_wins}")
+
+    print(
+        "Rebuilt effective price_source_daily_raw: "
+        f"bronze_rows={bronze_rows} yahoo_rows={yahoo_rows} "
+        f"included_symbols={included_symbols} effective_rows={effective_rows} "
+        f"yahoo_selected_rows={yahoo_wins}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+===== SHOW PRICE PIPELINES =====
+
+===== FILE: stock_quant/pipelines/build_prices_pipeline.py =====
+from __future__ import annotations
+
+from stock_quant.app.dto.pipeline_result import PipelineResult
+from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+from stock_quant.pipelines.base_pipeline import BasePipeline
+from stock_quant.shared.exceptions import PipelineError
+
+
+class BuildPricesResearchPipeline(BasePipeline):
+    pipeline_name = "build_prices_research"
+
+    def __init__(self, repository=None, uow: DuckDbUnitOfWork | None = None) -> None:
+        if repository is not None:
+            self.uow = repository.uow
+        else:
+            self.uow = uow
+
+        if self.uow is None:
+            raise ValueError("BuildPricesResearchPipeline requires repository or uow")
+
+        self._metrics: dict[str, int] = {}
+        self._rows_written = 0
+
+    @property
+    def con(self):
+        if self.uow.connection is None:
+            raise PipelineError("active DB connection is required")
+        return self.uow.connection
+
+    def extract(self):
+        return None
+
+    def transform(self, data):
+        return None
+
+    def validate(self, data) -> None:
+        count = self.con.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+        if int(count) == 0:
+            raise PipelineError("no price_history rows available")
+
+    def load(self, data) -> None:
+        con = self.con
+
+        input_price_rows = int(con.execute("SELECT COUNT(*) FROM price_history").fetchone()[0])
+
+        con.execute("DELETE FROM price_bars_unadjusted")
+        con.execute("DELETE FROM price_bars_adjusted")
+        con.execute("DELETE FROM price_quality_flags")
+
+        con.execute("DROP TABLE IF EXISTS tmp_prices_research_base")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_prices_research_base AS
+            SELECT
+                im.instrument_id,
+                ph.symbol,
+                ph.price_date AS bar_date,
+                CAST(ph.open AS DOUBLE) AS open,
+                CAST(ph.high AS DOUBLE) AS high,
+                CAST(ph.low AS DOUBLE) AS low,
+                CAST(ph.close AS DOUBLE) AS close,
+                CAST(ph.volume AS BIGINT) AS volume,
+                ph.source_name
+            FROM price_history ph
+            INNER JOIN instrument_master im
+              ON UPPER(TRIM(ph.symbol)) = UPPER(TRIM(im.symbol))
+            ORDER BY im.instrument_id, ph.price_date
+            """
+        )
+
+        missing_instrument_map = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM price_history ph
+                LEFT JOIN instrument_master im
+                  ON UPPER(TRIM(ph.symbol)) = UPPER(TRIM(im.symbol))
+                WHERE im.instrument_id IS NULL
+                """
+            ).fetchone()[0]
+        )
+
+        con.execute(
+            """
+            INSERT INTO price_bars_unadjusted (
+                instrument_id,
+                symbol,
+                bar_date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source_name,
+                created_at
+            )
+            SELECT
+                instrument_id,
+                symbol,
+                bar_date,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                source_name,
+                CURRENT_TIMESTAMP AS created_at
+            FROM tmp_prices_research_base
+            """
+        )
+
+        unadjusted_rows = int(
+            con.execute("SELECT COUNT(*) FROM price_bars_unadjusted").fetchone()[0]
+        )
+
+        con.execute(
+            """
+            INSERT INTO price_bars_adjusted (
+                instrument_id,
+                symbol,
+                bar_date,
+                adj_open,
+                adj_high,
+                adj_low,
+                adj_close,
+                volume,
+                adjustment_factor,
+                source_name,
+                created_at
+            )
+            SELECT
+                instrument_id,
+                symbol,
+                bar_date,
+                open AS adj_open,
+                high AS adj_high,
+                low AS adj_low,
+                close AS adj_close,
+                volume,
+                1.0 AS adjustment_factor,
+                source_name,
+                CURRENT_TIMESTAMP AS created_at
+            FROM tmp_prices_research_base
+            """
+        )
+
+        adjusted_rows = int(
+            con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0]
+        )
+
+        con.execute(
+            """
+            INSERT INTO price_quality_flags (
+                instrument_id,
+                price_date,
+                flag_type,
+                flag_value,
+                source_name,
+                created_at
+            )
+            SELECT
+                instrument_id,
+                bar_date AS price_date,
+                flag_type,
+                flag_value,
+                source_name,
+                CURRENT_TIMESTAMP AS created_at
+            FROM (
+                SELECT
+                    instrument_id,
+                    bar_date,
+                    source_name,
+                    'non_positive_price' AS flag_type,
+                    'close<=0_or_open<=0_or_high<=0_or_low<=0' AS flag_value
+                FROM tmp_prices_research_base
+                WHERE COALESCE(open, 0) <= 0
+                   OR COALESCE(high, 0) <= 0
+                   OR COALESCE(low, 0) <= 0
+                   OR COALESCE(close, 0) <= 0
+
+                UNION ALL
+
+                SELECT
+                    instrument_id,
+                    bar_date,
+                    source_name,
+                    'invalid_ohlc_range' AS flag_type,
+                    'high<low_or_close_outside_range_or_open_outside_range' AS flag_value
+                FROM tmp_prices_research_base
+                WHERE high < low
+                   OR close < low
+                   OR close > high
+                   OR open < low
+                   OR open > high
+
+                UNION ALL
+
+                SELECT
+                    instrument_id,
+                    bar_date,
+                    source_name,
+                    'negative_volume' AS flag_type,
+                    'volume<0' AS flag_value
+                FROM tmp_prices_research_base
+                WHERE COALESCE(volume, 0) < 0
+            ) q
+            """
+        )
+
+        quality_flags = int(
+            con.execute("SELECT COUNT(*) FROM price_quality_flags").fetchone()[0]
+        )
+
+        self._rows_written = unadjusted_rows + adjusted_rows + quality_flags
+        self._metrics = {
+            "input_price_rows": input_price_rows,
+            "missing_instrument_map": missing_instrument_map,
+            "unadjusted_rows": unadjusted_rows,
+            "adjusted_rows": adjusted_rows,
+            "quality_flags": quality_flags,
+            "written_unadjusted": unadjusted_rows,
+            "written_adjusted": adjusted_rows,
+            "written_quality_flags": quality_flags,
+        }
+
+    def finalize(self, result: PipelineResult) -> PipelineResult:
+        result.rows_read = int(self._metrics.get("input_price_rows", 0))
+        result.rows_written = self._rows_written
+        result.metrics.update(self._metrics)
+        return result
+
+===== FILE: stock_quant/pipelines/prices_pipeline.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+from stock_quant.app.services.price_ingestion_service import (
+    PriceIngestionResult,
+    PriceIngestionService,
+)
+from stock_quant.shared.exceptions import PipelineError
+
+
+@dataclass(slots=True)
+class PricesPipelineResult:
+    requested_symbols: int
+    fetched_symbols: int
+    written_price_history_rows: int
+    price_latest_rows_after_refresh: int
+
+
+class PricesPipeline:
+    """
+    Incremental prices pipeline.
+
+    Responsibilities:
+    - delegate ingestion work to PriceIngestionService
+    - expose a stable pipeline-level result object
+    - stay compatible with daily refresh orchestration
+    """
+
+    pipeline_name = "prices_incremental"
+
+    def __init__(self, price_ingestion_service: PriceIngestionService) -> None:
+        self.price_ingestion_service = price_ingestion_service
+
+    def run(
+        self,
+        symbols: Iterable[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> PricesPipelineResult:
+        try:
+            result = self.price_ingestion_service.ingest_incremental(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            return self._to_pipeline_result(result)
+        except Exception as exc:
+            if isinstance(exc, PipelineError):
+                raise
+            raise PipelineError(f"failed to run prices pipeline: {exc}") from exc
+
+    def _to_pipeline_result(self, result: PriceIngestionResult) -> PricesPipelineResult:
+        return PricesPipelineResult(
+            requested_symbols=result.requested_symbols,
+            fetched_symbols=result.fetched_symbols,
+            written_price_history_rows=result.written_price_history_rows,
+            price_latest_rows_after_refresh=result.price_latest_rows_after_refresh,
+        )
+
+===== SHOW PRICE SERVICES =====
+
+===== FILE: stock_quant/app/services/price_ingestion_service.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Iterable
+
+import pandas as pd
+
+from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
+from stock_quant.shared.exceptions import ServiceError
+
+
+@dataclass(slots=True)
+class PriceIngestionResult:
+    requested_symbols: int
+    fetched_symbols: int
+    written_price_history_rows: int
+    price_latest_rows_after_refresh: int
+
+
+class PriceIngestionService:
+    """
+    Dual-surface price service.
+
+    Supported modes:
+    - legacy in-memory build(raw_bars, allowed_symbols=...)
+    - incremental ingest_incremental(...) backed by repository/provider
+    """
+
+    def __init__(self, price_repository=None, historical_price_provider=None) -> None:
+        self.price_repository = price_repository
+        self.historical_price_provider = historical_price_provider
+
+    # ------------------------------------------------------------------
+    # Legacy test-compatible surface
+    # ------------------------------------------------------------------
+
+    def build(
+        self,
+        raw_bars: Iterable[RawPriceBar],
+        *,
+        allowed_symbols: set[str],
+    ) -> tuple[list[PriceBar], dict[str, int]]:
+        normalized_allowed = {self._norm_symbol(s) for s in allowed_symbols if self._norm_symbol(s)}
+        accepted: list[PriceBar] = []
+        metrics = {
+            "raw_bars": 0,
+            "accepted_bars": 0,
+            "skipped_not_in_universe": 0,
+            "skipped_invalid": 0,
+        }
+
+        for raw in raw_bars:
+            metrics["raw_bars"] += 1
+            symbol = self._norm_symbol(getattr(raw, "symbol", None))
+            if not symbol or symbol not in normalized_allowed:
+                metrics["skipped_not_in_universe"] += 1
+                continue
+
+            normalized = self._normalize_raw_bar(raw, symbol=symbol)
+            if normalized is None:
+                metrics["skipped_invalid"] += 1
+                continue
+
+            accepted.append(normalized)
+            metrics["accepted_bars"] += 1
+
+        return accepted, metrics
+
+    def _normalize_raw_bar(self, raw: RawPriceBar, *, symbol: str) -> PriceBar | None:
+        price_date = getattr(raw, "price_date", None)
+        if price_date is None:
+            return None
+
+        close = self._to_float(getattr(raw, "close", None))
+        open_ = self._to_float(getattr(raw, "open", None))
+        high = self._to_float(getattr(raw, "high", None))
+        low = self._to_float(getattr(raw, "low", None))
+        volume = self._to_int(getattr(raw, "volume", None), default=0)
+        source_name = str(getattr(raw, "source_name", "unknown") or "unknown").strip() or "unknown"
+
+        if close is None and any(v is None for v in (open_, high, low)):
+            return None
+
+        if close is None:
+            close = open_ if open_ is not None else high if high is not None else low
+        if close is None:
+            return None
+
+        if open_ is None:
+            open_ = close
+        if high is None:
+            high = close
+        if low is None:
+            low = close
+
+        if high < low:
+            return None
+        if open_ < 0 or high < 0 or low < 0 or close < 0 or volume < 0:
+            return None
+        if high < max(open_, close) or low > min(open_, close):
+            return None
+
+        return PriceBar(
+            symbol=symbol,
+            price_date=price_date,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            source_name=source_name,
+            ingested_at=datetime.utcnow(),
+        )
+
+    # ------------------------------------------------------------------
+    # Incremental repository/provider surface
+    # ------------------------------------------------------------------
+
+    def ingest_incremental(
+        self,
+        symbols: Iterable[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> PriceIngestionResult:
+        if self.price_repository is None or self.historical_price_provider is None:
+            raise ServiceError("price_repository and historical_price_provider are required for incremental ingestion")
+
+        try:
+            allowed_symbols = self._normalize_symbols(self.price_repository.list_allowed_symbols())
+            if not allowed_symbols:
+                raise ServiceError("no allowed symbols available for price ingestion")
+
+            requested_symbols = self._resolve_requested_symbols(
+                allowed_symbols=allowed_symbols,
+                requested_symbols=symbols,
+            )
+            if not requested_symbols:
+                return PriceIngestionResult(
+                    requested_symbols=0,
+                    fetched_symbols=0,
+                    written_price_history_rows=0,
+                    price_latest_rows_after_refresh=self.price_repository.refresh_price_latest([]),
+                )
+
+            raw_frame = self._fetch_prices(
+                symbols=requested_symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            normalized_frame = self._normalize_price_frame(raw_frame)
+
+            touched_symbols = []
+            if not normalized_frame.empty:
+                touched_symbols = sorted(
+                    {
+                        str(symbol).strip().upper()
+                        for symbol in normalized_frame["symbol"].dropna().tolist()
+                        if str(symbol).strip()
+                    }
+                )
+
+            written_rows = self.price_repository.upsert_price_history(normalized_frame)
+            latest_rows_after_refresh = self.price_repository.refresh_price_latest(touched_symbols)
+
+            return PriceIngestionResult(
+                requested_symbols=len(requested_symbols),
+                fetched_symbols=len(touched_symbols),
+                written_price_history_rows=written_rows,
+                price_latest_rows_after_refresh=latest_rows_after_refresh,
+            )
+        except Exception as exc:
+            if isinstance(exc, ServiceError):
+                raise
+            raise ServiceError(f"failed to ingest incremental prices: {exc}") from exc
+
+    def _resolve_requested_symbols(
+        self,
+        allowed_symbols: list[str],
+        requested_symbols: Iterable[str] | None,
+    ) -> list[str]:
+        allowed_set = set(allowed_symbols)
+        if requested_symbols is None:
+            return allowed_symbols
+
+        requested = self._normalize_symbols(requested_symbols)
+        return [symbol for symbol in requested if symbol in allowed_set]
+
+    def _fetch_prices(
+        self,
+        symbols: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ):
+        fetch_method = getattr(self.historical_price_provider, "fetch_prices", None)
+        if callable(fetch_method):
+            return fetch_method(symbols=symbols, start_date=start_date, end_date=end_date)
+
+        fallback_method = getattr(self.historical_price_provider, "fetch", None)
+        if callable(fallback_method):
+            return fallback_method(symbols=symbols, start_date=start_date, end_date=end_date)
+
+        raise ServiceError("historical price provider has no supported fetch method")
+
+    def _normalize_price_frame(self, frame: Any) -> pd.DataFrame:
+        if frame is None:
+            return self._empty_price_frame()
+
+        if isinstance(frame, list):
+            if not frame:
+                return self._empty_price_frame()
+            frame = pd.DataFrame(frame)
+
+        if not isinstance(frame, pd.DataFrame):
+            raise ServiceError(f"unsupported provider frame type: {type(frame)!r}")
+
+        if frame.empty:
+            return self._empty_price_frame()
+
+        normalized = frame.copy()
+        normalized.columns = [str(col).strip() for col in normalized.columns]
+
+        rename_map = {}
+        lower_to_actual = {str(col).strip().lower(): col for col in normalized.columns}
+        for src, dst in {
+            "date": "price_date",
+            "datetime": "price_date",
+            "timestamp": "price_date",
+            "adj close": "close",
+            "adj_close": "close",
+        }.items():
+            if src in lower_to_actual and dst not in normalized.columns:
+                rename_map[lower_to_actual[src]] = dst
+        if rename_map:
+            normalized = normalized.rename(columns=rename_map)
+
+        required = ["symbol", "price_date", "open", "high", "low", "close", "volume"]
+        missing = [name for name in required if name not in normalized.columns]
+        if missing:
+            raise ServiceError(f"provider frame missing required columns: {missing}")
+
+        if "source_name" not in normalized.columns:
+            normalized["source_name"] = "yfinance"
+        if "ingested_at" not in normalized.columns:
+            normalized["ingested_at"] = pd.Timestamp.utcnow()
+
+        normalized["symbol"] = normalized["symbol"].astype(str).str.strip().str.upper()
+        normalized["price_date"] = pd.to_datetime(normalized["price_date"], errors="coerce").dt.date
+        normalized["open"] = pd.to_numeric(normalized["open"], errors="coerce")
+        normalized["high"] = pd.to_numeric(normalized["high"], errors="coerce")
+        normalized["low"] = pd.to_numeric(normalized["low"], errors="coerce")
+        normalized["close"] = pd.to_numeric(normalized["close"], errors="coerce")
+        normalized["volume"] = pd.to_numeric(normalized["volume"], errors="coerce").fillna(0).astype("int64")
+        normalized["source_name"] = normalized["source_name"].astype(str).str.strip().replace("", "yfinance")
+        normalized["ingested_at"] = pd.to_datetime(normalized["ingested_at"], errors="coerce").fillna(pd.Timestamp.utcnow())
+
+        normalized = normalized[
+            ["symbol", "price_date", "open", "high", "low", "close", "volume", "source_name", "ingested_at"]
+        ].dropna(subset=["symbol", "price_date", "open", "high", "low", "close"])
+
+
+===== FILE: stock_quant/app/services/prices_research_service.py =====
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+import pandas as pd
+
+from stock_quant.domain.entities.corporate_action import PriceQualityFlag
+
+
+class PricesResearchService:
+    def build_unadjusted_bars(
+        self,
+        price_history_rows: list[dict[str, Any]],
+        instrument_map: dict[str, str],
+    ) -> tuple[pd.DataFrame, dict[str, int]]:
+        frame = pd.DataFrame(price_history_rows)
+        if frame.empty:
+            return self._empty_price_frame(), {
+                "input_price_rows": 0,
+                "unadjusted_rows": 0,
+                "missing_instrument_map": 0,
+            }
+
+        frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+        frame["instrument_id"] = frame["symbol"].map(instrument_map)
+        missing_instrument_map = int(frame["instrument_id"].isna().sum())
+
+        frame = frame.dropna(subset=["instrument_id"]).copy()
+        if frame.empty:
+            return self._empty_price_frame(), {
+                "input_price_rows": len(price_history_rows),
+                "unadjusted_rows": 0,
+                "missing_instrument_map": missing_instrument_map,
+            }
+
+        frame = frame.rename(columns={"price_date": "bar_date"})
+        frame["source_name"] = frame["source_name"].fillna("unknown").astype(str)
+        frame["created_at"] = datetime.utcnow()
+
+        out = frame.loc[
+            :,
+            [
+                "instrument_id",
+                "symbol",
+                "bar_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "source_name",
+                "created_at",
+            ],
+        ].sort_values(["instrument_id", "bar_date"]).reset_index(drop=True)
+
+        metrics = {
+            "input_price_rows": len(price_history_rows),
+            "unadjusted_rows": len(out),
+            "missing_instrument_map": missing_instrument_map,
+        }
+        return out, metrics
+
+    def build_adjusted_bars(
+        self,
+        unadjusted_bars: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, dict[str, int]]:
+        if unadjusted_bars.empty:
+            return self._empty_adjusted_frame(), {"adjusted_rows": 0}
+
+        out = unadjusted_bars.copy()
+        out["adj_open"] = out["open"]
+        out["adj_high"] = out["high"]
+        out["adj_low"] = out["low"]
+        out["adj_close"] = out["close"]
+        out["adjustment_factor"] = 1.0
+
+        out = out.loc[
+            :,
+            [
+                "instrument_id",
+                "symbol",
+                "bar_date",
+                "adj_open",
+                "adj_high",
+                "adj_low",
+                "adj_close",
+                "volume",
+                "adjustment_factor",
+                "source_name",
+                "created_at",
+            ],
+        ].sort_values(["instrument_id", "bar_date"]).reset_index(drop=True)
+
+        return out, {"adjusted_rows": len(out)}
+
+    def build_quality_flags(
+        self,
+        unadjusted_bars: pd.DataFrame,
+    ) -> tuple[list[PriceQualityFlag], dict[str, int]]:
+        if unadjusted_bars.empty:
+            return [], {"quality_flags": 0}
+
+        flags: list[PriceQualityFlag] = []
+        now = datetime.utcnow()
+
+        for row in unadjusted_bars.itertuples(index=False):
+            if row.high < row.low:
+                flags.append(
+                    PriceQualityFlag(
+                        instrument_id=row.instrument_id,
+                        price_date=row.bar_date,
+                        flag_type="high_below_low",
+                        flag_value="true",
+                        source_name=row.source_name,
+                        created_at=now,
+                    )
+                )
+            if row.volume is not None and int(row.volume) < 0:
+                flags.append(
+                    PriceQualityFlag(
+                        instrument_id=row.instrument_id,
+                        price_date=row.bar_date,
+                        flag_type="negative_volume",
+                        flag_value="true",
+                        source_name=row.source_name,
+                        created_at=now,
+                    )
+                )
+
+        return flags, {"quality_flags": len(flags)}
+
+    def _empty_price_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "instrument_id",
+                "symbol",
+                "bar_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "source_name",
+                "created_at",
+            ]
+        )
+
+    def _empty_adjusted_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "instrument_id",
+                "symbol",
+                "bar_date",
+                "adj_open",
+                "adj_high",
+                "adj_low",
+                "adj_close",
+                "volume",
+                "adjustment_factor",
+                "source_name",
+                "created_at",
+            ]
+        )
+
+===== PRICE TABLE COUNTS =====
+┌────────────────────────────┬───────────┐
+│         table_name         │ row_count │
+│          varchar           │   int64   │
+├────────────────────────────┼───────────┤
+│ price_source_daily_raw     │         0 │
+│ price_source_daily_raw_all │         0 │
+│ price_history              │         0 │
+│ price_latest               │         0 │
+└────────────────────────────┴───────────┘
+
+===== DONE =====
