@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
-from stock_quant.app.services.fundamentals_service import FundamentalsService
+from stock_quant.app.services.sec_filings_service import FundamentalsService
 from stock_quant.infrastructure.repositories.duckdb_fundamentals_repository import DuckDbFundamentalsRepository
 from stock_quant.pipelines.base_pipeline import BasePipeline
 from stock_quant.shared.exceptions import PipelineError

@@ -10,7 +10,7 @@ from stock_quant.infrastructure.db.label_engine_schema import LabelEngineSchemaM
 from stock_quant.infrastructure.db.prices_research_schema import PricesResearchSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_label_engine_repository import DuckDbLabelEngineRepository
-from stock_quant.pipelines.label_engine_pipeline import BuildLabelEnginePipeline
+from stock_quant.pipelines.build_label_engine_pipeline import BuildLabelEnginePipeline
 
 
 def parse_args() -> argparse.Namespace:

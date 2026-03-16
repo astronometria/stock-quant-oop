@@ -7,7 +7,7 @@ import duckdb
 import json
 from datetime import datetime
 
-from stock_quant.pipelines.label_engine_pipeline import run
+from stock_quant.pipelines.build_label_engine_pipeline import run
 
 
 def parse_args() -> argparse.Namespace:

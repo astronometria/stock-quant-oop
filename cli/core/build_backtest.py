@@ -11,7 +11,7 @@ from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFa
 from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_backtest_repository import DuckDbBacktestRepository
-from stock_quant.pipelines.backtest_pipeline import BuildBacktestPipeline
+from stock_quant.pipelines.build_backtest_pipeline import BuildBacktestPipeline
 
 
 def parse_args() -> argparse.Namespace:

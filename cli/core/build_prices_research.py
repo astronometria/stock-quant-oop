@@ -11,7 +11,7 @@ from stock_quant.infrastructure.db.prices_research_schema import PricesResearchS
 from stock_quant.infrastructure.db.schema_manager import SchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_prices_research_repository import DuckDbPricesResearchRepository
-from stock_quant.pipelines.prices_research_pipeline import BuildPricesResearchPipeline
+from stock_quant.pipelines.build_prices_pipeline import BuildPricesResearchPipeline
 
 
 def parse_args() -> argparse.Namespace:

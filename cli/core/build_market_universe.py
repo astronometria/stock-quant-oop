@@ -9,7 +9,7 @@ from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFa
 from stock_quant.infrastructure.db.schema_manager import SchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_universe_repository import DuckDbUniverseRepository
-from stock_quant.pipelines.market_universe_pipeline import BuildMarketUniversePipeline
+from stock_quant.pipelines.build_market_universe_pipeline import BuildMarketUniversePipeline
 
 
 def parse_args() -> argparse.Namespace:

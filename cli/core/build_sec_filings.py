@@ -10,7 +10,7 @@ from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaMan
 from stock_quant.infrastructure.db.sec_schema import SecSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_sec_repository import DuckDbSecRepository
-from stock_quant.pipelines.sec_pipeline import BuildSecFilingPipeline
+from stock_quant.pipelines.build_sec_filings_pipeline import BuildSecFilingPipeline
 from stock_quant.shared.exceptions import PipelineError, RepositoryError
 
 

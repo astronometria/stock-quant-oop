@@ -10,7 +10,7 @@ from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaMan
 from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_short_data_repository import DuckDbShortDataRepository
-from stock_quant.pipelines.short_data_pipeline import BuildShortDataPipeline
+from stock_quant.pipelines.build_short_interest_pipeline import BuildShortDataPipeline
 from stock_quant.shared.exceptions import PipelineError
 
 

@@ -14,7 +14,7 @@ from stock_quant.infrastructure.db.research_universe_schema import ResearchUnive
 from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_feature_engine_repository import DuckDbFeatureEngineRepository
-from stock_quant.pipelines.feature_engine_pipeline import BuildFeatureEnginePipeline
+from stock_quant.pipelines.build_feature_engine_pipeline import BuildFeatureEnginePipeline
 
 
 def parse_args() -> argparse.Namespace:

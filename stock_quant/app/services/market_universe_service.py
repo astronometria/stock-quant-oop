@@ -271,7 +271,7 @@ class ResearchUniverseService:
                     WHEN ru.include_in_research_universe THEN 'included'
                     ELSE COALESCE(ru.exclusion_reason, 'excluded')
                 END AS reason,
-                'research_universe_service' AS source_name
+                'market_universe_service' AS source_name
             FROM research_universe ru
             LEFT JOIN instrument_master im
                 ON UPPER(TRIM(im.symbol)) = UPPER(TRIM(ru.symbol))

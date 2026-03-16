@@ -12,7 +12,7 @@ from stock_quant.infrastructure.db.label_engine_schema import LabelEngineSchemaM
 from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
 from stock_quant.infrastructure.db.research_universe_schema import ResearchUniverseSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.pipelines.dataset_builder_pipeline import BuildDatasetBuilderPipeline
+from stock_quant.pipelines.build_dataset_pipeline import BuildDatasetBuilderPipeline
 
 
 def parse_args() -> argparse.Namespace:

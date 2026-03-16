@@ -10,7 +10,7 @@ from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaMan
 from stock_quant.infrastructure.db.news_intelligence_schema import NewsIntelligenceSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_news_intelligence_repository import DuckDbNewsIntelligenceRepository
-from stock_quant.pipelines.news_intelligence_pipeline import BuildNewsIntelligencePipeline
+from stock_quant.pipelines.build_news_pipeline import BuildNewsIntelligencePipeline
 
 
 def parse_args() -> argparse.Namespace:
