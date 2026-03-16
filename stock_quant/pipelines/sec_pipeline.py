@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+# =============================================================================
+# sec_pipeline.py
+# -----------------------------------------------------------------------------
+# Pipeline de construction de la table sec_filing à partir de sec_filing_raw_index.
+#
+# Correctifs importants:
+# - alignement avec le repository réel
+# - appel à upsert_sec_filings(...) au pluriel
+# - instanciation interne du service pour éviter les divergences d'interface
+# - métriques plus robustes
+# =============================================================================
+
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.app.services.sec_filing_service import SecFilingService
 from stock_quant.infrastructure.repositories.duckdb_sec_repository import DuckDbSecRepository
@@ -31,16 +43,25 @@ class BuildSecFilingPipeline(BasePipeline):
 
     def validate(self, data) -> None:
         filings, metrics = data
+
         if not isinstance(filings, list):
             raise PipelineError("filings must be a list")
+
         if not isinstance(metrics, dict):
             raise PipelineError("metrics must be a dict")
+
         if metrics.get("raw_index_rows", 0) == 0:
             raise PipelineError("no sec_filing_raw_index rows available")
 
     def load(self, data) -> None:
         filings, metrics = data
-        self._rows_written = self.repository.upsert_sec_filing(filings)
+
+        # ---------------------------------------------------------------------
+        # Alignement avec le repository actuel:
+        # - la méthode exposée est upsert_sec_filings(...)
+        # - au pluriel
+        # ---------------------------------------------------------------------
+        self._rows_written = self.repository.upsert_sec_filings(filings)
         self._metrics = dict(metrics)
         self._metrics["written_sec_filing"] = self._rows_written
 
