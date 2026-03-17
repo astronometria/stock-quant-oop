@@ -1,54 +1,38 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Canonical FINRA short interest builder.
+
+This CLI is the only entry point for short interest.
+"""
+
 import argparse
-import json
+from pathlib import Path
 
+from stock_quant.pipelines.build_short_interest_pipeline import BuildShortInterestPipeline
 from stock_quant.app.services.short_interest_service import ShortInterestService
-from stock_quant.infrastructure.config.settings_loader import build_app_config
-from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.repositories.duckdb_short_interest_repository import (
-    DuckDbShortInterestRepository,
-)
-from stock_quant.pipelines.build_finra_short_interest_pipeline import (
-    BuildFinraShortInterestPipeline,
-)
+from stock_quant.infrastructure.repositories.duckdb_short_interest_repository import DuckDbShortInterestRepository
+import duckdb
 
 
-def parse_args():
-
-    parser = argparse.ArgumentParser(
-        description="Build FINRA short interest normalized tables."
-    )
-
-    parser.add_argument("--db-path", default=None)
-
-    parser.add_argument("--verbose", action="store_true")
-
-    return parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Build FINRA short interest (canonical pipeline)")
+    p.add_argument("--db-path", required=True)
+    return p.parse_args()
 
 
-def main():
-
+def main() -> int:
     args = parse_args()
 
-    config = build_app_config(db_path=args.db_path)
+    con = duckdb.connect(Path(args.db_path))
+    repo = DuckDbShortInterestRepository(con)
+    service = ShortInterestService(repository=repo)
+    pipeline = BuildShortInterestPipeline(service=service)
 
-    session_factory = DuckDbSessionFactory(config.db_path)
+    result = pipeline.run()
 
-    with DuckDbUnitOfWork(session_factory) as uow:
-
-        repo = DuckDbShortInterestRepository(uow.connection)
-
-        service = ShortInterestService(repo)
-
-        pipeline = BuildFinraShortInterestPipeline(service)
-
-        result = pipeline.run()
-
-    print(json.dumps(result.__dict__, indent=2))
-
+    print(result.to_json(), flush=True)
     return 0
 
 
