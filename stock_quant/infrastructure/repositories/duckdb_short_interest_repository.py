@@ -18,15 +18,6 @@ from stock_quant.infrastructure.db.table_names import (
 from stock_quant.shared.exceptions import RepositoryError
 
 
-# -----------------------------------------------------------------------------
-# SQL-first repository for FINRA short interest.
-#
-# Important design choice:
-# - raw table stays raw/staging-oriented
-# - history/latest are canonical SQL-derived layers
-# - no Python row-by-row transforms in the canonical path
-# -----------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class ShortInterestBuildState:
     raw_row_count: int
@@ -40,19 +31,16 @@ class ShortInterestBuildState:
 
 class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
     """
-    Canonical SQL-first repository.
+    Repository SQL-first pour FINRA short interest.
 
-    This class intentionally keeps a few legacy abstract-method names implemented
-    so the existing repository port remains satisfiable, while the main pipeline
-    now uses SQL-first methods instead of object-by-object transforms.
+    Notes importantes:
+    - le pipeline canonique utilise surtout les méthodes SQL-first
+    - plusieurs méthodes legacy sont conservées pour satisfaire l'interface
+      abstraite existante et éviter de casser les anciens call sites
     """
 
     def __init__(self, con: Any) -> None:
         self.con = con
-
-    # -------------------------------------------------------------------------
-    # Internal helpers
-    # -------------------------------------------------------------------------
 
     def _require_connection(self):
         if self.con is None:
@@ -61,28 +49,24 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
 
     @staticmethod
     def _scalar_int(value: Any) -> int:
-        if value is None:
-            return 0
-        return int(value)
+        return 0 if value is None else int(value)
 
     @staticmethod
     def _scalar_str_or_none(value: Any) -> str | None:
         if value is None:
             return None
         text = str(value).strip()
-        return text if text else None
+        return text or None
 
-    # -------------------------------------------------------------------------
-    # Legacy / abstract-method compatibility
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Abstract / legacy compatibility methods required by repository port
+    # ------------------------------------------------------------------
 
     def load_included_symbols(self) -> set[str]:
         """
-        Historical-safe symbol probe.
-
-        This method is preserved mainly for compatibility with the abstract port.
-        The SQL-first canonical pipeline does not depend on current-universe
-        filtering for short-interest history construction.
+        Compat legacy method.
+        Le pipeline SQL-first short-interest ne dépend pas de ce filtre,
+        mais l'interface abstraite l'exige encore.
         """
         try:
             con = self._require_connection()
@@ -134,11 +118,8 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
 
     def load_raw_short_interest_records(self) -> list[RawShortInterestRecord]:
         """
-        Compatibility method for older tests / call sites.
-
-        Note:
-        - raw table does NOT reliably store derived columns like days_to_cover
-        - those belong to canonical history/latest and are computed in SQL later
+        Compat legacy method.
+        Charge les lignes raw en objets domaine.
         """
         try:
             con = self._require_connection()
@@ -180,22 +161,30 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
 
     def replace_short_interest_history(self, entries: list[ShortInterestRecord]) -> int:
         """
-        Legacy compatibility path.
-
-        The canonical pipeline should not use this anymore. We keep it working
-        for compatibility, but it is intentionally not the primary code path.
+        Compat legacy method.
         """
         return self.upsert_short_interest_history(entries)
 
     def replace_short_interest_sources(self, entries: list[ShortInterestSourceFile]) -> int:
         """
-        Legacy compatibility path.
+        Compat legacy method.
         """
         return self.upsert_short_interest_sources(entries)
 
-    # -------------------------------------------------------------------------
-    # State probes used by SQL-first pipeline
-    # -------------------------------------------------------------------------
+    def rebuild_short_interest_latest(self) -> int:
+        """
+        Compat legacy method attendu par l'interface abstraite.
+
+        Très important:
+        - c'est précisément cette méthode qui manque dans ton erreur actuelle
+        - on délègue simplement vers la méthode canonique existante
+        """
+        result = self.rebuild_latest_from_history_sql_first()
+        return int(result["latest_rows_after"])
+
+    # ------------------------------------------------------------------
+    # Compact state probes
+    # ------------------------------------------------------------------
 
     def get_raw_row_count(self) -> int:
         try:
@@ -264,9 +253,6 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
             raise RepositoryError(f"failed to get max latest settlement date: {exc}") from exc
 
     def get_build_state(self) -> ShortInterestBuildState:
-        """
-        One compact state object for the pipeline decision layer.
-        """
         return ShortInterestBuildState(
             raw_row_count=self.get_raw_row_count(),
             source_row_count=self.get_source_row_count(),
@@ -277,20 +263,11 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
             max_latest_settlement_date=self.get_max_latest_settlement_date(),
         )
 
-    # -------------------------------------------------------------------------
-    # SQL-first canonical write path
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # SQL-first canonical methods
+    # ------------------------------------------------------------------
 
     def insert_history_from_raw_sql_first(self) -> dict[str, int]:
-        """
-        Canonical SQL-first build from raw -> history.
-
-        Key properties:
-        - vectorized DuckDB SQL only
-        - dedupe inside raw staging by (symbol, settlement_date, source_file)
-        - avoid duplicate reinserts into history
-        - compute derived metrics here, not from raw
-        """
         try:
             con = self._require_connection()
 
@@ -343,7 +320,6 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
                 con.execute("SELECT COUNT(*) FROM tmp_finra_short_interest_history_stage").fetchone()[0]
             )
 
-            # Insert only rows not already present in canonical history.
             con.execute(
                 f"""
                 INSERT INTO {FINRA_SHORT_INTEREST_HISTORY} (
@@ -399,9 +375,6 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
             raise RepositoryError(f"failed to build history from raw in SQL-first mode: {exc}") from exc
 
     def rebuild_latest_from_history_sql_first(self) -> dict[str, int]:
-        """
-        Canonical SQL-first rebuild of latest snapshot from history.
-        """
         try:
             con = self._require_connection()
 
@@ -464,17 +437,11 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
         except Exception as exc:
             raise RepositoryError(f"failed to rebuild latest from history in SQL-first mode: {exc}") from exc
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Service compatibility helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def load_raw(self) -> list[dict[str, Any]]:
-        """
-        Lightweight compatibility helper.
-
-        The SQL-first pipeline no longer needs the full Python payload, but some
-        service code still probes this method. We keep it functional and schema-safe.
-        """
         try:
             con = self._require_connection()
             rows = con.execute(
@@ -519,24 +486,16 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
             raise RepositoryError(f"failed to load raw short-interest rows: {exc}") from exc
 
     def insert_history(self, normalized_rows: list[dict[str, Any]]) -> int:
-        """
-        Compatibility shim.
-
-        Canonical path should use insert_history_from_raw_sql_first().
-        """
         result = self.insert_history_from_raw_sql_first()
         return int(result["history_rows_inserted"])
 
     def rebuild_latest(self) -> int:
-        """
-        Compatibility shim.
-        """
         result = self.rebuild_latest_from_history_sql_first()
         return int(result["latest_rows_after"])
 
-    # -------------------------------------------------------------------------
-    # Legacy upsert paths retained for compatibility
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Legacy upsert paths
+    # ------------------------------------------------------------------
 
     def upsert_short_interest_history(self, entries: list[ShortInterestRecord]) -> int:
         try:
