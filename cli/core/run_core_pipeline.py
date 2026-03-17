@@ -81,20 +81,22 @@ def _extend_repeatable(args: list[str], flag: str, values: list[str]) -> None:
         args.extend([flag, value])
 
 
-def _auto_disable_missing_raw_loads(args: argparse.Namespace) -> None:
+def _auto_disable_missing_source_chains(args: argparse.Namespace) -> None:
     """
-    Compatibility behavior for tests and lightweight local runs.
+    Make the core pipeline safe for lightweight test runs and empty-db smoke runs.
 
-    If no explicit raw sources are provided, skip the matching raw load step
-    instead of failing fast.
+    Dependency rules:
+    - no symbol source  => skip symbol load + universe + symbol reference
+    - no FINRA source   => skip FINRA load + FINRA build
+    - no news source    => skip news load + news raw + news candidates
     """
     if not args.symbol_sources:
         args.skip_symbol_load = True
+        args.skip_universe = True
+        args.skip_symbol_reference = True
 
     if not args.finra_sources:
         args.skip_finra_load = True
-        # Without FINRA raw load, do not try to build FINRA unless user
-        # explicitly provided sources elsewhere in the DB already.
         args.skip_finra = True
 
     if not args.news_sources:
@@ -105,7 +107,7 @@ def _auto_disable_missing_raw_loads(args: argparse.Namespace) -> None:
 
 def main() -> int:
     args = parse_args()
-    _auto_disable_missing_raw_loads(args)
+    _auto_disable_missing_source_chains(args)
 
     project_root = Path(args.project_root).expanduser().resolve()
     orchestrator = CorePipelineOrchestrator(
@@ -172,7 +174,7 @@ def main() -> int:
     if not args.skip_finra_load:
         finra_args: list[str] = []
         _extend_repeatable(finra_args, "--source", args.finra_sources)
-        _append_if(finra_args, "--truncate", args.truncate_raw)
+        _append_if(finra_1args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
                 name="load_finra_short_interest_source_raw",
