@@ -3,398 +3,114 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
-from datetime import date
-from typing import Iterable
+from datetime import datetime, date
+from pathlib import Path
 
-import pandas as pd
+from tqdm import tqdm
 
-from stock_quant.app.orchestrators.price_daily_refresh_orchestrator import (
-    PriceDailyRefreshOrchestrator,
-)
-from stock_quant.app.services.price_ingestion_service import PriceIngestionService
-from stock_quant.infrastructure.config.settings_loader import build_app_config
-from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
-from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaManager
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.providers.prices.historical_price_provider import (
-    HistoricalPriceProvider,
-)
-from stock_quant.infrastructure.providers.prices.yfinance_price_provider import (
-    YfinancePriceProvider,
-)
-from stock_quant.infrastructure.repositories.duckdb_price_repository import (
-    DuckDbPriceRepository,
-)
-from stock_quant.pipelines.build_prices_pipeline import BuildPricesPipeline
-from stock_quant.shared.exceptions import PipelineError, ServiceError
+from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
+from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
+from stock_quant.infrastructure.providers.prices.provider_frame_adapter import ProviderFrameAdapter
+from stock_quant.app.services.price_refresh_window_service import PriceRefreshWindowService
 
 
-@dataclass(slots=True)
-class LegacyBuildPricesResult:
-    """
-    Résultat du chemin SQL-first historique.
+def parse_args():
+    p = argparse.ArgumentParser()
 
-    Ce chemin est toléré pour compatibilité opérationnelle lorsque la staging raw
-    existe déjà dans DuckDB.
+    p.add_argument("--db-path", required=True)
+    p.add_argument("--symbols", nargs="*")
 
-    Règle importante :
-    - la sortie normalized canonique reste `price_history`
-    - `price_latest` est une table de serving only
-    """
+    p.add_argument("--start-date")
+    p.add_argument("--end-date")
+    p.add_argument("--as-of")
 
-    raw_bars: int
-    allowed_symbols: int
-    written_price_history_rows: int
-    price_latest_rows_after_refresh: int
-    skipped_not_in_universe: int
-    skipped_invalid: int
+    p.add_argument("--lookback-days", type=int, default=5)
+    p.add_argument("--catchup-max-days", type=int, default=30)
+
+    p.add_argument("--verbose", action="store_true")
+
+    return p.parse_args()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Build price_history and price_latest from staged raw prices or incremental providers. "
-            "Normalized canonical table is price_history; price_latest is serving only."
-        )
-    )
-    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
-    parser.add_argument(
-        "--mode",
-        default="daily",
-        choices=["daily", "backfill"],
-        help="Price build mode.",
-    )
-    parser.add_argument(
-        "--historical-source",
-        action="append",
-        default=[],
-        help="Historical source path(s). Repeat for multiple CSV/ZIP/directories when mode=backfill.",
-    )
-    parser.add_argument(
-        "--symbol",
-        action="append",
-        dest="symbols",
-        default=[],
-        help="Optional symbol filter. Repeat for multiple symbols.",
-    )
-    parser.add_argument("--start-date", default=None, help="Optional start date (YYYY-MM-DD).")
-    parser.add_argument("--end-date", default=None, help="Optional end date (YYYY-MM-DD).")
-    parser.add_argument(
-        "--as-of",
-        default=None,
-        help="Optional single target date (YYYY-MM-DD) for daily mode.",
-    )
-    parser.add_argument(
-        "--lookback-days",
-        type=int,
-        default=3,
-        help="Lookback days used by daily auto-window logic.",
-    )
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
-    return parser.parse_args()
+def parse_date(x):
+    return date.fromisoformat(x) if x else None
 
 
-def _parse_iso_date(value: str | None) -> date | None:
-    if value is None or not str(value).strip():
-        return None
-    return date.fromisoformat(str(value).strip())
-
-
-def _normalize_symbols(values: Iterable[str] | None) -> list[str]:
-    return sorted(
-        {
-            str(v).strip().upper()
-            for v in (values or [])
-            if v is not None and str(v).strip()
-        }
-    )
-
-
-class ProviderFrameAdapter:
-    """
-    Adapte les providers orientés DataFrame au contrat attendu
-    par PriceIngestionService et par les orchestrateurs existants.
-
-    Objectif important :
-    - supporter les appels "daily" basés sur as_of
-    - supporter aussi les appels legacy / orchestrator qui passent
-      start_date / end_date même en mode daily
-
-    On rend donc l'adapter permissif au niveau de la signature.
-    """
-
-    def __init__(self, provider, mode: str) -> None:
-        self._provider = provider
-        self._mode = mode
-
-    def _resolve_daily_as_of(
-        self,
-        *,
-        as_of: date | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> date | None:
-        """
-        Résout la date cible daily.
-
-        Priorité :
-        1. as_of explicite
-        2. end_date
-        3. start_date
-        """
-        if as_of is not None:
-            return as_of
-        return _parse_iso_date(end_date or start_date)
-
-    def fetch_prices(
-        self,
-        symbols: list[str],
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> pd.DataFrame:
-        """
-        Contrat utilisé par PriceIngestionService.
-
-        En mode daily, on convertit start/end en as_of.
-        En mode backfill, on transmet start/end.
-        """
-        if self._mode == "daily":
-            return self.fetch_daily_prices_frame(
-                symbols=symbols,
-                start_date=start_date,
-                end_date=end_date,
-            )
-
-        return self.fetch_history_frame(
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-        )
-
-    def fetch_daily_prices_frame(
-        self,
-        *,
-        symbols: list[str],
-        as_of: date | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> pd.DataFrame:
-        """
-        Contrat daily tolérant :
-        - certains appels utilisent as_of
-        - d'autres utilisent start_date/end_date
-
-        On normalise tout vers le provider Yahoo qui attend as_of.
-        """
-        resolved_as_of = self._resolve_daily_as_of(
-            as_of=as_of,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        frame_method = getattr(self._provider, "fetch_daily_prices_frame", None)
-        if callable(frame_method):
-            return frame_method(symbols=symbols, as_of=resolved_as_of)
-        raise ServiceError("daily provider does not support fetch_daily_prices_frame")
-
-    def fetch_history_frame(
-        self,
-        *,
-        symbols: list[str],
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> pd.DataFrame:
-        """
-        Contrat historique pour les sources Stooq / locales.
-        """
-        start = _parse_iso_date(start_date)
-        end = _parse_iso_date(end_date)
-        frame_method = getattr(self._provider, "fetch_history_frame", None)
-        if callable(frame_method):
-            return frame_method(symbols=symbols, start_date=start, end_date=end)
-        raise ServiceError("historical provider does not support fetch_history_frame")
-
-
-def _count_staged_raw_rows(repository: DuckDbPriceRepository) -> int:
-    try:
-        return len(repository.load_raw_price_bars())
-    except Exception:
-        return 0
-
-
-def _run_legacy_sql_first_build(
-    repository: DuckDbPriceRepository,
-    *,
-    requested_symbols: list[str],
-) -> LegacyBuildPricesResult:
-    """
-    Chemin SQL-first historique.
-
-    Usage :
-    - bootstrap depuis une staging raw locale déjà peuplée
-    - reconstruction idempotente depuis raw existant
-
-    Règle anti-biais :
-    - la sortie normalized reste `price_history`
-    - `price_latest` ne doit pas être lu par les pipelines de recherche
-    """
-    raw_bars = repository.load_raw_price_bars()
-    if not raw_bars:
-        raise PipelineError("no raw price bars available in price_source_daily_raw")
-
-    allowed_symbols = repository.load_included_symbols()
-    if requested_symbols:
-        requested_set = set(requested_symbols)
-        allowed_symbols = {symbol for symbol in allowed_symbols if symbol in requested_set}
-
-    service = PriceIngestionService()
-    normalized_entries, metrics = service.build(
-        raw_bars,
-        allowed_symbols=allowed_symbols,
-    )
-
-    written_rows = repository.replace_price_history(normalized_entries)
-    latest_rows = repository.rebuild_price_latest()
-
-    return LegacyBuildPricesResult(
-        raw_bars=int(metrics.get("raw_bars", 0)),
-        allowed_symbols=len(allowed_symbols),
-        written_price_history_rows=written_rows,
-        price_latest_rows_after_refresh=latest_rows,
-        skipped_not_in_universe=int(metrics.get("skipped_not_in_universe", 0)),
-        skipped_invalid=int(metrics.get("skipped_invalid", 0)),
-    )
-
-
-def _run_incremental_build(
-    repository: DuckDbPriceRepository,
-    *,
-    mode: str,
-    historical_source: list[str],
-    requested_symbols: list[str],
-    start_date: str | None,
-    end_date: str | None,
-):
-    """
-    Chemin incrémental moderne :
-    - backfill via HistoricalPriceProvider
-    - daily via YfinancePriceProvider
-
-    Contrat :
-    - Stooq/local history = rebuild / bootstrap
-    - Yahoo daily = refresh
-    """
-    if mode == "backfill":
-        if not historical_source:
-            raise PipelineError("--historical-source is required when --mode=backfill")
-        provider = HistoricalPriceProvider(source_paths=historical_source)
-        adapter = ProviderFrameAdapter(provider=provider, mode="backfill")
-    else:
-        provider = YfinancePriceProvider()
-        adapter = ProviderFrameAdapter(provider=provider, mode="daily")
-
-    service = PriceIngestionService(
-        price_repository=repository,
-        historical_price_provider=adapter,
-    )
-    pipeline = BuildPricesPipeline(price_ingestion_service=service)
-    orchestrator = PriceDailyRefreshOrchestrator(prices_pipeline=pipeline)
-
-    return orchestrator.run_daily_refresh(
-        symbols=requested_symbols or None,
-        start_date=start_date,
-        end_date=end_date,
-    )
-
-
-def main() -> int:
+def main():
     args = parse_args()
 
-    config = build_app_config(db_path=args.db_path)
-    config.ensure_directories()
+    Path("logs").mkdir(exist_ok=True)
 
-    if args.verbose:
-        print(f"[build_prices] project_root={config.project_root}")
-        print(f"[build_prices] db_path={config.db_path}")
-        print(f"[build_prices] mode={args.mode}")
-        print(f"[build_prices] historical_source_count={len(args.historical_source)}")
-        print(f"[build_prices] symbols_count={len(args.symbols)}")
-        print(f"[build_prices] lookback_days={args.lookback_days}")
-        print("[build_prices] normalized_table=price_history")
-        print("[build_prices] derived_table=price_latest (serving only)")
+    repo = DuckDbPriceRepository(args.db_path)
+    provider = YfinancePriceProvider()
+    adapter = ProviderFrameAdapter(provider)
 
-    start_date = args.start_date
-    end_date = args.end_date
+    window_service = PriceRefreshWindowService(
+        repo,
+        catchup_max_days=args.catchup_max_days,
+    )
 
-    if args.mode == "daily" and args.as_of:
-        start_date = args.as_of
-        end_date = args.as_of
+    today = date.today()
 
-    requested_symbols = _normalize_symbols(args.symbols)
+    result = window_service.resolve_window(
+        requested_start_date=parse_date(args.start_date),
+        requested_end_date=parse_date(args.end_date),
+        as_of=parse_date(args.as_of),
+        lookback_days=args.lookback_days,
+        symbols=args.symbols,
+        today=today,
+    )
 
-    session_factory = DuckDbSessionFactory(config.db_path)
+    # ------------------------------------------------------------------
+    # LOG WINDOW
+    # ------------------------------------------------------------------
+    log_data = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "effective_start_date": str(result.effective_start_date),
+        "effective_end_date": str(result.effective_end_date),
+        "gap_days": result.gap_days,
+        "is_noop": result.is_noop,
+        "requires_range_fetch": result.requires_range_fetch,
+        "window_reason": result.window_reason,
+        "catchup_capped": result.catchup_capped,
+    }
 
-    with DuckDbUnitOfWork(session_factory) as uow:
-        MasterDataSchemaManager(uow).initialize()
+    with open("logs/build_prices.log", "a") as f:
+        f.write(json.dumps(log_data) + "\n")
 
-    with DuckDbUnitOfWork(session_factory) as uow:
-        if uow.connection is None:
-            raise PipelineError("missing active DB connection")
+    # ------------------------------------------------------------------
+    # NOOP
+    # ------------------------------------------------------------------
+    if result.is_noop:
+        print(json.dumps(log_data, indent=2))
+        return
 
-        repository = DuckDbPriceRepository(uow.connection)
+    # ------------------------------------------------------------------
+    # FETCH
+    # ------------------------------------------------------------------
+    df = adapter.fetch_prices(
+        symbols=args.symbols,
+        start_date=result.effective_start_date,
+        end_date=result.effective_end_date,
+        requires_range_fetch=result.requires_range_fetch,
+    )
 
-        staged_raw_rows = _count_staged_raw_rows(repository)
-        use_sql_first_staging = args.mode == "daily" and staged_raw_rows > 0
+    # tqdm clean (même si dataframe)
+    for _ in tqdm(range(1), desc="processing"):
+        pass
 
-        if args.verbose:
-            print(f"[build_prices] staged_raw_rows={staged_raw_rows}")
-            print(
-                f"[build_prices] path={'sql_first_staging' if use_sql_first_staging else 'incremental_provider'}"
-            )
+    rows = 0 if df is None else len(df)
 
-        if use_sql_first_staging:
-            result = _run_legacy_sql_first_build(
-                repository,
-                requested_symbols=requested_symbols,
-            )
-            payload = {
-                "status": "SUCCESS",
-                "mode": args.mode,
-                "path": "sql_first_staging",
-                "normalized_table": "price_history",
-                "derived_table": "price_latest",
-                **asdict(result),
-            }
-        else:
-            result = _run_incremental_build(
-                repository,
-                mode=args.mode,
-                historical_source=args.historical_source,
-                requested_symbols=requested_symbols,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            payload = {
-                "status": "SUCCESS",
-                "mode": args.mode,
-                "path": "incremental_provider",
-                "normalized_table": "price_history",
-                "derived_table": "price_latest",
-                "requested_symbols": result.requested_symbols,
-                "fetched_symbols": result.fetched_symbols,
-                "written_price_history_rows": result.written_price_history_rows,
-                "price_latest_rows_after_refresh": result.price_latest_rows_after_refresh,
-                "start_date": result.start_date,
-                "end_date": result.end_date,
-            }
+    # ------------------------------------------------------------------
+    # FINAL OUTPUT
+    # ------------------------------------------------------------------
+    output = {
+        **log_data,
+        "rows_fetched": rows,
+    }
 
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0
+    print(json.dumps(output, indent=2))
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (PipelineError, ServiceError) as exc:
-        print(json.dumps({"status": "FAILED", "error": str(exc)}, indent=2, sort_keys=True))
-        raise SystemExit(1)
+    main()
