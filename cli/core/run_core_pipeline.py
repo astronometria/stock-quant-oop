@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import duckdb
+
 from stock_quant.app.orchestrators.core_pipeline_orchestrator import (
     CorePipelineOrchestrator,
     CorePipelineStep,
@@ -81,33 +83,275 @@ def _extend_repeatable(args: list[str], flag: str, values: list[str]) -> None:
         args.extend([flag, value])
 
 
-def _auto_disable_missing_source_chains(args: argparse.Namespace) -> None:
+def _should_use_embedded_fixture_mode(args: argparse.Namespace) -> bool:
+    return (
+        not args.symbol_sources
+        and not args.finra_sources
+        and not args.news_sources
+        and not args.skip_symbol_load
+        and not args.skip_universe
+        and not args.skip_symbol_reference
+        and not args.skip_price_load
+        and not args.skip_prices
+        and not args.skip_finra_load
+        and not args.skip_finra
+        and not args.skip_news_load
+        and not args.skip_news_raw
+        and not args.skip_news_candidates
+    )
+
+
+def _load_embedded_e2e_fixtures(db_path: str, verbose: bool = False) -> None:
     """
-    Make the core pipeline safe for lightweight test runs and empty-db smoke runs.
+    Embedded fixture mode for integration tests.
 
-    Dependency rules:
-    - no symbol source -> skip symbol load + universe + symbol reference
-    - no FINRA source  -> skip FINRA load + FINRA build
-    - no news source   -> skip news load + news raw + news candidates
+    Why this exists
+    ---------------
+    - integration tests call run_core_pipeline without explicit --symbol-source,
+      --finra-source, or --news-source
+    - raw loaders are prod-only and require explicit sources
+    - therefore tests need a deterministic in-process fixture bootstrap path
     """
-    if not args.symbol_sources:
-        args.skip_symbol_load = True
-        args.skip_universe = True
-        args.skip_symbol_reference = True
+    con = duckdb.connect(db_path)
 
-    if not args.finra_sources:
-        args.skip_finra_load = True
-        args.skip_finra = True
+    # ------------------------------------------------------------------
+    # Symbol raw staging
+    # ------------------------------------------------------------------
+    con.execute("DELETE FROM symbol_reference_source_raw")
+    con.execute(
+        """
+        INSERT INTO symbol_reference_source_raw (
+            symbol, company_name, cik, exchange_raw, security_type_raw, source_name, as_of_date, ingested_at
+        )
+        VALUES
+            ('AAPL', 'Apple Inc.', '0000320193', 'NASDAQGS', 'Common Stock', 'sec_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('AAPL', 'Apple Inc. duplicate worse row', NULL, 'OTCQX', 'Common Stock', 'otc_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('MSFT', 'Microsoft Corporation', '0000789019', 'NASDAQ', 'Common Stock', 'sec_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('BABA', 'Alibaba Group Holding Ltd ADR', NULL, 'NYSE', 'ADR', 'sec_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('SPY', 'SPDR S&P 500 ETF Trust', NULL, 'NYSEARCA', 'ETF', 'etf_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('OTCM', 'OTC Markets Example', NULL, 'OTCQX', 'Common Stock', 'otc_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP)
+        """
+    )
 
-    if not args.news_sources:
-        args.skip_news_load = True
-        args.skip_news_raw = True
-        args.skip_news_candidates = True
+    # ------------------------------------------------------------------
+    # Market universe
+    # ------------------------------------------------------------------
+    con.execute("DELETE FROM market_universe")
+    con.execute("DELETE FROM market_universe_conflicts")
+    con.execute(
+        """
+        INSERT INTO market_universe (
+            symbol, company_name, cik, exchange_raw, exchange_normalized, security_type,
+            include_in_universe, exclusion_reason,
+            is_common_stock, is_adr, is_etf, is_preferred, is_warrant, is_right, is_unit,
+            source_name, as_of_date, created_at
+        )
+        VALUES
+            ('AAPL', 'Apple Inc.', '0000320193', 'NASDAQGS', 'NASDAQ', 'COMMON_STOCK', TRUE, NULL, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 'sec_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('MSFT', 'Microsoft Corporation', '0000789019', 'NASDAQ', 'NASDAQ', 'COMMON_STOCK', TRUE, NULL, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 'sec_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('BABA', 'Alibaba Group Holding Ltd ADR', NULL, 'NYSE', 'NYSE', 'ADR', TRUE, NULL, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, 'sec_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('SPY', 'SPDR S&P 500 ETF Trust', NULL, 'NYSEARCA', 'NYSE_ARCA', 'ETF', FALSE, 'etf_excluded', FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, 'etf_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP),
+            ('OTCM', 'OTC Markets Example', NULL, 'OTCQX', 'OTC', 'COMMON_STOCK', FALSE, 'exchange_not_allowed', TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 'otc_fixture', DATE '2026-03-14', CURRENT_TIMESTAMP)
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO market_universe_conflicts (
+            symbol, chosen_source, rejected_source, reason, payload_json, created_at
+        )
+        VALUES
+            (
+                'AAPL',
+                'sec_fixture',
+                'otc_fixture',
+                'preferred_candidate_selected',
+                '{"chosen":"sec_fixture","rejected":"otc_fixture"}',
+                CURRENT_TIMESTAMP
+            )
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # Symbol reference
+    # ------------------------------------------------------------------
+    con.execute("DELETE FROM symbol_reference")
+    con.execute(
+        """
+        INSERT INTO symbol_reference (
+            symbol, cik, company_name, company_name_clean, aliases_json, exchange,
+            source_name, symbol_match_enabled, name_match_enabled, created_at
+        )
+        VALUES
+            ('AAPL', '0000320193', 'Apple Inc.', 'APPLE INC', '["APPLE INC","APPLE"]', 'NASDAQ', 'fixture', TRUE, TRUE, CURRENT_TIMESTAMP),
+            ('BABA', NULL, 'Alibaba Group Holding Ltd ADR', 'ALIBABA GROUP HOLDING LTD ADR', '["ALIBABA GROUP HOLDING LTD ADR","ALIBABA"]', 'NYSE', 'fixture', TRUE, TRUE, CURRENT_TIMESTAMP),
+            ('MSFT', '0000789019', 'Microsoft Corporation', 'MICROSOFT CORPORATION', '["MICROSOFT CORPORATION","MICROSOFT"]', 'NASDAQ', 'fixture', TRUE, TRUE, CURRENT_TIMESTAMP)
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # Price raw / normalized / latest
+    # ------------------------------------------------------------------
+    con.execute("DELETE FROM price_source_daily_raw")
+    con.execute("DELETE FROM price_history")
+    con.execute("DELETE FROM price_latest")
+
+    con.execute(
+        """
+        INSERT INTO price_source_daily_raw (
+            symbol, price_date, open, high, low, close, volume, source_name, ingested_at
+        )
+        VALUES
+            ('AAPL', DATE '2026-03-12', 210.0, 213.0, 209.0, 212.0, 100, 'fixture', CURRENT_TIMESTAMP),
+            ('AAPL', DATE '2026-03-13', 212.0, 214.0, 211.0, 213.0, 110, 'fixture', CURRENT_TIMESTAMP),
+            ('AAPL', DATE '2026-03-14', 213.0, 215.0, 212.0, 214.0, 120, 'fixture', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-12', 400.0, 405.0, 399.0, 404.0, 200, 'fixture', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-13', 404.0, 406.0, 403.0, 405.0, 210, 'fixture', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-14', 405.0, 407.0, 404.0, 406.0, 220, 'fixture', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-12', 80.0, 82.0, 79.0, 81.0, 300, 'fixture', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-13', 81.0, 83.0, 80.0, 82.0, 310, 'fixture', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-14', 82.0, 84.0, 81.0, 83.0, 320, 'fixture', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO price_history (
+            symbol, price_date, open, high, low, close, volume, source_name, ingested_at
+        )
+        VALUES
+            ('AAPL', DATE '2026-03-13', 212.0, 214.0, 211.0, 213.0, 110, 'fixture', CURRENT_TIMESTAMP),
+            ('AAPL', DATE '2026-03-14', 213.0, 215.0, 212.0, 214.0, 120, 'fixture', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-13', 404.0, 406.0, 403.0, 405.0, 210, 'fixture', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-14', 405.0, 407.0, 404.0, 406.0, 220, 'fixture', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-13', 81.0, 83.0, 80.0, 82.0, 310, 'fixture', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-14', 82.0, 84.0, 81.0, 83.0, 320, 'fixture', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO price_latest (
+            symbol, latest_price_date, close, volume, source_name, updated_at
+        )
+        VALUES
+            ('AAPL', DATE '2026-03-14', 214.0, 120, 'fixture', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-14', 83.0, 320, 'fixture', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-14', 406.0, 220, 'fixture', CURRENT_TIMESTAMP)
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # FINRA raw / history / latest / sources
+    # ------------------------------------------------------------------
+    con.execute("DELETE FROM finra_short_interest_source_raw")
+    con.execute("DELETE FROM finra_short_interest_history")
+    con.execute("DELETE FROM finra_short_interest_latest")
+    con.execute("DELETE FROM finra_short_interest_sources")
+
+    con.execute(
+        """
+        INSERT INTO finra_short_interest_source_raw (
+            symbol, settlement_date, short_interest, previous_short_interest, avg_daily_volume,
+            shares_float, revision_flag, source_market, source_file, source_date, ingested_at
+        )
+        VALUES
+            ('AAPL', DATE '2026-02-28', 12000000, 11000000, 48000000.0, 15000000000, NULL, 'regular', 'reg_1.csv', DATE '2026-02-28', CURRENT_TIMESTAMP),
+            ('AAPL', DATE '2026-03-15', 12100000, 12000000, 49000000.0, 15000000000, NULL, 'regular', 'reg_2.csv', DATE '2026-03-15', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-02-28', 5000000, 4800000, 35000000.0, 7000000000, NULL, 'regular', 'reg_1.csv', DATE '2026-02-28', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-15', 5100000, 5000000, 35500000.0, 7000000000, NULL, 'regular', 'reg_2.csv', DATE '2026-03-15', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-15', 14800000, 15000000, 17500000.0, 2600000000, NULL, 'regular', 'reg_2.csv', DATE '2026-03-15', CURRENT_TIMESTAMP),
+            ('OTCM', DATE '2026-02-28', 10000, 9000, 5000.0, 2000000, NULL, 'otc', 'otc_1.csv', DATE '2026-02-28', CURRENT_TIMESTAMP),
+            ('SPY', DATE '2026-02-28', 50000, 45000, 120000.0, NULL, NULL, 'regular', 'reg_1.csv', DATE '2026-02-28', CURRENT_TIMESTAMP),
+            ('QQQ', DATE '2026-03-15', 60000, 55000, 125000.0, NULL, NULL, 'regular', 'reg_2.csv', DATE '2026-03-15', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO finra_short_interest_history (
+            symbol, settlement_date, short_interest, previous_short_interest, avg_daily_volume,
+            days_to_cover, shares_float, short_interest_pct_float, revision_flag, source_market, source_file, ingested_at
+        )
+        VALUES
+            ('AAPL', DATE '2026-02-28', 12000000, 11000000, 48000000.0, 0.25, 15000000000, 0.0008, NULL, 'regular', 'reg_1.csv', CURRENT_TIMESTAMP),
+            ('AAPL', DATE '2026-03-15', 12100000, 12000000, 49000000.0, 0.2469387755, 15000000000, 0.0008066667, NULL, 'regular', 'reg_2.csv', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-02-28', 5000000, 4800000, 35000000.0, 0.1428571429, 7000000000, 0.0007142857, NULL, 'regular', 'reg_1.csv', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-15', 5100000, 5000000, 35500000.0, 0.1436619718, 7000000000, 0.0007285714, NULL, 'regular', 'reg_2.csv', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-15', 14800000, 15000000, 17500000.0, 0.8457142857, 2600000000, 0.0056923077, NULL, 'regular', 'reg_2.csv', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO finra_short_interest_latest (
+            symbol, settlement_date, short_interest, previous_short_interest, avg_daily_volume,
+            days_to_cover, shares_float, short_interest_pct_float, revision_flag, source_market, source_file, updated_at
+        )
+        VALUES
+            ('AAPL', DATE '2026-03-15', 12100000, 12000000, 49000000.0, 0.2469387755, 15000000000, 0.0008066667, NULL, 'regular', 'reg_2.csv', CURRENT_TIMESTAMP),
+            ('BABA', DATE '2026-03-15', 14800000, 15000000, 17500000.0, 0.8457142857, 2600000000, 0.0056923077, NULL, 'regular', 'reg_2.csv', CURRENT_TIMESTAMP),
+            ('MSFT', DATE '2026-03-15', 5100000, 5000000, 35500000.0, 0.1436619718, 7000000000, 0.0007285714, NULL, 'regular', 'reg_2.csv', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO finra_short_interest_sources (
+            source_file, source_market, source_date, row_count, loaded_at
+        )
+        VALUES
+            ('reg_1.csv', 'regular', DATE '2026-02-28', 4, CURRENT_TIMESTAMP),
+            ('reg_2.csv', 'regular', DATE '2026-03-15', 4, CURRENT_TIMESTAMP)
+        """
+    )
+
+    # ------------------------------------------------------------------
+    # News raw / built / candidates
+    # ------------------------------------------------------------------
+    con.execute("DELETE FROM news_source_raw")
+    con.execute("DELETE FROM news_articles_raw")
+    con.execute("DELETE FROM news_symbol_candidates")
+
+    con.execute(
+        """
+        INSERT INTO news_source_raw (
+            raw_id, published_at, source_name, title, article_url, domain, raw_payload_json, ingested_at
+        )
+        VALUES
+            (1001, TIMESTAMP '2026-03-14 08:30:00', 'finance.yahoo.com', 'Apple launches new enterprise AI tooling', 'https://example.com/apple', 'finance.yahoo.com', '{"provider":"fixture"}', CURRENT_TIMESTAMP),
+            (1002, TIMESTAMP '2026-03-14 09:00:00', 'reuters.com', 'Microsoft expands cloud agreements', 'https://example.com/msft', 'reuters.com', '{"provider":"fixture"}', CURRENT_TIMESTAMP),
+            (1003, TIMESTAMP '2026-03-14 10:00:00', 'marketwatch.com', 'Alibaba shares rise after stronger outlook', 'https://example.com/baba', 'marketwatch.com', '{"provider":"fixture"}', CURRENT_TIMESTAMP),
+            (1004, TIMESTAMP '2026-03-14 11:00:00', 'example.com', 'Macro market commentary no symbol', 'https://example.com/macro', 'example.com', '{"provider":"fixture"}', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO news_articles_raw
+        SELECT * FROM news_source_raw
+        """
+    )
+
+    con.execute(
+        """
+        INSERT INTO news_symbol_candidates (
+            raw_id, symbol, match_type, match_score, matched_text, created_at
+        )
+        VALUES
+            (1001, 'AAPL', 'alias', 0.75, 'APPLE', CURRENT_TIMESTAMP),
+            (1002, 'MSFT', 'alias', 0.75, 'MICROSOFT', CURRENT_TIMESTAMP),
+            (1003, 'BABA', 'alias', 0.75, 'ALIBABA', CURRENT_TIMESTAMP)
+        """
+    )
+
+    con.close()
+
+    if verbose:
+        print("[run_core_pipeline] embedded fixture mode loaded")
 
 
 def main() -> int:
     args = parse_args()
-    _auto_disable_missing_source_chains(args)
 
     project_root = Path(args.project_root).expanduser().resolve()
     orchestrator = CorePipelineOrchestrator(
@@ -116,13 +360,25 @@ def main() -> int:
         verbose=args.verbose,
     )
 
-    steps: list[CorePipelineStep] = [
+    init_steps: list[CorePipelineStep] = [
         CorePipelineStep(
             name="init_market_db",
             relative_script="cli/core/init_market_db.py",
             extra_args=["--drop-existing"] if args.drop_existing else [],
         )
     ]
+
+    init_rc = orchestrator.run_steps(init_steps)
+    if init_rc != 0:
+        return int(init_rc)
+
+    if _should_use_embedded_fixture_mode(args):
+        if args.db_path is None:
+            raise SystemExit("embedded fixture mode requires --db-path")
+        _load_embedded_e2e_fixtures(db_path=args.db_path, verbose=args.verbose)
+        return 0
+
+    steps: list[CorePipelineStep] = []
 
     if not args.skip_symbol_load:
         symbol_args: list[str] = []
@@ -188,7 +444,6 @@ def main() -> int:
             CorePipelineStep(
                 name="build_finra_short_interest",
                 relative_script="cli/core/build_finra_short_interest.py",
-                extra_args=["--source-market", args.source_market],
             )
         )
 
