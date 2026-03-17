@@ -11,9 +11,12 @@ from tqdm import tqdm
 from stock_quant.app.services.price_provider_symbol_service import PriceProviderSymbolService
 from stock_quant.app.services.price_refresh_window_service import PriceRefreshWindowService
 from stock_quant.infrastructure.providers.prices.provider_frame_adapter import ProviderFrameAdapter
-from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
+from stock_quant.infrastructure.providers.prices.yfinance_price_provider import (
+    YfinancePriceProvider,
+)
 from stock_quant.infrastructure.repositories.duckdb_price_provider_failure_repository import (
     DuckDbPriceProviderFailureRepository,
+    is_permanent_failure,
 )
 from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
 
@@ -43,28 +46,16 @@ def main():
     args = parse_args()
     Path("logs").mkdir(exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Repositories
-    # ------------------------------------------------------------------
     repo = DuckDbPriceRepository(args.db_path)
     failure_repo = DuckDbPriceProviderFailureRepository(args.db_path)
     failure_repo.ensure_table()
 
-    # ------------------------------------------------------------------
-    # Resolve canonical symbol scope
-    # ------------------------------------------------------------------
     canonical_symbols, symbol_scope_source = repo.get_refresh_symbols(args.symbols)
 
     provider_service = PriceProviderSymbolService()
     plan = provider_service.build_yfinance_plan(canonical_symbols)
 
-    # ------------------------------------------------------------------
-    # Filter provider symbols already known as repeated recent failures
-    # ------------------------------------------------------------------
-    failed_provider_symbols = set(
-        failure_repo.get_recent_failures("yfinance")
-    )
-
+    failed_provider_symbols = set(failure_repo.get_recent_failures("yfinance"))
     filtered_provider_symbols = [
         symbol
         for symbol in plan.eligible_provider_symbols
@@ -72,7 +63,6 @@ def main():
     ]
 
     filtered_out_failures = len(plan.eligible_provider_symbols) - len(filtered_provider_symbols)
-
     run_started_at = datetime.utcnow()
 
     log = {
@@ -87,9 +77,6 @@ def main():
         "filtered_out_failures": filtered_out_failures,
     }
 
-    # ------------------------------------------------------------------
-    # Optional logging of provider exclusions decided before fetch
-    # ------------------------------------------------------------------
     if plan.excluded_count > 0:
         exclusion_payload = {
             "timestamp": run_started_at.isoformat(),
@@ -108,11 +95,6 @@ def main():
         }
         write_jsonl_log("logs/provider_symbol_mapping.log", exclusion_payload)
 
-    # ------------------------------------------------------------------
-    # Resolve refresh window
-    # IMPORTANT:
-    # resolve_window requires explicit keyword-only args even when None.
-    # ------------------------------------------------------------------
     window = PriceRefreshWindowService(
         repo,
         catchup_max_days=args.catchup_max_days,
@@ -136,17 +118,11 @@ def main():
         }
     )
 
-    # ------------------------------------------------------------------
-    # No-op cases
-    # ------------------------------------------------------------------
     if window.is_noop or not filtered_provider_symbols:
         write_jsonl_log("logs/build_prices.log", log)
         print(json.dumps(log, indent=2))
         return
 
-    # ------------------------------------------------------------------
-    # Fetch from provider
-    # ------------------------------------------------------------------
     provider = YfinancePriceProvider()
     adapter = ProviderFrameAdapter(provider)
 
@@ -163,34 +139,57 @@ def main():
     log["rows_fetched"] = 0 if df is None else len(df)
 
     # ------------------------------------------------------------------
-    # Failure memory: any provider symbol asked but not returned gets logged.
-    # NOTE:
-    # df["symbol"] is canonical after adapter remap.
+    # Capture les failures Yahoo réelles remontées par le provider.
+    # On n'insère en mémoire que les permanentes; le repository filtrera.
     # ------------------------------------------------------------------
-    fetched_canonical_symbols = (
-        set(df["symbol"].dropna().astype(str).unique())
-        if df is not None and not df.empty
-        else set()
-    )
+    provider_failures = provider.get_last_failures()
 
-    failures = []
-    for provider_symbol in filtered_provider_symbols:
-        canonical_symbol = plan.provider_to_canonical.get(provider_symbol)
-        if canonical_symbol not in fetched_canonical_symbols:
-            failures.append(
-                {
-                    "canonical_symbol": canonical_symbol,
-                    "provider_symbol": provider_symbol,
-                    "failure_reason": "no_data_returned",
-                }
-            )
+    failures_for_repository = []
+    permanent_failure_count = 0
+    transient_failure_count = 0
 
-    failure_repo.upsert_failures("yfinance", failures)
-    log["new_failures_logged"] = len(failures)
+    for failure in provider_failures:
+        canonical_symbol = plan.provider_to_canonical.get(failure.provider_symbol)
+        if failure.is_transient:
+            transient_failure_count += 1
+        else:
+            if is_permanent_failure(failure.failure_reason):
+                permanent_failure_count += 1
 
-    # ------------------------------------------------------------------
-    # Write canonical rows into price_history and refresh price_latest
-    # ------------------------------------------------------------------
+        failures_for_repository.append(
+            {
+                "canonical_symbol": canonical_symbol,
+                "provider_symbol": failure.provider_symbol,
+                "failure_reason": failure.failure_reason,
+            }
+        )
+
+    failure_repo.upsert_failures("yfinance", failures_for_repository)
+
+    log["provider_failure_count"] = len(provider_failures)
+    log["provider_permanent_failure_count"] = permanent_failure_count
+    log["provider_transient_failure_count"] = transient_failure_count
+
+    if provider_failures:
+        write_jsonl_log(
+            "logs/provider_fetch_failures.log",
+            {
+                "timestamp": run_started_at.isoformat(),
+                "provider_name": "yfinance",
+                "failure_count": len(provider_failures),
+                "permanent_failure_count": permanent_failure_count,
+                "transient_failure_count": transient_failure_count,
+                "sample_failures": [
+                    {
+                        "provider_symbol": failure.provider_symbol,
+                        "failure_reason": failure.failure_reason,
+                        "is_transient": failure.is_transient,
+                    }
+                    for failure in provider_failures[:200]
+                ],
+            },
+        )
+
     write_result = repo.upsert_price_history(
         df,
         source_name="yfinance",
