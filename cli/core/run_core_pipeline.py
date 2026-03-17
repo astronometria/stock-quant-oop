@@ -12,7 +12,7 @@ from stock_quant.app.orchestrators.core_pipeline_orchestrator import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the core stock-quant-oop pipeline in sequence using real source data only."
+        description="Run the core stock-quant-oop pipeline in sequence."
     )
     parser.add_argument(
         "--project-root",
@@ -40,21 +40,21 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="symbol_sources",
         default=[],
-        help="Real symbol reference raw source file. Repeat this flag for multiple inputs.",
+        help="Optional symbol reference raw source file. Repeat this flag for multiple inputs.",
     )
     parser.add_argument(
         "--finra-source",
         action="append",
         dest="finra_sources",
         default=[],
-        help="Real FINRA raw source path/file/dir/glob. Repeat this flag for multiple inputs.",
+        help="Optional FINRA raw source path/file/dir/glob. Repeat this flag for multiple inputs.",
     )
     parser.add_argument(
         "--news-source",
         action="append",
         dest="news_sources",
         default=[],
-        help="Real news raw source file. Repeat this flag for multiple inputs.",
+        help="Optional news raw source file. Repeat this flag for multiple inputs.",
     )
     parser.add_argument("--skip-symbol-load", action="store_true")
     parser.add_argument("--skip-universe", action="store_true")
@@ -81,34 +81,10 @@ def _extend_repeatable(args: list[str], flag: str, values: list[str]) -> None:
         args.extend([flag, value])
 
 
-def _validate_required_sources(args: argparse.Namespace) -> None:
-    """
-    Enforce prod-only behavior.
-
-    If a raw load step is enabled, the matching real source(s) must be provided.
-    """
-    if not args.skip_symbol_load and not args.symbol_sources:
-        raise SystemExit(
-            "run_core_pipeline requires at least one --symbol-source when symbol load is enabled."
-        )
-
-    if not args.skip_finra_load and not args.finra_sources:
-        raise SystemExit(
-            "run_core_pipeline requires at least one --finra-source when FINRA raw load is enabled."
-        )
-
-    if not args.skip_news_load and not args.news_sources:
-        raise SystemExit(
-            "run_core_pipeline requires at least one --news-source when news raw load is enabled."
-        )
-
-
 def main() -> int:
     args = parse_args()
-    _validate_required_sources(args)
 
     project_root = Path(args.project_root).expanduser().resolve()
-
     orchestrator = CorePipelineOrchestrator(
         project_root=project_root,
         db_path=args.db_path,

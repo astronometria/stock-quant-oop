@@ -4,66 +4,64 @@ Quant research pipeline (OOP) with strict point-in-time guarantees.
 
 ## Core Principles
 
-- price_history = canonical
-- price_latest = serving only (never used in research)
-- all joins are point-in-time using available_at
-- no fallback to period_end_date
-- dataset is reproducible and versioned
+- `price_history` = canonical price table
+- `price_latest` = serving only, never used for research
+- all research joins are point-in-time with `available_at`
+- no fallback from `available_at` to `period_end_date`
+- datasets are reproducible and versionable
 
 ## Data Layers
 
 ### Raw
-- SEC filings
-- NASDAQ / symbol sources
-- FINRA short interest
-- price raw (stooq / yahoo)
+- SEC raw filings and XBRL facts
+- symbol raw sources
+- FINRA raw short-interest sources
+- price raw sources (historical + daily)
 
 ### Normalized
-- sec_filing
-- sec_fact_normalized
-- finra_short_interest_history
-- price_history
+- `symbol_reference`
+- `sec_filing`
+- `sec_fact_normalized`
+- `price_history`
+- `finra_short_interest_history`
 
 ### Derived
-- fundamental_features_daily
-- short_features_daily
-- training_dataset_daily
+- `market_universe`
+- `fundamental_features_daily`
+- `short_features_daily`
+- `training_dataset_daily`
+- `dataset_versions`
 
-## Pipelines
+## Rebuild
 
-Core rebuild:
+Canonical rebuild entry point:
 
     python3 cli/ops/rebuild_database_from_scratch.py --db-path ~/stock-quant-oop/market.duckdb
 
-Includes:
-- symbol sources
+Rebuild includes:
+- symbol staging
 - market universe
+- symbol reference
 - SEC filings
-- SEC normalized facts
+- SEC fact normalization
 - fundamentals
-- price backfill (stooq)
-- price daily (yahoo)
+- historical price backfill
+- daily price refresh
 - FINRA short interest
 
-## Research Dataset
+## Research Guarantees
 
-training_dataset_daily is:
+- fundamentals become visible only after `available_at`
+- short interest becomes visible only after `available_at`
+- research never reads `price_latest`
+- datasets must be point-in-time safe and deduplicated per `(symbol, price_date)`
 
-- point-in-time correct
-- no future leakage
-- deduplicated per (symbol, price_date)
+## Repo Structure
 
-## Guarantees
+- `stock_quant/` : application package
+- `cli/core/` : main builders
+- `cli/ops/` : orchestration
+- `cli/raw/` : raw ingestion / staging
+- `docs/` : architecture and pipeline docs
+- `tests/` : unit and integration coverage
 
-- fundamentals visible only after available_at
-- short interest visible only after available_at
-- no use of price_latest in research
-- no implicit look-ahead bias
-
-## Structure
-
-- stock_quant/ → core package
-- cli/core/ → main entry points
-- cli/ops/ → orchestration
-- cli/raw/ → raw ingestion
-- tests/ → unit + integration tests
