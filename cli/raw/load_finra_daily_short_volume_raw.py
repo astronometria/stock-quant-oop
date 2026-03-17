@@ -20,6 +20,8 @@ from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManag
 EXPECTED_HEADER_5 = "Date|Symbol|ShortVolume|TotalVolume|Market"
 EXPECTED_HEADER_6 = "Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market"
 ALLOWED_MARKET_DIRS = {"CNMS", "FNQC", "FNRA", "FNSQ", "FNYX"}
+
+# Batch volontairement modéré pour limiter l'impact des fichiers cassés.
 BATCH_SIZE = 100
 
 
@@ -140,13 +142,16 @@ def discover_files(sources: Iterable[str], manifests: Iterable[str]) -> list[Pat
 
 def _nonempty_lines(path: Path, limit: int = 3) -> list[str]:
     lines: list[str] = []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            value = line.strip()
-            if value:
-                lines.append(value)
-                if len(lines) >= limit:
-                    break
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                value = line.strip()
+                if value:
+                    lines.append(value)
+                    if len(lines) >= limit:
+                        break
+    except Exception:
+        return []
     return lines
 
 
@@ -235,8 +240,21 @@ def _insert_from_sql(con: duckdb.DuckDBPyConnection, sql: str, stage_name: str) 
     return int(after - before)
 
 
-def _insert_batch_header5(con, stage_name: str, files: list[str], source_name: str) -> int:
-    sql = f"""
+def _read_csv_common_options() -> str:
+    return """
+        delim='|',
+        filename=true,
+        all_varchar=true,
+        ignore_errors=true,
+        union_by_name=true,
+        strict_mode=false,
+        null_padding=true,
+        max_line_size=10000000
+    """
+
+
+def _insert_batch_header5_sql(stage_name: str, files: list[str], source_name: str) -> str:
+    return f"""
     INSERT INTO {stage_name}
     SELECT
         CAST(strptime(Date, '%Y%m%d') AS DATE) AS trade_date,
@@ -251,20 +269,15 @@ def _insert_batch_header5(con, stage_name: str, files: list[str], source_name: s
         {_sql_quote(source_name)} AS source_name
     FROM read_csv(
         {_sql_file_list(files)},
-        delim='|',
         header=true,
-        filename=true,
-        all_varchar=true,
-        ignore_errors=true,
-        union_by_name=true
+        {_read_csv_common_options()}
     )
     WHERE trim(coalesce(Symbol, '')) <> ''
     """
-    return _insert_from_sql(con, sql, stage_name)
 
 
-def _insert_batch_header6(con, stage_name: str, files: list[str], source_name: str) -> int:
-    sql = f"""
+def _insert_batch_header6_sql(stage_name: str, files: list[str], source_name: str) -> str:
+    return f"""
     INSERT INTO {stage_name}
     SELECT
         CAST(strptime(Date, '%Y%m%d') AS DATE) AS trade_date,
@@ -279,20 +292,15 @@ def _insert_batch_header6(con, stage_name: str, files: list[str], source_name: s
         {_sql_quote(source_name)} AS source_name
     FROM read_csv(
         {_sql_file_list(files)},
-        delim='|',
         header=true,
-        filename=true,
-        all_varchar=true,
-        ignore_errors=true,
-        union_by_name=true
+        {_read_csv_common_options()}
     )
     WHERE trim(coalesce(Symbol, '')) <> ''
     """
-    return _insert_from_sql(con, sql, stage_name)
 
 
-def _insert_batch_no_header5(con, stage_name: str, files: list[str], source_name: str) -> int:
-    sql = f"""
+def _insert_batch_no_header5_sql(stage_name: str, files: list[str], source_name: str) -> str:
+    return f"""
     INSERT INTO {stage_name}
     SELECT
         CAST(strptime(column0, '%Y%m%d') AS DATE) AS trade_date,
@@ -307,20 +315,15 @@ def _insert_batch_no_header5(con, stage_name: str, files: list[str], source_name
         {_sql_quote(source_name)} AS source_name
     FROM read_csv(
         {_sql_file_list(files)},
-        delim='|',
         header=false,
-        filename=true,
-        all_varchar=true,
-        ignore_errors=true,
-        union_by_name=true
+        {_read_csv_common_options()}
     )
     WHERE trim(coalesce(column1, '')) <> ''
     """
-    return _insert_from_sql(con, sql, stage_name)
 
 
-def _insert_batch_no_header6(con, stage_name: str, files: list[str], source_name: str) -> int:
-    sql = f"""
+def _insert_batch_no_header6_sql(stage_name: str, files: list[str], source_name: str) -> str:
+    return f"""
     INSERT INTO {stage_name}
     SELECT
         CAST(strptime(column0, '%Y%m%d') AS DATE) AS trade_date,
@@ -335,21 +338,47 @@ def _insert_batch_no_header6(con, stage_name: str, files: list[str], source_name
         {_sql_quote(source_name)} AS source_name
     FROM read_csv(
         {_sql_file_list(files)},
-        delim='|',
         header=false,
-        filename=true,
-        all_varchar=true,
-        ignore_errors=true,
-        union_by_name=true
+        {_read_csv_common_options()}
     )
     WHERE trim(coalesce(column1, '')) <> ''
     """
-    return _insert_from_sql(con, sql, stage_name)
+
+
+def _insert_with_fallback(
+    con: duckdb.DuckDBPyConnection,
+    stage_name: str,
+    batch: list[str],
+    batch_sql_builder,
+    source_name: str,
+    bad_files: list[dict],
+) -> int:
+    try:
+        sql = batch_sql_builder(stage_name, batch, source_name)
+        return _insert_from_sql(con, sql, stage_name)
+    except Exception as exc:
+        inserted = 0
+        for path in batch:
+            try:
+                sql = batch_sql_builder(stage_name, [path], source_name)
+                inserted += _insert_from_sql(con, sql, stage_name)
+            except Exception as single_exc:
+                bad_files.append(
+                    {
+                        "file": path,
+                        "error": str(single_exc),
+                    }
+                )
+        return inserted
 
 
 def main() -> int:
     args = parse_args()
     db_path = str(Path(args.db_path).expanduser().resolve())
+    repo_root = Path("/home/marty/stock-quant-oop")
+    logs_dir = repo_root / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    bad_files_log = logs_dir / "finra_daily_short_volume_bad_files.json"
 
     source_items = list(args.sources or [])
     manifest_items = list(args.manifests or [])
@@ -372,16 +401,20 @@ def main() -> int:
         _create_stage(con, stage_name)
 
         h5, h6, nh5, nh6, empty_files, skipped_bad = split_files(discovered)
-
+        bad_files: list[dict] = []
         inserted = 0
+
         for batch in tqdm(list(_chunked(h5, BATCH_SIZE)), desc="load_h5", dynamic_ncols=True):
-            inserted += _insert_batch_header5(con, stage_name, batch, args.source_name)
+            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_header5_sql, args.source_name, bad_files)
+
         for batch in tqdm(list(_chunked(h6, BATCH_SIZE)), desc="load_h6", dynamic_ncols=True):
-            inserted += _insert_batch_header6(con, stage_name, batch, args.source_name)
+            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_header6_sql, args.source_name, bad_files)
+
         for batch in tqdm(list(_chunked(nh5, BATCH_SIZE)), desc="load_nh5", dynamic_ncols=True):
-            inserted += _insert_batch_no_header5(con, stage_name, batch, args.source_name)
+            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_no_header5_sql, args.source_name, bad_files)
+
         for batch in tqdm(list(_chunked(nh6, BATCH_SIZE)), desc="load_nh6", dynamic_ncols=True):
-            inserted += _insert_batch_no_header6(con, stage_name, batch, args.source_name)
+            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_no_header6_sql, args.source_name, bad_files)
 
         con.execute("DELETE FROM finra_daily_short_volume_source_raw")
         con.execute(
@@ -410,6 +443,8 @@ def main() -> int:
                 available_at,
                 source_name
             FROM {stage_name}
+            WHERE symbol IS NOT NULL
+              AND trade_date IS NOT NULL
             """
         )
 
@@ -439,13 +474,28 @@ def main() -> int:
         rows_after = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
         source_rows_after = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_sources").fetchone()[0])
 
+        bad_files_log.write_text(
+            json.dumps(
+                {
+                    "bad_file_count": len(bad_files),
+                    "bad_files": bad_files,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
         print(f"[load_finra_daily_short_volume_raw] db_path={db_path}", flush=True)
         print(f"[load_finra_daily_short_volume_raw] discovered_files={len(discovered)}", flush=True)
         print(f"[load_finra_daily_short_volume_raw] empty_files={empty_files}", flush=True)
         print(f"[load_finra_daily_short_volume_raw] skipped_bad_payload_files={skipped_bad}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] batch_parse_failures={len(bad_files)}", flush=True)
         print(f"[load_finra_daily_short_volume_raw] rows_before={rows_before}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] rows_written={rows_after}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] rows_after={rows_after}", flush=True)
         print(f"[load_finra_daily_short_volume_raw] source_rows_after={source_rows_after}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] bad_files_log={bad_files_log}", flush=True)
+
         print(
             json.dumps(
                 {
@@ -457,9 +507,11 @@ def main() -> int:
                     "no_header6_files": len(nh6),
                     "empty_files": empty_files,
                     "skipped_bad_payload_files": skipped_bad,
+                    "bad_file_count": len(bad_files),
                     "stage_inserted_rows": inserted,
                     "final_raw_rows": rows_after,
                     "final_source_rows": source_rows_after,
+                    "bad_files_log": str(bad_files_log),
                 },
                 default=str,
             ),
