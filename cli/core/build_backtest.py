@@ -15,18 +15,25 @@ from stock_quant.pipelines.build_backtest_pipeline import BuildBacktestPipeline
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build experiment tracking and simple backtest results.")
+    parser = argparse.ArgumentParser(
+        description="Build experiment tracking and cross-sectional backtest results."
+    )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument("--dataset-name", default="research_dataset_v1", help="Dataset logical name.")
     parser.add_argument("--dataset-version", default="v1", help="Dataset version.")
-    parser.add_argument("--experiment-name", default="momentum_experiment_v1", help="Experiment name.")
-    parser.add_argument("--backtest-name", default="momentum_backtest_v1", help="Backtest name.")
+    parser.add_argument("--experiment-name", default="cross_sectional_experiment_v1", help="Experiment name.")
+    parser.add_argument("--backtest-name", default="cross_sectional_backtest_v1", help="Backtest name.")
+    parser.add_argument("--signal-column", default="close_to_sma_20", help="Feature column used for ranking.")
+    parser.add_argument("--label-column", default="fwd_return_1d", help="Forward return column used for realized return.")
+    parser.add_argument("--top-n", type=int, default=20, help="Top N securities selected each day.")
+    parser.add_argument("--holding-days", type=int, default=1, help="Holding period metadata.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
     config = build_app_config(db_path=args.db_path)
     config.ensure_directories()
 
@@ -37,8 +44,13 @@ def main() -> int:
         print(f"[build_backtest] dataset_version={args.dataset_version}")
         print(f"[build_backtest] experiment_name={args.experiment_name}")
         print(f"[build_backtest] backtest_name={args.backtest_name}")
+        print(f"[build_backtest] signal_column={args.signal_column}")
+        print(f"[build_backtest] label_column={args.label_column}")
+        print(f"[build_backtest] top_n={args.top_n}")
+        print(f"[build_backtest] holding_days={args.holding_days}")
 
     session_factory = DuckDbSessionFactory(config.db_path)
+
     with DuckDbUnitOfWork(session_factory) as uow:
         ResearchSchemaManager(uow).initialize()
         DatasetBuilderSchemaManager(uow).initialize()
@@ -51,6 +63,10 @@ def main() -> int:
             dataset_version=args.dataset_version,
             experiment_name=args.experiment_name,
             backtest_name=args.backtest_name,
+            signal_column=args.signal_column,
+            label_column=args.label_column,
+            top_n=args.top_n,
+            holding_days=args.holding_days,
         )
         result = pipeline.run()
 

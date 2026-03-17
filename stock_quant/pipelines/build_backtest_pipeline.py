@@ -6,10 +6,18 @@ from datetime import datetime
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.pipelines.base_pipeline import BasePipeline
+from stock_quant.research.backtests.signal_backtester import SignalBacktester
 from stock_quant.shared.exceptions import PipelineError
 
 
 class BuildBacktestPipeline(BasePipeline):
+    """
+    Pipeline de backtest cross-sectional v1.
+
+    Cette version remplace le backtest momentum binaire simpliste
+    par un ranking quotidien sur une colonne signal configurable.
+    """
+
     pipeline_name = "build_backtest"
 
     def __init__(
@@ -18,8 +26,12 @@ class BuildBacktestPipeline(BasePipeline):
         uow: DuckDbUnitOfWork | None = None,
         dataset_name: str = "research_dataset_v1",
         dataset_version: str = "v1",
-        experiment_name: str = "momentum_experiment_v1",
-        backtest_name: str = "momentum_backtest_v1",
+        experiment_name: str = "cross_sectional_experiment_v1",
+        backtest_name: str = "cross_sectional_backtest_v1",
+        signal_column: str = "close_to_sma_20",
+        label_column: str = "fwd_return_1d",
+        top_n: int = 20,
+        holding_days: int = 1,
     ) -> None:
         if repository is not None:
             self.uow = repository.uow
@@ -35,11 +47,15 @@ class BuildBacktestPipeline(BasePipeline):
         self.dataset_version = dataset_version
         self.experiment_name = experiment_name
         self.backtest_name = backtest_name
+        self.signal_column = signal_column
+        self.label_column = label_column
+        self.top_n = int(top_n)
+        self.holding_days = int(holding_days)
 
-        self._experiment_rows = 0
-        self._written_experiment_run = 0
-        self._written_backtest_run = 0
-        self._metrics: dict[str, int | float | None] = {}
+        self._backtester = SignalBacktester()
+        self._metrics: dict[str, int | float | None | str] = {}
+        self._rows_read = 0
+        self._rows_written = 0
 
     @property
     def con(self):
@@ -48,159 +64,89 @@ class BuildBacktestPipeline(BasePipeline):
         return self.uow.connection
 
     def extract(self):
-        return None
-
-    def transform(self, data):
-        return None
-
-    def validate(self, data) -> None:
-        count = self.con.execute(
+        rows = self.con.execute(
             """
-            SELECT COUNT(*)
+            SELECT *
             FROM research_dataset_daily
             WHERE dataset_name = ? AND dataset_version = ?
+            ORDER BY as_of_date, symbol
             """,
             [self.dataset_name, self.dataset_version],
-        ).fetchone()[0]
-        if int(count) == 0:
+        ).fetchdf()
+        return rows.to_dict(orient="records")
+
+    def transform(self, data):
+        return self._backtester.run_cross_sectional_backtest(
+            dataset_rows=data,
+            signal_column=self.signal_column,
+            label_column=self.label_column,
+            top_n=self.top_n,
+            experiment_name=self.experiment_name,
+            backtest_name=self.backtest_name,
+            dataset_name=self.dataset_name,
+            dataset_version=self.dataset_version,
+        )
+
+    def validate(self, data) -> None:
+        if not data:
             raise PipelineError("no rows available in research_dataset_daily for requested dataset")
 
     def load(self, data) -> None:
+        output = self.transform(data)
+
         con = self.con
 
         con.execute("DELETE FROM experiment_results_daily")
+        con.execute("DELETE FROM backtest_runs")
 
-        con.execute(
-            """
-            INSERT INTO experiment_results_daily (
-                experiment_name,
-                dataset_name,
-                dataset_version,
-                instrument_id,
-                company_id,
-                symbol,
-                as_of_date,
-                signal_value,
-                selected_flag,
-                realized_return_1d,
-                created_at
-            )
-            SELECT
-                ? AS experiment_name,
-                dataset_name,
-                dataset_version,
-                instrument_id,
-                company_id,
-                symbol,
-                as_of_date,
-                close_to_sma_20 AS signal_value,
-                CASE
-                    WHEN close_to_sma_20 IS NOT NULL AND close_to_sma_20 > 0 THEN TRUE
-                    ELSE FALSE
-                END AS selected_flag,
-                fwd_return_1d AS realized_return_1d,
-                CURRENT_TIMESTAMP AS created_at
-            FROM research_dataset_daily
-            WHERE dataset_name = ? AND dataset_version = ?
-            """,
-            [self.experiment_name, self.dataset_name, self.dataset_version],
-        )
-
-        self._experiment_rows = int(
-            con.execute("SELECT COUNT(*) FROM experiment_results_daily").fetchone()[0]
-        )
-
-        metric_row = con.execute(
-            """
-            WITH selected AS (
-                SELECT realized_return_1d
-                FROM experiment_results_daily
-                WHERE selected_flag = TRUE
-                  AND realized_return_1d IS NOT NULL
-            )
-            SELECT
-                (SELECT COUNT(*) FROM experiment_results_daily) AS observations,
-                (SELECT COUNT(*) FROM selected) AS selected_observations,
-                AVG(realized_return_1d) AS mean_return_1d,
-                AVG(CASE WHEN realized_return_1d > 0 THEN 1.0 ELSE 0.0 END) AS hit_rate_1d,
-                CASE
-                    WHEN COUNT(*) = 0 THEN NULL
-                    WHEN MIN(1.0 + realized_return_1d) <= 0 THEN NULL
-                    ELSE EXP(SUM(LN(1.0 + realized_return_1d))) - 1.0
-                END AS cumulative_return_proxy
-            FROM selected
-            """
-        ).fetchone()
-
-        observations = int(metric_row[0] or 0)
-        selected_observations = int(metric_row[1] or 0)
-        mean_return_1d = float(metric_row[2]) if metric_row[2] is not None else None
-        hit_rate_1d = float(metric_row[3]) if metric_row[3] is not None else None
-        cumulative_return_proxy = float(metric_row[4]) if metric_row[4] is not None else None
-
-        self._metrics = {
-            "experiment_rows": self._experiment_rows,
-            "selected_rows": selected_observations,
-            "observations": observations,
-            "selected_observations": selected_observations,
-            "mean_return_1d": mean_return_1d,
-            "hit_rate_1d": hit_rate_1d,
-            "cumulative_return_proxy": cumulative_return_proxy,
-        }
-
-        dataset_version_id = None
-        if self.repository is not None:
-            dataset_version_id = self.repository.lookup_dataset_version_id(
-                self.dataset_name,
-                self.dataset_version,
+        if output.positions:
+            payload = [
+                (
+                    row["experiment_name"],
+                    row["dataset_name"],
+                    row["dataset_version"],
+                    row["instrument_id"],
+                    row["company_id"],
+                    row["symbol"],
+                    row["as_of_date"],
+                    row["signal_value"],
+                    True,
+                    row["realized_return"],
+                    row["created_at"],
+                )
+                for row in output.positions
+            ]
+            con.executemany(
+                """
+                INSERT INTO experiment_results_daily (
+                    experiment_name,
+                    dataset_name,
+                    dataset_version,
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    signal_value,
+                    selected_flag,
+                    realized_return_1d,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                payload,
             )
 
-        experiment_metrics_json = json.dumps(
+        metrics_json = json.dumps(
             {
-                "experiment_rows": self._experiment_rows,
-                "selected_rows": selected_observations,
+                "signal_column": self.signal_column,
+                "label_column": self.label_column,
+                "top_n": self.top_n,
+                "holding_days": self.holding_days,
+                **output.summary,
             },
             sort_keys=True,
+            default=str,
         )
-        backtest_metrics_json = json.dumps(
-            {
-                "cumulative_return_proxy": cumulative_return_proxy,
-                "hit_rate_1d": hit_rate_1d,
-                "mean_return_1d": mean_return_1d,
-                "observations": observations,
-                "selected_observations": selected_observations,
-            },
-            sort_keys=True,
-        )
-
-        con.execute(
-            """
-            INSERT INTO experiment_runs (
-                experiment_name,
-                status,
-                dataset_version_id,
-                started_at,
-                finished_at,
-                metrics_json,
-                config_json,
-                error_message,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                self.experiment_name,
-                "SUCCESS",
-                dataset_version_id,
-                datetime.utcnow(),
-                datetime.utcnow(),
-                experiment_metrics_json,
-                "{}",
-                None,
-                datetime.utcnow(),
-            ],
-        )
-        self._written_experiment_run = 1
 
         con.execute(
             """
@@ -220,26 +166,36 @@ class BuildBacktestPipeline(BasePipeline):
             [
                 self.backtest_name,
                 "SUCCESS",
-                dataset_version_id,
+                None,
                 datetime.utcnow(),
                 datetime.utcnow(),
-                backtest_metrics_json,
-                "{}",
+                metrics_json,
+                json.dumps(
+                    {
+                        "signal_column": self.signal_column,
+                        "label_column": self.label_column,
+                        "top_n": self.top_n,
+                        "holding_days": self.holding_days,
+                    },
+                    sort_keys=True,
+                ),
                 None,
                 datetime.utcnow(),
             ],
         )
-        self._written_backtest_run = 1
+
+        self._rows_read = len(data)
+        self._rows_written = len(output.positions) + 1
+        self._metrics = {
+            "signal_column": self.signal_column,
+            "label_column": self.label_column,
+            "top_n": self.top_n,
+            "holding_days": self.holding_days,
+            **output.summary,
+        }
 
     def finalize(self, result: PipelineResult) -> PipelineResult:
-        result.rows_read = self._experiment_rows
-        result.rows_written = (
-            self._experiment_rows
-            + self._written_experiment_run
-            + self._written_backtest_run
-        )
+        result.rows_read = self._rows_read
+        result.rows_written = self._rows_written
         result.metrics.update(self._metrics)
-        result.metrics["written_experiment_rows"] = self._experiment_rows
-        result.metrics["written_experiment_run"] = self._written_experiment_run
-        result.metrics["written_backtest_run"] = self._written_backtest_run
         return result

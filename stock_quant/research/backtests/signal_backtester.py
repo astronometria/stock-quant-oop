@@ -1,86 +1,254 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
+from math import sqrt
+from typing import Any
 
 import pandas as pd
 
-from stock_quant.domain.entities.backtest_result import BacktestResultSummary, ExperimentResultDaily
+
+@dataclass(slots=True)
+class CrossSectionalBacktestOutput:
+    """
+    Résultat complet du backtest cross-sectional v1.
+
+    Notes
+    -----
+    - positions : sélection journalière des titres retenus
+    - daily     : métriques agrégées journalières
+    - summary   : résumé global simple
+    """
+    positions: list[dict[str, Any]]
+    daily: list[dict[str, Any]]
+    summary: dict[str, Any]
 
 
 class SignalBacktester:
-    def run_simple_momentum_backtest(
+    """
+    Moteur de backtest cross-sectional v1.
+
+    Hypothèses v1
+    -------------
+    - long-only
+    - equal-weight
+    - rebalance daily
+    - top_n titres retenus chaque jour
+    - performance = moyenne simple du label forward sélectionné
+    """
+
+    def run_cross_sectional_backtest(
         self,
-        dataset_rows: list[dict],
+        dataset_rows: list[dict[str, Any]],
+        *,
+        signal_column: str,
+        label_column: str,
+        top_n: int,
         experiment_name: str,
         backtest_name: str,
         dataset_name: str,
         dataset_version: str,
-        min_signal: float = 0.0,
-    ) -> tuple[list[ExperimentResultDaily], BacktestResultSummary, dict[str, int | float]]:
+    ) -> CrossSectionalBacktestOutput:
         frame = pd.DataFrame(dataset_rows)
+
+        # --------------------------------------------------------------
+        # Cas vide : on retourne un résultat vide mais structuré.
+        # --------------------------------------------------------------
         if frame.empty:
-            summary = BacktestResultSummary(
-                backtest_name=backtest_name,
-                dataset_name=dataset_name,
-                dataset_version=dataset_version,
-                observations=0,
-                selected_observations=0,
-                mean_return_1d=None,
-                hit_rate_1d=None,
-                cumulative_return_proxy=None,
-                created_at=datetime.utcnow(),
-            )
-            return [], summary, {
-                "experiment_rows": 0,
-                "selected_rows": 0,
-            }
-
-        frame["signal_value"] = pd.to_numeric(frame["close_to_sma_20"], errors="coerce")
-        frame["realized_return_1d"] = pd.to_numeric(frame["fwd_return_1d"], errors="coerce")
-        frame["selected_flag"] = frame["signal_value"] > min_signal
-
-        experiment_rows: list[ExperimentResultDaily] = []
-        for row in frame.itertuples(index=False):
-            experiment_rows.append(
-                ExperimentResultDaily(
-                    experiment_name=experiment_name,
-                    dataset_name=dataset_name,
-                    dataset_version=dataset_version,
-                    instrument_id=row.instrument_id,
-                    company_id=row.company_id,
-                    symbol=row.symbol,
-                    as_of_date=row.as_of_date,
-                    signal_value=None if pd.isna(row.signal_value) else float(row.signal_value),
-                    selected_flag=bool(row.selected_flag),
-                    realized_return_1d=None if pd.isna(row.realized_return_1d) else float(row.realized_return_1d),
-                    created_at=datetime.utcnow(),
-                )
+            return CrossSectionalBacktestOutput(
+                positions=[],
+                daily=[],
+                summary={
+                    "backtest_name": backtest_name,
+                    "dataset_name": dataset_name,
+                    "dataset_version": dataset_version,
+                    "signal_column": signal_column,
+                    "label_column": label_column,
+                    "top_n": top_n,
+                    "observations": 0,
+                    "selected_observations": 0,
+                    "trading_days": 0,
+                    "mean_daily_return": None,
+                    "volatility_daily": None,
+                    "sharpe_like": None,
+                    "hit_rate": None,
+                    "cumulative_return_proxy": None,
+                    "created_at": datetime.utcnow(),
+                },
             )
 
-        selected = frame[frame["selected_flag"] & frame["realized_return_1d"].notna()].copy()
-
-        mean_return = None
-        hit_rate = None
-        cumulative_return_proxy = None
-        if not selected.empty:
-            mean_return = float(selected["realized_return_1d"].mean())
-            hit_rate = float((selected["realized_return_1d"] > 0).mean())
-            cumulative_return_proxy = float((1.0 + selected["realized_return_1d"]).prod() - 1.0)
-
-        summary = BacktestResultSummary(
-            backtest_name=backtest_name,
-            dataset_name=dataset_name,
-            dataset_version=dataset_version,
-            observations=int(len(frame)),
-            selected_observations=int(len(selected)),
-            mean_return_1d=mean_return,
-            hit_rate_1d=hit_rate,
-            cumulative_return_proxy=cumulative_return_proxy,
-            created_at=datetime.utcnow(),
-        )
-
-        metrics = {
-            "experiment_rows": int(len(experiment_rows)),
-            "selected_rows": int(len(selected)),
+        required_columns = {
+            "instrument_id",
+            "company_id",
+            "symbol",
+            "as_of_date",
+            signal_column,
+            label_column,
         }
-        return experiment_rows, summary, metrics
+        missing = sorted(col for col in required_columns if col not in frame.columns)
+        if missing:
+            raise ValueError(f"dataset_rows missing required columns: {missing}")
+
+        # --------------------------------------------------------------
+        # On force les colonnes quantitatives en numérique.
+        # --------------------------------------------------------------
+        frame["signal_value"] = pd.to_numeric(frame[signal_column], errors="coerce")
+        frame["realized_return"] = pd.to_numeric(frame[label_column], errors="coerce")
+
+        # --------------------------------------------------------------
+        # On garde seulement les lignes exploitables.
+        # - signal connu
+        # - label connu
+        # --------------------------------------------------------------
+        usable = frame[
+            frame["signal_value"].notna() & frame["realized_return"].notna()
+        ].copy()
+
+        if usable.empty:
+            return CrossSectionalBacktestOutput(
+                positions=[],
+                daily=[],
+                summary={
+                    "backtest_name": backtest_name,
+                    "dataset_name": dataset_name,
+                    "dataset_version": dataset_version,
+                    "signal_column": signal_column,
+                    "label_column": label_column,
+                    "top_n": top_n,
+                    "observations": int(len(frame)),
+                    "selected_observations": 0,
+                    "trading_days": 0,
+                    "mean_daily_return": None,
+                    "volatility_daily": None,
+                    "sharpe_like": None,
+                    "hit_rate": None,
+                    "cumulative_return_proxy": None,
+                    "created_at": datetime.utcnow(),
+                },
+            )
+
+        usable["as_of_date"] = pd.to_datetime(usable["as_of_date"]).dt.date
+
+        positions: list[dict[str, Any]] = []
+        daily_rows: list[dict[str, Any]] = []
+
+        # --------------------------------------------------------------
+        # Ranking cross-sectional par jour.
+        # --------------------------------------------------------------
+        for as_of_date, day_frame in usable.groupby("as_of_date", sort=True):
+            ranked = day_frame.sort_values(
+                by=["signal_value", "symbol"],
+                ascending=[False, True],
+            ).head(max(int(top_n), 1)).copy()
+
+            if ranked.empty:
+                continue
+
+            weight = 1.0 / float(len(ranked))
+            ranked["weight"] = weight
+            ranked["rank"] = range(1, len(ranked) + 1)
+            ranked["position_return"] = ranked["realized_return"] * ranked["weight"]
+
+            for row in ranked.itertuples(index=False):
+                positions.append(
+                    {
+                        "experiment_name": experiment_name,
+                        "backtest_name": backtest_name,
+                        "dataset_name": dataset_name,
+                        "dataset_version": dataset_version,
+                        "instrument_id": row.instrument_id,
+                        "company_id": row.company_id,
+                        "symbol": row.symbol,
+                        "as_of_date": row.as_of_date,
+                        "signal_column": signal_column,
+                        "label_column": label_column,
+                        "signal_value": float(row.signal_value),
+                        "realized_return": float(row.realized_return),
+                        "rank_position": int(row.rank),
+                        "weight": float(row.weight),
+                        "created_at": datetime.utcnow(),
+                    }
+                )
+
+            gross_return = float(ranked["realized_return"].mean())
+            selected_count = int(len(ranked))
+            hit_rate = float((ranked["realized_return"] > 0).mean())
+
+            daily_rows.append(
+                {
+                    "backtest_name": backtest_name,
+                    "dataset_name": dataset_name,
+                    "dataset_version": dataset_version,
+                    "as_of_date": as_of_date,
+                    "signal_column": signal_column,
+                    "label_column": label_column,
+                    "selected_count": selected_count,
+                    "gross_return": gross_return,
+                    "hit_rate": hit_rate,
+                    "created_at": datetime.utcnow(),
+                }
+            )
+
+        daily_frame = pd.DataFrame(daily_rows)
+
+        if daily_frame.empty:
+            summary = {
+                "backtest_name": backtest_name,
+                "dataset_name": dataset_name,
+                "dataset_version": dataset_version,
+                "signal_column": signal_column,
+                "label_column": label_column,
+                "top_n": top_n,
+                "observations": int(len(frame)),
+                "selected_observations": 0,
+                "trading_days": 0,
+                "mean_daily_return": None,
+                "volatility_daily": None,
+                "sharpe_like": None,
+                "hit_rate": None,
+                "cumulative_return_proxy": None,
+                "created_at": datetime.utcnow(),
+            }
+            return CrossSectionalBacktestOutput(
+                positions=positions,
+                daily=daily_rows,
+                summary=summary,
+            )
+
+        mean_daily_return = float(daily_frame["gross_return"].mean())
+        volatility_daily = (
+            float(daily_frame["gross_return"].std(ddof=0))
+            if len(daily_frame) > 1
+            else 0.0
+        )
+        sharpe_like = None
+        if volatility_daily and volatility_daily > 0:
+            sharpe_like = float(mean_daily_return / volatility_daily * sqrt(252.0))
+
+        hit_rate_total = float((daily_frame["gross_return"] > 0).mean())
+
+        cumulative_return_proxy = float((1.0 + daily_frame["gross_return"]).prod() - 1.0)
+
+        summary = {
+            "backtest_name": backtest_name,
+            "dataset_name": dataset_name,
+            "dataset_version": dataset_version,
+            "signal_column": signal_column,
+            "label_column": label_column,
+            "top_n": int(top_n),
+            "observations": int(len(frame)),
+            "selected_observations": int(len(positions)),
+            "trading_days": int(len(daily_frame)),
+            "mean_daily_return": mean_daily_return,
+            "volatility_daily": volatility_daily,
+            "sharpe_like": sharpe_like,
+            "hit_rate": hit_rate_total,
+            "cumulative_return_proxy": cumulative_return_proxy,
+            "created_at": datetime.utcnow(),
+        }
+
+        return CrossSectionalBacktestOutput(
+            positions=positions,
+            daily=daily_rows,
+            summary=summary,
+        )
