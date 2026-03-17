@@ -1,0 +1,961 @@
+===== DATE =====
+Tue 17 Mar 2026 08:52:40 AM EDT
+
+===== SHOW REBUILD PRICE SECTION =====
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+from stock_quant.infrastructure.config.settings_loader import build_app_config
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rebuild the DuckDB database from scratch using real raw symbol sources, "
+            "SEC normalized facts, fundamentals, mandatory Stooq price backfill, "
+            "optional Yahoo daily refresh, and FINRA daily refresh."
+        )
+    )
+    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
+
+    parser.add_argument("--skip-init", action="store_true", help="Skip schema initialization step.")
+    parser.add_argument("--skip-sec-fetch", action="store_true", help="Skip SEC company tickers raw download.")
+    parser.add_argument("--skip-nasdaq-fetch", action="store_true", help="Skip NASDAQ symbol directory raw download.")
+    parser.add_argument("--skip-raw-load", action="store_true", help="Skip loading symbol_reference_source_raw.")
+    parser.add_argument("--skip-market-universe", action="store_true", help="Skip build_market_universe.")
+    parser.add_argument("--skip-symbol-reference", action="store_true", help="Skip build_symbol_reference.")
+    parser.add_argument("--skip-sec-filings", action="store_true", help="Skip build_sec_filings.")
+    parser.add_argument("--skip-sec-fact-normalized", action="store_true", help="Skip build_sec_fact_normalized.")
+    parser.add_argument("--skip-fundamentals", action="store_true", help="Skip build_fundamentals.")
+
+    parser.add_argument(
+        "--skip-price-backfill",
+        action="store_true",
+        help="Skip mandatory historical Stooq-style price backfill step.",
+    )
+    parser.add_argument(
+        "--skip-price-daily",
+        action="store_true",
+        help="Skip Yahoo daily price refresh after historical backfill.",
+    )
+    parser.add_argument(
+        "--stooq-source",
+        action="append",
+        dest="stooq_sources",
+        default=[],
+        help="Historical Stooq source path. Repeat for multiple inputs.",
+    )
+    parser.add_argument(
+        "--price-symbol",
+        action="append",
+        dest="price_symbols",
+        default=[],
+        help="Optional symbol filter for prices. Repeat for multiple symbols.",
+    )
+    parser.add_argument("--price-start-date", default=None, help="Optional start date for prices (YYYY-MM-DD).")
+    parser.add_argument("--price-end-date", default=None, help="Optional end date for prices (YYYY-MM-DD).")
+    parser.add_argument("--price-as-of", default=None, help="Optional single date for daily price refresh (YYYY-MM-DD).")
+
+    parser.add_argument("--skip-finra", action="store_true", help="Skip FINRA daily refresh.")
+    parser.add_argument(
+        "--finra-output-dir",
+        default="~/stock-quant-oop/data/raw/finra/short_interest",
+        help="Directory where FINRA short-interest files are stored/downloaded.",
+    )
+    parser.add_argument("--finra-start-date", default=None, help="Inclusive FINRA start date YYYY-MM-DD.")
+    parser.add_argument("--finra-end-date", default=None, help="Inclusive FINRA end date YYYY-MM-DD.")
+    parser.add_argument(
+        "--finra-source-market",
+        default="regular",
+        choices=["regular", "otc", "both"],
+        help="Source market passed to FINRA normalized build.",
+    )
+    parser.add_argument("--finra-overwrite-downloads", action="store_true", help="Overwrite existing local FINRA download files.")
+    parser.add_argument("--finra-truncate-raw", action="store_true", help="Delete existing finra_short_interest_source_raw before load.")
+
+    parser.add_argument(
+        "--allow-adr",
+        action="store_true",
+        default=False,
+        help="Allow ADR in market universe build. Default is ADR-free.",
+    )
+
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose child command output.")
+    return parser.parse_args()
+
+
+def _run_step(step_name: str, command: list[str]) -> None:
+    print(f"===== STEP: {step_name} =====", flush=True)
+    print("COMMAND:", " ".join(shlex.quote(part) for part in command), flush=True)
+
+    completed = subprocess.run(command, text=True)
+
+    if completed.returncode != 0:
+        raise SystemExit(f"step failed: {step_name} (exit_code={completed.returncode})")
+
+
+def _latest_file(directory: Path, pattern: str) -> Path | None:
+    matches = sorted(directory.glob(pattern))
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _extend_with_optional_price_filters(command: list[str], args: argparse.Namespace) -> list[str]:
+    for source in args.stooq_sources:
+        command.extend(["--historical-source", str(source)])
+
+    for symbol in args.price_symbols:
+        command.extend(["--symbol", str(symbol)])
+
+    if args.price_start_date:
+        command.extend(["--start-date", str(args.price_start_date)])
+    if args.price_end_date:
+        command.extend(["--end-date", str(args.price_end_date)])
+    if args.price_as_of:
+        command.extend(["--as-of", str(args.price_as_of)])
+
+    return command
+
+
+def main() -> int:
+    args = parse_args()
+
+    config = build_app_config(db_path=args.db_path)
+    config.ensure_directories()
+
+    project_root = Path(config.project_root).expanduser().resolve()
+    db_path = Path(config.db_path).expanduser().resolve()
+
+    # NOTE:
+    # We intentionally use the currently running interpreter to keep the rebuild
+    # consistent with the active virtual environment / site-packages.
+    python_bin = sys.executable
+
+    sec_dir = project_root / "data" / "symbol_sources" / "sec"
+    nasdaq_dir = project_root / "data" / "symbol_sources" / "nasdaq"
+
+    print("===== REBUILD DATABASE FROM SCRATCH =====", flush=True)
+    print(f"project_root={project_root}", flush=True)
+    print(f"db_path={db_path}", flush=True)
+
+    if not args.skip_init:
+        _run_step(
+            "INIT MARKET DB",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "init_market_db.py"),
+                "--db-path",
+                str(db_path),
+            ],
+        )
+
+    if not args.skip_sec_fetch:
+        _run_step(
+            "FETCH SEC COMPANY TICKERS RAW",
+            [
+                python_bin,
+                str(project_root / "cli" / "raw" / "fetch_sec_company_tickers_raw.py"),
+                "--verbose",
+            ],
+        )
+
+    if not args.skip_nasdaq_fetch:
+        _run_step(
+            "FETCH NASDAQ SYMBOL DIRECTORY RAW",
+            [
+                python_bin,
+                str(project_root / "cli" / "raw" / "fetch_nasdaq_symbol_directory_raw.py"),
+                "--verbose",
+            ],
+        )
+
+    sec_file = _latest_file(sec_dir, "sec_company_tickers_*.csv")
+    nasdaqlisted_file = _latest_file(nasdaq_dir, "nasdaqlisted_*.csv")
+    otherlisted_file = _latest_file(nasdaq_dir, "otherlisted_*.csv")
+
+    print("===== RESOLVED RAW FILES =====", flush=True)
+    print(f"sec_file={sec_file}", flush=True)
+    print(f"nasdaqlisted_file={nasdaqlisted_file}", flush=True)
+    print(f"otherlisted_file={otherlisted_file}", flush=True)
+
+    if not args.skip_raw_load:
+        missing_files: list[str] = []
+        if sec_file is None:
+            missing_files.append("SEC company tickers file")
+        if nasdaqlisted_file is None:
+            missing_files.append("NASDAQ listed file")
+        if otherlisted_file is None:
+            missing_files.append("NASDAQ other listed file")
+
+        if missing_files:
+            raise SystemExit(
+                "cannot load symbol_reference_source_raw; missing files: " + ", ".join(missing_files)
+            )
+
+        _run_step(
+            "LOAD SYMBOL_REFERENCE_SOURCE_RAW",
+            [
+                python_bin,
+                str(project_root / "cli" / "raw" / "load_symbol_reference_source_raw.py"),
+                "--db-path",
+                str(db_path),
+                "--truncate",
+                "--source",
+                str(nasdaqlisted_file),
+                "--source",
+                str(otherlisted_file),
+                "--source",
+                str(sec_file),
+                "--verbose",
+            ],
+        )
+
+    if not args.skip_market_universe:
+        cmd = [
+            python_bin,
+            str(project_root / "cli" / "core" / "build_market_universe.py"),
+            "--db-path",
+            str(db_path),
+            "--verbose",
+            "--allow-adr",
+        ]
+        _run_step("BUILD MARKET UNIVERSE", cmd)
+
+    if not args.skip_symbol_reference:
+        _run_step(
+            "BUILD SYMBOL REFERENCE",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_symbol_reference.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
+
+    if not args.skip_sec_filings:
+        _run_step(
+            "BUILD SEC FILINGS",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_sec_filings.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
+
+    if not args.skip_sec_fact_normalized:
+        _run_step(
+            "BUILD SEC FACT NORMALIZED",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_sec_fact_normalized.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
+
+    if not args.skip_fundamentals:
+        _run_step(
+            "BUILD FUNDAMENTALS",
+            [
+                python_bin,
+                str(project_root / "cli" / "core" / "build_fundamentals.py"),
+                "--db-path",
+                str(db_path),
+                "--verbose",
+            ],
+        )
+
+    if not args.skip_price_backfill:
+        if not args.stooq_sources:
+            raise SystemExit(
+                "historical Stooq price sources are required for rebuild; "
+                "pass at least one --stooq-source or explicitly use --skip-price-backfill"
+            )
+
+        cmd = [
+            python_bin,
+            str(project_root / "cli" / "core" / "build_prices.py"),
+            "--db-path",
+            str(db_path),
+            "--mode",
+            "backfill",
+            "--verbose",
+        ]
+        cmd = _extend_with_optional_price_filters(cmd, args)
+        _run_step("BUILD PRICES BACKFILL", cmd)
+
+    if not args.skip_price_daily:
+        cmd = [
+            python_bin,
+            str(project_root / "cli" / "core" / "build_prices.py"),
+            "--db-path",
+            str(db_path),
+            "--mode",
+            "daily",
+            "--verbose",
+        ]
+
+        for symbol in args.price_symbols:
+            cmd.extend(["--symbol", str(symbol)])
+
+        if args.price_start_date:
+            cmd.extend(["--start-date", str(args.price_start_date)])
+        if args.price_end_date:
+            cmd.extend(["--end-date", str(args.price_end_date)])
+        if args.price_as_of:
+            cmd.extend(["--as-of", str(args.price_as_of)])
+
+        _run_step("BUILD PRICES DAILY", cmd)
+
+    if not args.skip_finra:
+        finra_cmd = [
+            python_bin,
+            str(project_root / "cli" / "ops" / "run_finra_daily_refresh.py"),
+            "--project-root",
+            str(project_root),
+            "--db-path",
+            str(db_path),
+            "--output-dir",
+            str(Path(args.finra_output_dir).expanduser().resolve()),
+            "--source-market",
+            str(args.finra_source_market),
+        ]
+        if args.finra_start_date:
+            finra_cmd.extend(["--start-date", str(args.finra_start_date)])
+        if args.finra_end_date:
+            finra_cmd.extend(["--end-date", str(args.finra_end_date)])
+        if args.finra_overwrite_downloads:
+            finra_cmd.append("--overwrite-downloads")
+        if args.finra_truncate_raw:
+            finra_cmd.append("--truncate-raw")
+        if args.verbose:
+            finra_cmd.append("--verbose")
+
+
+===== GREP BUILD_PRICES CALLS =====
+cli/load_price_source_daily_raw_all_from_stooq_zip.py:10:        str(Path(__file__).resolve().parent / "raw" / "load_price_source_daily_raw_all_from_stooq_zip.py"),
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:31:        default="~/stock-quant/data/download/stooq/d_us_txt.zip",
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:144:                "stooq_zip_full",
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:216:            for member in tqdm(members, desc="stooq bronze files", unit="file", dynamic_ncols=True):
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:249:        print(f"[load_price_source_daily_raw_all_from_stooq_zip] db_path={config.db_path}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:250:        print(f"[load_price_source_daily_raw_all_from_stooq_zip] zip_path={zip_path}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:251:        print(f"[load_price_source_daily_raw_all_from_stooq_zip] parsed_files={parsed_files}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:252:        print(f"[load_price_source_daily_raw_all_from_stooq_zip] distinct_symbols={len(distinct_symbols)}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:253:        print(f"[load_price_source_daily_raw_all_from_stooq_zip] inserted_rows={inserted_rows}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_zip.py:254:        print(f"[load_price_source_daily_raw_all_from_stooq_zip] total_rows={total_rows}")
+cli/raw/load_price_source_daily_raw.py:20:#     load_price_source_daily_raw_all_from_stooq_dir.py
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:30:        default="~/stock-quant/data/extracted/stooq/data/daily/us",
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:183:                "stooq_dir_full",
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:255:        for path in tqdm(files, desc="stooq bronze dir files", unit="file", dynamic_ncols=True):
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:288:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] db_path={config.db_path}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:289:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] root_dir={root_dir}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:290:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] symbol_filter_count={len(symbol_filter)}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:291:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] parsed_files={parsed_files}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:292:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] distinct_symbols={len(distinct_symbols)}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:293:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] inserted_rows={inserted_rows}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py.bak:294:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] total_rows={total_rows}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:31:        default="~/stock-quant/data/download/stooq/d_us_txt.zip",
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:199:            for member in tqdm(members, desc="stooq files", unit="file", dynamic_ncols=True):
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:218:                        "stooq_zip_real",
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:270:        print(f"[load_price_source_daily_raw_from_stooq_zip] db_path={config.db_path}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:271:        print(f"[load_price_source_daily_raw_from_stooq_zip] zip_path={zip_path}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:272:        print(f"[load_price_source_daily_raw_from_stooq_zip] symbol_filter_count={len(symbol_filter)}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:273:        print(f"[load_price_source_daily_raw_from_stooq_zip] parsed_files={parsed_files}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:274:        print(f"[load_price_source_daily_raw_from_stooq_zip] distinct_symbols={len(kept_symbols)}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:275:        print(f"[load_price_source_daily_raw_from_stooq_zip] inserted_rows={inserted_rows}")
+cli/raw/load_price_source_daily_raw_from_stooq_zip.py:276:        print(f"[load_price_source_daily_raw_from_stooq_zip] total_rows={total_rows}")
+cli/raw/rebuild_price_source_daily_raw_effective.py:79:            WITH stooq_filtered AS (
+cli/raw/rebuild_price_source_daily_raw_effective.py:116:                SELECT * FROM stooq_filtered
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:5:# load_price_source_daily_raw_all_from_stooq_dir.py
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:13:#   ~/stock-quant-oop/data/raw/stooq/daily/us
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:106:        default="~/stock-quant-oop/data/raw/stooq/daily/us",
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:289:                "stooq_dir_full",
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:358:        raise SystemExit(f"stooq root dir not found: {root_dir}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:360:        raise SystemExit(f"stooq root dir is not a directory: {root_dir}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:390:                f"load_price_source_daily_raw_all_from_stooq_dir: no txt files found under {root_dir}"
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:396:            desc="stooq bronze dir files",
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:446:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] db_path={config.db_path}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:447:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] root_dir={root_dir}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:448:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] exclude_etfs={args.exclude_etfs}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:449:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] parsed_files={parsed_files}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:451:            f"[load_price_source_daily_raw_all_from_stooq_dir] distinct_symbols={len(distinct_symbols)}"
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:453:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] inserted_rows={inserted_rows}")
+cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py:454:        print(f"[load_price_source_daily_raw_all_from_stooq_dir] total_rows={total_rows}")
+cli/raw/load_price_source_daily_raw_all_from_csv.py:21:        default="~/stock-quant/data/normalized/stooq_us_daily_normalized.csv",
+cli/core/run_core_pipeline.py.bak:118:                name="build_prices",
+cli/core/run_core_pipeline.py.bak:119:                relative_script="cli/core/build_prices.py",
+cli/core/build_prices.py:29:from stock_quant.pipelines.build_prices_pipeline import BuildPricesPipeline
+cli/core/build_prices.py:68:        "--historical-source",
+cli/core/build_prices.py:214:            raise PipelineError("--historical-source is required when --mode=backfill")
+cli/core/build_prices.py:242:        print(f"[build_prices] project_root={config.project_root}")
+cli/core/build_prices.py:243:        print(f"[build_prices] db_path={config.db_path}")
+cli/core/build_prices.py:244:        print(f"[build_prices] mode={args.mode}")
+cli/core/build_prices.py:245:        print(f"[build_prices] historical_source_count={len(args.historical_source)}")
+cli/core/build_prices.py:246:        print(f"[build_prices] symbols_count={len(args.symbols)}")
+cli/core/build_prices.py:247:        print("[build_prices] normalized_table=price_history")
+cli/core/build_prices.py:248:        print("[build_prices] derived_table=price_latest (serving only)")
+cli/core/build_prices.py:280:            print(f"[build_prices] staged_raw_rows={staged_raw_rows}")
+cli/core/build_prices.py:282:                f"[build_prices] path={'sql_first_staging' if use_sql_first_staging else 'incremental_provider'}"
+cli/core/run_core_pipeline.py:425:                name="build_prices",
+cli/core/run_core_pipeline.py:426:                relative_script="cli/core/build_prices.py",
+cli/core/build_prices.py.bak:31:        "--historical-source",
+cli/core/build_prices.py.bak:87:        print(f"[build_prices] project_root={config.project_root}")
+cli/core/build_prices.py.bak:88:        print(f"[build_prices] db_path={config.db_path}")
+cli/core/build_prices.py.bak:89:        print(f"[build_prices] mode={args.mode}")
+cli/core/build_prices.py.bak:90:        print(f"[build_prices] historical_source_count={len(args.historical_source)}")
+cli/core/build_prices.py.bak:91:        print(f"[build_prices] symbols_count={len(args.symbols)}")
+cli/core/build_prices.py.bak:112:                raise SystemExit("--historical-source is required when --mode=backfill")
+cli/core/build_prices_research.py:14:from stock_quant.pipelines.build_prices_pipeline import BuildPricesResearchPipeline
+cli/core/build_prices_research.py:30:        print(f"[build_prices_research] project_root={config.project_root}")
+cli/core/build_prices_research.py:31:        print(f"[build_prices_research] db_path={config.db_path}")
+cli/build_prices.py:9:    runpy.run_path(str(Path(__file__).resolve().parent / "core" / "build_prices.py"), run_name="__main__")
+cli/load_price_source_daily_raw_from_stooq_zip.py:10:        str(Path(__file__).resolve().parent / "raw" / "load_price_source_daily_raw_from_stooq_zip.py"),
+cli/load_price_source_daily_raw_all_from_stooq_dir.py:10:        str(Path(__file__).resolve().parent / "raw" / "load_price_source_daily_raw_all_from_stooq_dir.py"),
+cli/tools/export_stooq_dir_to_normalized_csv.py:21:        default="~/stock-quant/data/extracted/stooq/data/daily/us",
+cli/tools/export_stooq_dir_to_normalized_csv.py:26:        default="~/stock-quant/data/normalized/stooq_us_daily_normalized.csv",
+cli/tools/export_stooq_dir_to_normalized_csv.py:164:        for path in tqdm(files, desc="export stooq csv", unit="file", dynamic_ncols=True):
+cli/tools/export_stooq_dir_to_normalized_csv.py:201:                            "stooq_dir_full",
+cli/tools/export_stooq_dir_to_normalized_csv.py:223:        print(f"[export_stooq_dir_to_normalized_csv] root_dir={root_dir}")
+cli/tools/export_stooq_dir_to_normalized_csv.py:224:        print(f"[export_stooq_dir_to_normalized_csv] output_csv={output_csv}")
+cli/tools/export_stooq_dir_to_normalized_csv.py:225:        print(f"[export_stooq_dir_to_normalized_csv] symbol_filter_count={len(symbol_filter)}")
+cli/tools/export_stooq_dir_to_normalized_csv.py:226:        print(f"[export_stooq_dir_to_normalized_csv] parsed_files={parsed_files}")
+cli/tools/export_stooq_dir_to_normalized_csv.py:227:        print(f"[export_stooq_dir_to_normalized_csv] distinct_symbols={len(distinct_symbols)}")
+cli/tools/export_stooq_dir_to_normalized_csv.py:228:        print(f"[export_stooq_dir_to_normalized_csv] exported_rows={exported_rows}")
+cli/ops/rebuild_database_from_scratch.py:34:        "--skip-price-backfill",
+cli/ops/rebuild_database_from_scratch.py:39:        "--skip-price-daily",
+cli/ops/rebuild_database_from_scratch.py:44:        "--stooq-source",
+cli/ops/rebuild_database_from_scratch.py:46:        dest="stooq_sources",
+cli/ops/rebuild_database_from_scratch.py:107:    for source in args.stooq_sources:
+cli/ops/rebuild_database_from_scratch.py:108:        command.extend(["--historical-source", str(source)])
+cli/ops/rebuild_database_from_scratch.py:276:        if not args.stooq_sources:
+cli/ops/rebuild_database_from_scratch.py:279:                "pass at least one --stooq-source or explicitly use --skip-price-backfill"
+cli/ops/rebuild_database_from_scratch.py:284:            str(project_root / "cli" / "core" / "build_prices.py"),
+cli/ops/rebuild_database_from_scratch.py:297:            str(project_root / "cli" / "core" / "build_prices.py"),
+cli/ops/seed_initial_db.py.bak:128:                "build_prices",
+cli/ops/seed_initial_db.py.bak:129:                build_base_command(project_root, "build_prices.py", args.db_path, args.verbose),
+cli/ops/run_research_dataset_daily.py:75:        "build_prices",
+cli/ops/run_research_dataset_daily.py:76:        build_cmd(project_root, "cli/core/build_prices.py", args.db_path, args.verbose),
+cli/ops/run_price_daily_refresh.py.bak:18:        description="Run the daily price refresh pipeline directly through the new incremental OOP build_prices flow."
+cli/ops/run_price_daily_refresh.py.bak:83:        "build_prices.py",
+cli/ops/run_price_daily_refresh.py.bak:100:    steps.append(("build_prices_daily_incremental", build_cmd))
+cli/ops/rebuild_database_from_scratch.py.bak:34:        "--skip-price-backfill",
+cli/ops/rebuild_database_from_scratch.py.bak:39:        "--skip-price-daily",
+cli/ops/rebuild_database_from_scratch.py.bak:44:        "--stooq-source",
+cli/ops/rebuild_database_from_scratch.py.bak:46:        dest="stooq_sources",
+cli/ops/rebuild_database_from_scratch.py.bak:107:    for source in args.stooq_sources:
+cli/ops/rebuild_database_from_scratch.py.bak:108:        command.extend(["--historical-source", str(source)])
+cli/ops/rebuild_database_from_scratch.py.bak:276:        if not args.stooq_sources:
+cli/ops/rebuild_database_from_scratch.py.bak:279:                "pass at least one --stooq-source or explicitly use --skip-price-backfill"
+cli/ops/rebuild_database_from_scratch.py.bak:284:            str(project_root / "cli" / "core" / "build_prices.py"),
+cli/ops/rebuild_database_from_scratch.py.bak:297:            str(project_root / "cli" / "core" / "build_prices.py"),
+cli/ops/refresh_price_history_daily.py:97:        "build_prices.py",
+cli/ops/refresh_price_history_daily.py:101:    steps.append(("build_prices", build_cmd))
+cli/ops/run_price_daily_refresh.py:18:        description="Run daily price refresh using the canonical build_prices CLI."
+cli/ops/run_price_daily_refresh.py:76:        "cli/core/build_prices.py",
+cli/ops/run_price_daily_refresh.py:96:        ("build_prices_daily", build_cmd),
+stock_quant/pipelines/build_prices_pipeline.py:48:    pipeline_name = "build_prices"
+stock_quant/pipelines/build_prices_pipeline.py:69:            raise PipelineError(f"failed to run build_prices pipeline: {exc}") from exc
+stock_quant/pipelines/prices_pipeline.py.bak:30:        return "build_prices"
+stock_quant/pipelines/prices_research_pipeline.py.bak:11:    pipeline_name = "build_prices_research"
+stock_quant/pipelines/prices_pipeline.py:14:    build_prices_pipeline.py
+stock_quant/pipelines/prices_pipeline.py:22:from stock_quant.pipelines.build_prices_pipeline import (
+stock_quant/shared/pipeline_runner.py:41:            "build_prices",
+stock_quant/infrastructure/providers/prices/raw_price_loader.py.bak:33:    def load_from_stooq_txt(self, path: Path) -> pd.DataFrame:
+stock_quant/infrastructure/providers/prices/raw_price_loader.py.bak:36:        return self._normalize_frame(df, source_name=f"stooq:{txt_path.name}")
+stock_quant/infrastructure/providers/prices/raw_price_loader.py.bak:62:                        source_name=f"zip-stooq:{zip_path.name}:{Path(member).name}",
+stock_quant/infrastructure/providers/prices/raw_price_loader.py.bak:87:            frames.append(self._normalize_frame(df, source_name=f"dir-stooq:{txt_file.name}"))
+stock_quant/infrastructure/providers/prices/raw_price_loader.py.bak:111:                frames.append(self.load_from_stooq_txt(resolved))
+stock_quant/infrastructure/providers/prices/raw_price_loader.py:40:    def load_from_stooq_txt(self, path: Path) -> pd.DataFrame:
+stock_quant/infrastructure/providers/prices/raw_price_loader.py:47:        return self._normalize_frame(df, source_name=f"stooq:{txt_path.name}")
+stock_quant/infrastructure/providers/prices/raw_price_loader.py:93:                            source_name=f"zip-stooq:{zip_path.name}:{Path(member).name}",
+stock_quant/infrastructure/providers/prices/raw_price_loader.py:135:                frames.append(self._normalize_frame(df, source_name=f"dir-stooq:{txt_file.name}"))
+stock_quant/infrastructure/providers/prices/raw_price_loader.py:158:                frames.append(self.load_from_stooq_txt(resolved))
+
+===== SHOW HISTORICAL PRICE PROVIDER =====
+from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from stock_quant.domain.ports.providers import PriceSourcePort
+from stock_quant.infrastructure.providers.prices.raw_price_loader import RawPriceLoader
+
+
+class HistoricalPriceProvider(PriceSourcePort):
+    def __init__(self, source_paths: list[str | Path], loader: RawPriceLoader | None = None) -> None:
+        self._source_paths = [Path(path).expanduser().resolve() for path in source_paths]
+        self._loader = loader or RawPriceLoader()
+
+    def fetch_daily_prices(self, symbols: list[str] | None, as_of: date | None = None) -> Iterable[Any]:
+        end_date = as_of
+        start_date = as_of
+        return self.fetch_history(symbols=symbols, start_date=start_date, end_date=end_date)
+
+    def fetch_history(
+        self,
+        symbols: list[str] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> Iterable[Any]:
+        frame = self._loader.load_many(self._source_paths)
+        frame = self._filter_frame(frame, symbols=symbols, start_date=start_date, end_date=end_date)
+        return frame.to_dict(orient="records")
+
+    def fetch_history_frame(
+        self,
+        symbols: list[str] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        frame = self._loader.load_many(self._source_paths)
+        return self._filter_frame(frame, symbols=symbols, start_date=start_date, end_date=end_date)
+
+    def _filter_frame(
+        self,
+        frame: pd.DataFrame,
+        symbols: list[str] | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> pd.DataFrame:
+        filtered = frame.copy()
+
+        normalized_symbols = {
+            str(symbol).strip().upper()
+            for symbol in (symbols or [])
+            if str(symbol).strip()
+        }
+        if normalized_symbols:
+            filtered = filtered[filtered["symbol"].isin(normalized_symbols)]
+
+        if start_date is not None:
+            filtered = filtered[filtered["price_date"] >= start_date]
+
+        if end_date is not None:
+            filtered = filtered[filtered["price_date"] <= end_date]
+
+        return filtered.sort_values(["symbol", "price_date"]).reset_index(drop=True)
+
+===== SHOW BUILD_PRICES PIPELINE =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+from stock_quant.app.services.price_ingestion_service import (
+    PriceIngestionResult,
+    PriceIngestionService,
+)
+from stock_quant.shared.exceptions import PipelineError
+
+
+@dataclass(slots=True)
+class BuildPricesPipelineResult:
+    """
+    Résultat canonique du pipeline prix.
+
+    Contrat métier
+    --------------
+    - `price_history` = normalized canonique
+    - `price_latest` = serving only
+    - le pipeline ne doit jamais promouvoir `price_latest` comme source de recherche
+    """
+    requested_symbols: int
+    fetched_symbols: int
+    written_price_history_rows: int
+    price_latest_rows_after_refresh: int
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+class BuildPricesPipeline:
+    """
+    Pipeline canonique du domaine prix.
+
+    Responsabilités
+    ----------------
+    - déléguer l'ingestion incrémentale à PriceIngestionService
+    - exposer un contrat stable au CLI / orchestrateur
+    - garder un design homogène avec le reste du codebase
+
+    Notes anti-biais
+    ----------------
+    - `price_history` est la seule table normalized canonique
+    - `price_latest` ne doit jamais servir aux backtests / features
+    """
+
+    pipeline_name = "build_prices"
+
+    def __init__(self, price_ingestion_service: PriceIngestionService) -> None:
+        self.price_ingestion_service = price_ingestion_service
+
+    def run(
+        self,
+        symbols: Iterable[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> BuildPricesPipelineResult:
+        try:
+            result = self.price_ingestion_service.ingest_incremental(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            return self._to_pipeline_result(result)
+        except Exception as exc:
+            if isinstance(exc, PipelineError):
+                raise
+            raise PipelineError(f"failed to run build_prices pipeline: {exc}") from exc
+
+    def _to_pipeline_result(
+        self,
+        result: PriceIngestionResult,
+    ) -> BuildPricesPipelineResult:
+        return BuildPricesPipelineResult(
+            requested_symbols=result.requested_symbols,
+            fetched_symbols=result.fetched_symbols,
+            written_price_history_rows=result.written_price_history_rows,
+            price_latest_rows_after_refresh=result.price_latest_rows_after_refresh,
+            start_date=result.start_date,
+            end_date=result.end_date,
+        )
+
+
+# ----------------------------------------------------------------------
+# Aliases de compatibilité
+# ----------------------------------------------------------------------
+PricesPipelineResult = BuildPricesPipelineResult
+PricesPipeline = BuildPricesPipeline
+
+__all__ = [
+    "BuildPricesPipeline",
+    "BuildPricesPipelineResult",
+    "PricesPipeline",
+    "PricesPipelineResult",
+]
+
+===== SHOW PRICE INGESTION SERVICE =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Iterable
+
+import pandas as pd
+
+from stock_quant.domain.entities.prices import PriceBar, RawPriceBar
+from stock_quant.shared.exceptions import ServiceError
+
+
+@dataclass(slots=True)
+class PriceIngestionResult:
+    requested_symbols: int
+    fetched_symbols: int
+    written_price_history_rows: int
+    price_latest_rows_after_refresh: int
+
+
+class PriceIngestionService:
+    """
+    Dual-surface price service.
+
+    Supported modes:
+    - legacy in-memory build(raw_bars, allowed_symbols=...)
+    - incremental ingest_incremental(...) backed by repository/provider
+    """
+
+    def __init__(self, price_repository=None, historical_price_provider=None) -> None:
+        self.price_repository = price_repository
+        self.historical_price_provider = historical_price_provider
+
+    # ------------------------------------------------------------------
+    # Legacy test-compatible surface
+    # ------------------------------------------------------------------
+
+    def build(
+        self,
+        raw_bars: Iterable[RawPriceBar],
+        *,
+        allowed_symbols: set[str],
+    ) -> tuple[list[PriceBar], dict[str, int]]:
+        normalized_allowed = {self._norm_symbol(s) for s in allowed_symbols if self._norm_symbol(s)}
+        accepted: list[PriceBar] = []
+        metrics = {
+            "raw_bars": 0,
+            "accepted_bars": 0,
+            "skipped_not_in_universe": 0,
+            "skipped_invalid": 0,
+        }
+
+        for raw in raw_bars:
+            metrics["raw_bars"] += 1
+            symbol = self._norm_symbol(getattr(raw, "symbol", None))
+            if not symbol or symbol not in normalized_allowed:
+                metrics["skipped_not_in_universe"] += 1
+                continue
+
+            normalized = self._normalize_raw_bar(raw, symbol=symbol)
+            if normalized is None:
+                metrics["skipped_invalid"] += 1
+                continue
+
+            accepted.append(normalized)
+            metrics["accepted_bars"] += 1
+
+        return accepted, metrics
+
+    def _normalize_raw_bar(self, raw: RawPriceBar, *, symbol: str) -> PriceBar | None:
+        price_date = getattr(raw, "price_date", None)
+        if price_date is None:
+            return None
+
+        close = self._to_float(getattr(raw, "close", None))
+        open_ = self._to_float(getattr(raw, "open", None))
+        high = self._to_float(getattr(raw, "high", None))
+        low = self._to_float(getattr(raw, "low", None))
+        volume = self._to_int(getattr(raw, "volume", None), default=0)
+        source_name = str(getattr(raw, "source_name", "unknown") or "unknown").strip() or "unknown"
+
+        if close is None and any(v is None for v in (open_, high, low)):
+            return None
+
+        if close is None:
+            close = open_ if open_ is not None else high if high is not None else low
+        if close is None:
+            return None
+
+        if open_ is None:
+            open_ = close
+        if high is None:
+            high = close
+        if low is None:
+            low = close
+
+        if high < low:
+            return None
+        if open_ < 0 or high < 0 or low < 0 or close < 0 or volume < 0:
+            return None
+        if high < max(open_, close) or low > min(open_, close):
+            return None
+
+        return PriceBar(
+            symbol=symbol,
+            price_date=price_date,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            source_name=source_name,
+            ingested_at=datetime.utcnow(),
+        )
+
+    # ------------------------------------------------------------------
+    # Incremental repository/provider surface
+    # ------------------------------------------------------------------
+
+    def ingest_incremental(
+        self,
+        symbols: Iterable[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> PriceIngestionResult:
+        if self.price_repository is None or self.historical_price_provider is None:
+            raise ServiceError("price_repository and historical_price_provider are required for incremental ingestion")
+
+        try:
+            allowed_symbols = self._normalize_symbols(self.price_repository.list_allowed_symbols())
+            if not allowed_symbols:
+                raise ServiceError("no allowed symbols available for price ingestion")
+
+            requested_symbols = self._resolve_requested_symbols(
+                allowed_symbols=allowed_symbols,
+                requested_symbols=symbols,
+            )
+            if not requested_symbols:
+                return PriceIngestionResult(
+                    requested_symbols=0,
+                    fetched_symbols=0,
+                    written_price_history_rows=0,
+                    price_latest_rows_after_refresh=self.price_repository.refresh_price_latest([]),
+                )
+
+            raw_frame = self._fetch_prices(
+                symbols=requested_symbols,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            normalized_frame = self._normalize_price_frame(raw_frame)
+
+            touched_symbols = []
+            if not normalized_frame.empty:
+                touched_symbols = sorted(
+                    {
+                        str(symbol).strip().upper()
+                        for symbol in normalized_frame["symbol"].dropna().tolist()
+                        if str(symbol).strip()
+                    }
+                )
+
+            written_rows = self.price_repository.upsert_price_history(normalized_frame)
+            latest_rows_after_refresh = self.price_repository.refresh_price_latest(touched_symbols)
+
+            return PriceIngestionResult(
+                requested_symbols=len(requested_symbols),
+                fetched_symbols=len(touched_symbols),
+                written_price_history_rows=written_rows,
+                price_latest_rows_after_refresh=latest_rows_after_refresh,
+            )
+        except Exception as exc:
+            if isinstance(exc, ServiceError):
+                raise
+            raise ServiceError(f"failed to ingest incremental prices: {exc}") from exc
+
+    def _resolve_requested_symbols(
+        self,
+        allowed_symbols: list[str],
+        requested_symbols: Iterable[str] | None,
+    ) -> list[str]:
+        allowed_set = set(allowed_symbols)
+        if requested_symbols is None:
+            return allowed_symbols
+
+        requested = self._normalize_symbols(requested_symbols)
+        return [symbol for symbol in requested if symbol in allowed_set]
+
+    def _fetch_prices(
+        self,
+        symbols: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ):
+        fetch_method = getattr(self.historical_price_provider, "fetch_prices", None)
+        if callable(fetch_method):
+            return fetch_method(symbols=symbols, start_date=start_date, end_date=end_date)
+
+        fallback_method = getattr(self.historical_price_provider, "fetch", None)
+        if callable(fallback_method):
+            return fallback_method(symbols=symbols, start_date=start_date, end_date=end_date)
+
+        raise ServiceError("historical price provider has no supported fetch method")
+
+    def _normalize_price_frame(self, frame: Any) -> pd.DataFrame:
+        if frame is None:
+            return self._empty_price_frame()
+
+        if isinstance(frame, list):
+            if not frame:
+                return self._empty_price_frame()
+            frame = pd.DataFrame(frame)
+
+        if not isinstance(frame, pd.DataFrame):
+            raise ServiceError(f"unsupported provider frame type: {type(frame)!r}")
+
+        if frame.empty:
+            return self._empty_price_frame()
+
+        normalized = frame.copy()
+        normalized.columns = [str(col).strip() for col in normalized.columns]
+
+        rename_map = {}
+        lower_to_actual = {str(col).strip().lower(): col for col in normalized.columns}
+        for src, dst in {
+            "date": "price_date",
+            "datetime": "price_date",
+            "timestamp": "price_date",
+            "adj close": "close",
+            "adj_close": "close",
+        }.items():
+            if src in lower_to_actual and dst not in normalized.columns:
+                rename_map[lower_to_actual[src]] = dst
+        if rename_map:
+            normalized = normalized.rename(columns=rename_map)
+
+        required = ["symbol", "price_date", "open", "high", "low", "close", "volume"]
+        missing = [name for name in required if name not in normalized.columns]
+        if missing:
+            raise ServiceError(f"provider frame missing required columns: {missing}")
+
+        if "source_name" not in normalized.columns:
+            normalized["source_name"] = "yfinance"
+        if "ingested_at" not in normalized.columns:
+            normalized["ingested_at"] = pd.Timestamp.utcnow()
+
+        normalized["symbol"] = normalized["symbol"].astype(str).str.strip().str.upper()
+        normalized["price_date"] = pd.to_datetime(normalized["price_date"], errors="coerce").dt.date
+        normalized["open"] = pd.to_numeric(normalized["open"], errors="coerce")
+        normalized["high"] = pd.to_numeric(normalized["high"], errors="coerce")
+        normalized["low"] = pd.to_numeric(normalized["low"], errors="coerce")
+        normalized["close"] = pd.to_numeric(normalized["close"], errors="coerce")
+        normalized["volume"] = pd.to_numeric(normalized["volume"], errors="coerce").fillna(0).astype("int64")
+        normalized["source_name"] = normalized["source_name"].astype(str).str.strip().replace("", "yfinance")
+        normalized["ingested_at"] = pd.to_datetime(normalized["ingested_at"], errors="coerce").fillna(pd.Timestamp.utcnow())
+
+        normalized = normalized[
+            ["symbol", "price_date", "open", "high", "low", "close", "volume", "source_name", "ingested_at"]
+        ].dropna(subset=["symbol", "price_date", "open", "high", "low", "close"])
+
+        if normalized.empty:
+            return self._empty_price_frame()
+
+        normalized = normalized.sort_values(
+            by=["symbol", "price_date", "ingested_at"],
+            ascending=[True, True, True],
+        ).drop_duplicates(subset=["symbol", "price_date"], keep="last")
+
+        return normalized.reset_index(drop=True)
+
+    def _empty_price_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "price_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "source_name",
+                "ingested_at",
+            ]
+        )
+
+    def _normalize_symbols(self, symbols: Iterable[str]) -> list[str]:
+        return sorted({self._norm_symbol(symbol) for symbol in symbols if self._norm_symbol(symbol)})
+
+    def _norm_symbol(self, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip().upper()
+
+    def _to_float(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _to_int(self, value: Any, *, default: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+===== DONE =====
