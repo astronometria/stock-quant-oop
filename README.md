@@ -1,72 +1,69 @@
 # stock-quant-oop
 
-Pipeline orienté objet pour construire un référentiel marché US, un référentiel symboles, l’historique de prix, et les tables de base nécessaires aux enrichissements aval.
+Quant research pipeline (OOP) with strict point-in-time guarantees.
 
-## État actuel
+## Core Principles
 
-Le coeur OOP en place couvre déjà :
+- price_history = canonical
+- price_latest = serving only (never used in research)
+- all joins are point-in-time using available_at
+- no fallback to period_end_date
+- dataset is reproducible and versioned
 
-- initialisation du schéma DuckDB
-- construction de `market_universe`
-- construction de `symbol_reference`
-- construction de `price_history` et `price_latest`
-- provider prix daily via `yfinance`
-- orchestrateur Python pour le core pipeline
-- couche providers pour FINRA, news raw et symbol staging
-- wrappers de compatibilité pour conserver les anciennes entrées CLI
+## Data Layers
 
-## Structure du repo
+### Raw
+- SEC filings
+- NASDAQ / symbol sources
+- FINRA short interest
+- price raw (stooq / yahoo)
 
-- `cli/core/` : points d’entrée principaux
-- `cli/ops/` : opérations récurrentes ou lourdes
-- `cli/raw/` : scripts raw / staging déplacés hors du chemin principal
-- `cli/tools/` : utilitaires d’export
-- `stock_quant/` : package applicatif
-- `docs/` : documentation projet
-- `tests/` : tests unitaires et d’intégration
+### Normalized
+- sec_filing
+- sec_fact_normalized
+- finra_short_interest_history
+- price_history
 
-## Commandes coeur
+### Derived
+- fundamental_features_daily
+- short_features_daily
+- training_dataset_daily
 
-### Initialiser la base
+## Pipelines
 
-    python3 cli/core/init_market_db.py --db-path ~/stock-quant-oop/market.duckdb
+Core rebuild:
 
-### Construire l’univers marché
+    python3 cli/ops/rebuild_database_from_scratch.py --db-path ~/stock-quant-oop/market.duckdb
 
-    python3 cli/core/build_market_universe.py --db-path ~/stock-quant-oop/market.duckdb
+Includes:
+- symbol sources
+- market universe
+- SEC filings
+- SEC normalized facts
+- fundamentals
+- price backfill (stooq)
+- price daily (yahoo)
+- FINRA short interest
 
-### Construire le référentiel symboles
+## Research Dataset
 
-    python3 cli/core/build_symbol_reference.py --db-path ~/stock-quant-oop/market.duckdb
+training_dataset_daily is:
 
-### Construire les prix
+- point-in-time correct
+- no future leakage
+- deduplicated per (symbol, price_date)
 
-Mode daily via `yfinance` :
+## Guarantees
 
-    python3 cli/core/build_prices.py \
-      --db-path ~/stock-quant-oop/market.duckdb \
-      --mode daily \
-      --symbol AAPL
+- fundamentals visible only after available_at
+- short interest visible only after available_at
+- no use of price_latest in research
+- no implicit look-ahead bias
 
-Mode backfill via sources historiques :
+## Structure
 
-    python3 cli/core/build_prices.py \
-      --db-path ~/stock-quant-oop/market.duckdb \
-      --mode backfill \
-      --historical-source /chemin/source.csv
-
-### Lancer le core pipeline
-
-    python3 cli/core/run_core_pipeline.py \
-      --db-path ~/stock-quant-oop/market.duckdb
-
-## Documentation
-
-- `docs/ARCHITECTURE.md`
-- `docs/PIPELINE_USAGE.md`
-- `docs/PRICE_PIPELINE.md`
-
-## Remarques
-
-- Le provider daily officiel pour les prix est `yfinance`.
-- Les scripts raw/staging ont été déplacés sous `cli/raw/`, avec wrappers de compatibilité en racine `cli/`.
+- stock_quant/ → core package
+- cli/core/ → main entry points
+- cli/ops/ → orchestration
+- cli/raw/ → raw ingestion
+- tests/ → unit + integration tests
