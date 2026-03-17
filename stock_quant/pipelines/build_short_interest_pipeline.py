@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
+from stock_quant.app.services.short_interest_service import ShortInterestService
 from stock_quant.pipelines.base_pipeline import BasePipeline
-from stock_quant.shared.exceptions import PipelineError
 
 
 try:
@@ -16,28 +16,32 @@ class BuildShortInterestPipeline(BasePipeline):
     """
     Canonical FINRA short-interest pipeline.
 
-    Important:
-    - raw ingestion and canonical build are two different phases
-    - the existence of rows in `finra_short_interest_sources` does NOT mean
-      that `finra_short_interest_history` and `finra_short_interest_latest`
-      are already materialized
-    - this pipeline must decide whether to build from table state, not only
-      from "pending file" semantics
+    Backward-compatible constructor:
+    - service=ShortInterestService(...)
+    - repository=DuckDbShortInterestRepository(...)
+    - uow=... (reserved compatibility hook)
 
-    Expected behavior:
-    - if raw rows exist and history is empty -> build
-    - if raw rows exist and latest is empty -> build
-    - if raw source_date is newer than history settlement_date -> build
-    - otherwise -> noop
+    Build decision is based on table state, not only on "pending file" logic.
     """
 
     pipeline_name = "build_short_interest"
 
-    def __init__(self, service) -> None:
+    def __init__(self, service=None, repository=None, uow=None) -> None:
+        # Compatibilité rétroactive avec les anciens call-sites qui injectent
+        # directement `repository=...`.
+        if service is None:
+            if repository is not None:
+                service = ShortInterestService(repository=repository)
+            else:
+                raise ValueError(
+                    "BuildShortInterestPipeline requires either service=... or repository=..."
+                )
+
         self.service = service
         self.repository = getattr(service, "repository", None)
+        self.uow = uow
         if self.repository is None:
-            raise ValueError("BuildShortInterestPipeline requires a service with a repository")
+            raise ValueError("BuildShortInterestPipeline requires a service exposing repository")
 
         self._progress_total_steps = 5
 
@@ -47,19 +51,20 @@ class BuildShortInterestPipeline(BasePipeline):
             flush=True,
         )
 
-    def _safe_date_str(self, value) -> str | None:
+    def _safe_date_str(self, value):
         if value is None:
             return None
         return str(value)
 
     def _collect_build_state(self) -> dict:
         """
-        Read only the minimum state required to decide whether the canonical
-        build must run.
+        Décide si la matérialisation canonique doit être exécutée.
 
-        We intentionally base this on table contents, because:
-        - source_raw/source tables reflect raw ingestion status
-        - history/latest reflect canonical materialization status
+        Règles:
+        - raw > 0 et history == 0 -> build
+        - raw > 0 et latest == 0 -> build
+        - max(raw.source_date) > max(history.settlement_date) -> build
+        - sinon noop
         """
         repo = self.repository
 
@@ -75,8 +80,10 @@ class BuildShortInterestPipeline(BasePipeline):
         should_build_because_history_empty = raw_row_count > 0 and history_row_count == 0
         should_build_because_latest_empty = raw_row_count > 0 and latest_row_count == 0
         should_build_because_raw_newer_than_history = (
-            max_raw_source_date is not None and (
-                max_history_settlement_date is None or max_raw_source_date > max_history_settlement_date
+            max_raw_source_date is not None
+            and (
+                max_history_settlement_date is None
+                or max_raw_source_date > max_history_settlement_date
             )
         )
 
@@ -113,9 +120,6 @@ class BuildShortInterestPipeline(BasePipeline):
         }
 
     def run(self) -> PipelineResult:
-        """
-        Execute the canonical short-interest materialization pipeline.
-        """
         self._log_step(1, "detect canonical short-interest build need from table state")
 
         state = self._collect_build_state()
