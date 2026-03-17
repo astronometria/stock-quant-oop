@@ -1,22 +1,9 @@
 from __future__ import annotations
 
-"""
-Canonical incremental FINRA short-interest pipeline.
-
-Responsabilités :
-- détecter les nouveaux source_file dans finra_short_interest_source_raw
-- charger seulement les fichiers non encore normalisés
-- transformer via le service métier
-- upsert dans finra_short_interest_history
-- upsert dans finra_short_interest_sources
-- rebuild finra_short_interest_latest
-- finir en noop s'il n'y a rien de nouveau
-"""
-
-from dataclasses import dataclass, field
-from datetime import datetime
-
+from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.pipelines.base_pipeline import BasePipeline
+from stock_quant.shared.exceptions import PipelineError
+
 
 try:
     from tqdm import tqdm
@@ -25,36 +12,33 @@ except Exception:
         return iterable
 
 
-@dataclass
-class BuildShortInterestPipelineResult:
-    pipeline_name: str
-    status: str
-    started_at: str
-    finished_at: str
-    rows_read: int
-    rows_written: int
-    error_message: str | None = None
-    metrics: dict[str, int] = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "pipeline_name": self.pipeline_name,
-            "status": self.status,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "rows_read": self.rows_read,
-            "rows_written": self.rows_written,
-            "error_message": self.error_message,
-            "metrics": self.metrics,
-        }
-
-
 class BuildShortInterestPipeline(BasePipeline):
+    """
+    Canonical FINRA short-interest pipeline.
+
+    Important:
+    - raw ingestion and canonical build are two different phases
+    - the existence of rows in `finra_short_interest_sources` does NOT mean
+      that `finra_short_interest_history` and `finra_short_interest_latest`
+      are already materialized
+    - this pipeline must decide whether to build from table state, not only
+      from "pending file" semantics
+
+    Expected behavior:
+    - if raw rows exist and history is empty -> build
+    - if raw rows exist and latest is empty -> build
+    - if raw source_date is newer than history settlement_date -> build
+    - otherwise -> noop
+    """
+
     pipeline_name = "build_short_interest"
 
-    def __init__(self, repository, service) -> None:
-        self.repository = repository
+    def __init__(self, service) -> None:
         self.service = service
+        self.repository = getattr(service, "repository", None)
+        if self.repository is None:
+            raise ValueError("BuildShortInterestPipeline requires a service with a repository")
+
         self._progress_total_steps = 5
 
     def _log_step(self, step_no: int, label: str) -> None:
@@ -63,100 +47,120 @@ class BuildShortInterestPipeline(BasePipeline):
             flush=True,
         )
 
-    def run(self) -> BuildShortInterestPipelineResult:
-        started_at = datetime.utcnow()
-        metrics: dict[str, int] = {}
+    def _safe_date_str(self, value) -> str | None:
+        if value is None:
+            return None
+        return str(value)
 
-        try:
-            # -------------------------------------------------
-            # 1) detect pending source files
-            # -------------------------------------------------
-            self._log_step(1, "detect pending FINRA short-interest source files")
-            pending_source_files = self.repository.list_pending_source_files()
+    def _collect_build_state(self) -> dict:
+        """
+        Read only the minimum state required to decide whether the canonical
+        build must run.
 
-            metrics["pending_source_file_count"] = len(pending_source_files)
+        We intentionally base this on table contents, because:
+        - source_raw/source tables reflect raw ingestion status
+        - history/latest reflect canonical materialization status
+        """
+        repo = self.repository
 
-            if not pending_source_files:
-                finished_at = datetime.utcnow()
-                return BuildShortInterestPipelineResult(
-                    pipeline_name=self.pipeline_name,
-                    status="noop",
-                    started_at=started_at.isoformat(),
-                    finished_at=finished_at.isoformat(),
-                    rows_read=0,
-                    rows_written=0,
-                    error_message=None,
-                    metrics=metrics,
-                )
+        raw_row_count = int(repo.get_raw_row_count())
+        source_row_count = int(repo.get_source_row_count())
+        history_row_count = int(repo.get_history_row_count())
+        latest_row_count = int(repo.get_latest_row_count())
 
-            # -------------------------------------------------
-            # 2) load raw rows only for pending files
-            # -------------------------------------------------
-            self._log_step(2, "load raw rows for pending source files")
-            raw_records = self.repository.load_raw_short_interest_records_for_source_files(
-                pending_source_files
+        max_raw_source_date = repo.get_max_raw_source_date()
+        max_history_settlement_date = repo.get_max_history_settlement_date()
+        max_latest_settlement_date = repo.get_max_latest_settlement_date()
+
+        should_build_because_history_empty = raw_row_count > 0 and history_row_count == 0
+        should_build_because_latest_empty = raw_row_count > 0 and latest_row_count == 0
+        should_build_because_raw_newer_than_history = (
+            max_raw_source_date is not None and (
+                max_history_settlement_date is None or max_raw_source_date > max_history_settlement_date
             )
-            metrics["raw_record_count"] = len(raw_records)
+        )
 
-            # -------------------------------------------------
-            # 3) transform raw -> normalized domain entries
-            # -------------------------------------------------
-            self._log_step(3, "transform raw short-interest rows")
-            history_entries, source_entries, service_metrics = (
-                self.service.build_history_entries_from_raw(
-                    raw_records,
-                    source_market="both",
-                )
-            )
-            metrics.update(service_metrics)
-            metrics["history_entry_count"] = len(history_entries)
-            metrics["source_entry_count"] = len(source_entries)
+        should_build = (
+            should_build_because_history_empty
+            or should_build_because_latest_empty
+            or should_build_because_raw_newer_than_history
+        )
 
-            # -------------------------------------------------
-            # 4) upsert history + source metadata
-            # -------------------------------------------------
-            self._log_step(4, "upsert history and source metadata")
-            inserted_history = self.repository.upsert_short_interest_history(history_entries)
-            inserted_sources = self.repository.upsert_short_interest_sources(source_entries)
+        if raw_row_count == 0:
+            build_reason = "no_raw_rows"
+        elif should_build_because_history_empty:
+            build_reason = "history_empty_with_raw_present"
+        elif should_build_because_latest_empty:
+            build_reason = "latest_empty_with_raw_present"
+        elif should_build_because_raw_newer_than_history:
+            build_reason = "raw_newer_than_history"
+        else:
+            build_reason = "already_materialized"
 
-            metrics["inserted_history_rows"] = int(inserted_history)
-            metrics["inserted_source_rows"] = int(inserted_sources)
+        return {
+            "raw_row_count": raw_row_count,
+            "source_row_count": source_row_count,
+            "history_row_count": history_row_count,
+            "latest_row_count": latest_row_count,
+            "max_raw_source_date": self._safe_date_str(max_raw_source_date),
+            "max_history_settlement_date": self._safe_date_str(max_history_settlement_date),
+            "max_latest_settlement_date": self._safe_date_str(max_latest_settlement_date),
+            "should_build_because_history_empty": should_build_because_history_empty,
+            "should_build_because_latest_empty": should_build_because_latest_empty,
+            "should_build_because_raw_newer_than_history": should_build_because_raw_newer_than_history,
+            "should_build": should_build,
+            "build_reason": build_reason,
+        }
 
-            # -------------------------------------------------
-            # 5) rebuild latest
-            # -------------------------------------------------
-            self._log_step(5, "rebuild latest short-interest snapshot")
-            latest_row_count = self.repository.rebuild_short_interest_latest()
-            metrics["latest_row_count"] = int(latest_row_count)
+    def run(self) -> PipelineResult:
+        """
+        Execute the canonical short-interest materialization pipeline.
+        """
+        self._log_step(1, "detect canonical short-interest build need from table state")
 
-            finished_at = datetime.utcnow()
+        state = self._collect_build_state()
 
-            return BuildShortInterestPipelineResult(
+        if state["raw_row_count"] == 0:
+            return PipelineResult(
                 pipeline_name=self.pipeline_name,
-                status="success",
-                started_at=started_at.isoformat(),
-                finished_at=finished_at.isoformat(),
-                rows_read=len(raw_records),
-                rows_written=int(inserted_history) + int(inserted_sources),
-                error_message=None,
-                metrics=metrics,
+                status="noop",
+                rows_read=0,
+                rows_written=0,
+                metrics=state,
             )
 
-        except Exception as exc:
-            finished_at = datetime.utcnow()
-            return BuildShortInterestPipelineResult(
+        if not state["should_build"]:
+            return PipelineResult(
                 pipeline_name=self.pipeline_name,
-                status="failed",
-                started_at=started_at.isoformat(),
-                finished_at=finished_at.isoformat(),
-                rows_read=metrics.get("raw_record_count", 0),
-                rows_written=metrics.get("inserted_history_rows", 0) + metrics.get("inserted_source_rows", 0),
-                error_message=str(exc),
-                metrics=metrics,
+                status="noop",
+                rows_read=state["raw_row_count"],
+                rows_written=0,
+                metrics=state,
             )
 
+        self._log_step(2, "load raw short-interest rows from staging")
+        rows_read = int(self.service.load_raw())
 
-# ---------------------------------------------------------------------
-# Backward-compatible alias during migration
-# ---------------------------------------------------------------------
-FinraShortInterestPipeline = BuildShortInterestPipeline
+        self._log_step(3, "build canonical short-interest history")
+        history_written = int(self.service.build_history())
+
+        self._log_step(4, "rebuild canonical short-interest latest snapshot")
+        latest_written = int(self.service.refresh_latest())
+
+        self._log_step(5, "finalize metrics")
+        metrics = dict(state)
+        metrics.update(
+            {
+                "rows_loaded_from_raw": rows_read,
+                "history_rows_written": history_written,
+                "latest_rows_written": latest_written,
+            }
+        )
+
+        return PipelineResult(
+            pipeline_name=self.pipeline_name,
+            status="success",
+            rows_read=rows_read,
+            rows_written=history_written,
+            metrics=metrics,
+        )
