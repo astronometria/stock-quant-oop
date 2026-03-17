@@ -8,6 +8,7 @@ Objectif:
 - construire `finra_short_interest_history`
 - reconstruire `finra_short_interest_latest`
 - rester compatible avec des services qui retournent soit un int, soit un dict
+- compter correctement les lignes écrites à partir des clés réellement retournées
 
 Important:
 - cette pipeline ne doit pas recaster brutalement en int un résultat dict
@@ -48,6 +49,7 @@ class BuildShortInterestPipeline:
     def _safe_result_payload(self, value: Any) -> dict[str, Any]:
         """
         Normalise n'importe quel retour de service en dictionnaire.
+
         Cas supportés:
         - dict
         - int / float / bool
@@ -100,6 +102,15 @@ class BuildShortInterestPipeline:
                     except Exception:
                         continue
         return default
+
+    def _metric_delta(self, payload: dict[str, Any], before_key: str, after_key: str) -> int:
+        """
+        Calcule un delta after-before si les deux clés existent.
+        """
+        before_val = self._safe_metric_int(payload, before_key, default=0)
+        after_val = self._safe_metric_int(payload, after_key, default=0)
+        delta = after_val - before_val
+        return delta if delta >= 0 else 0
 
     def _read_scalar(self, repository: Any, method_name: str, default: int = 0) -> int:
         method = getattr(repository, method_name, None)
@@ -251,14 +262,22 @@ class BuildShortInterestPipeline:
 
             history_rows_written = self._safe_metric_int(
                 history_payload,
-                "rows_written",
+                "history_rows_written",
+                "history_rows_inserted",
                 "inserted_rows",
                 "upserted_rows",
-                "history_rows_written",
+                "rows_written",
                 "row_count",
                 "value",
-                default=0,
+                default=-1,
             )
+            if history_rows_written < 0:
+                history_rows_written = self._metric_delta(
+                    history_payload,
+                    "history_rows_before",
+                    "history_rows_after",
+                )
+
             metrics["history_rows_written"] = history_rows_written
             rows_written += history_rows_written
 
@@ -269,14 +288,22 @@ class BuildShortInterestPipeline:
 
             latest_rows_written = self._safe_metric_int(
                 latest_payload,
-                "rows_written",
+                "latest_rows_written",
+                "latest_rows_inserted",
                 "inserted_rows",
                 "replaced_rows",
-                "latest_rows_written",
+                "rows_written",
                 "row_count",
                 "value",
-                default=0,
+                default=-1,
             )
+            if latest_rows_written < 0:
+                latest_rows_written = self._metric_delta(
+                    latest_payload,
+                    "latest_rows_before",
+                    "latest_rows_after",
+                )
+
             metrics["latest_rows_written"] = latest_rows_written
             rows_written += latest_rows_written
 
