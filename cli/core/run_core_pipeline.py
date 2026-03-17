@@ -86,9 +86,9 @@ def _auto_disable_missing_source_chains(args: argparse.Namespace) -> None:
     Make the core pipeline safe for lightweight test runs and empty-db smoke runs.
 
     Dependency rules:
-    - no symbol source  => skip symbol load + universe + symbol reference
-    - no FINRA source   => skip FINRA load + FINRA build
-    - no news source    => skip news load + news raw + news candidates
+    - no symbol source -> skip symbol load + universe + symbol reference
+    - no FINRA source  -> skip FINRA load + FINRA build
+    - no news source   -> skip news load + news raw + news candidates
     """
     if not args.symbol_sources:
         args.skip_symbol_load = True
@@ -174,7 +174,7 @@ def main() -> int:
     if not args.skip_finra_load:
         finra_args: list[str] = []
         _extend_repeatable(finra_args, "--source", args.finra_sources)
-        _append_if(finra_1args, "--truncate", args.truncate_raw)
+        _append_if(finra_args, "--truncate", args.truncate_raw)
         steps.append(
             CorePipelineStep(
                 name="load_finra_short_interest_source_raw",
