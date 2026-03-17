@@ -9,7 +9,7 @@ import duckdb
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Bootstrap research prerequisites from canonical production tables."
+        description="Bootstrap research prerequisites from existing canonical tables."
     )
     parser.add_argument("--db-path", required=True, help="Path to DuckDB database file.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
@@ -29,18 +29,172 @@ def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     return bool(row and row[0] > 0)
 
 
-def column_exists(con: duckdb.DuckDBPyConnection, table_name: str, column_name: str) -> bool:
-    row = con.execute(
+def get_columns(con: duckdb.DuckDBPyConnection, table_name: str) -> list[str]:
+    rows = con.execute(
         """
-        SELECT COUNT(*)
+        SELECT column_name
         FROM information_schema.columns
         WHERE table_schema = 'main'
           AND table_name = ?
-          AND column_name = ?
+        ORDER BY ordinal_position
         """,
-        [table_name, column_name],
-    ).fetchone()
-    return bool(row and row[0] > 0)
+        [table_name],
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def has_column(con: duckdb.DuckDBPyConnection, table_name: str, column_name: str) -> bool:
+    return column_name in get_columns(con, table_name)
+
+
+def scalar(con: duckdb.DuckDBPyConnection, sql: str) -> int:
+    row = con.execute(sql).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def bootstrap_price_bars_adjusted(con: duckdb.DuckDBPyConnection) -> None:
+    if not table_exists(con, "price_bars_adjusted"):
+        raise RuntimeError("missing table price_bars_adjusted")
+
+    if not table_exists(con, "price_history"):
+        raise RuntimeError("missing table price_history")
+
+    con.execute("DELETE FROM price_bars_adjusted")
+
+    source_cols = set(get_columns(con, "price_history"))
+    target_cols = get_columns(con, "price_bars_adjusted")
+
+    expressions: dict[str, str] = {
+        "symbol": "symbol",
+        "bar_date": "price_date",
+        "price_date": "price_date",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "adjusted_close": "close",
+        "volume": "volume",
+        "source_name": "source_name" if "source_name" in source_cols else "'bootstrap_research_inputs'",
+        "ingested_at": "ingested_at" if "ingested_at" in source_cols else "CURRENT_TIMESTAMP",
+        "created_at": "CURRENT_TIMESTAMP",
+        "updated_at": "CURRENT_TIMESTAMP",
+    }
+
+    insert_cols: list[str] = []
+    select_exprs: list[str] = []
+
+    for col in target_cols:
+        if col in expressions:
+            insert_cols.append(col)
+            select_exprs.append(f"{expressions[col]} AS {col}")
+        else:
+            # colonne inconnue du bridge actuel : on la laisse à NULL
+            insert_cols.append(col)
+            select_exprs.append(f"NULL AS {col}")
+
+    con.execute(
+        f"""
+        INSERT INTO price_bars_adjusted ({", ".join(insert_cols)})
+        SELECT
+            {", ".join(select_exprs)}
+        FROM price_history
+        """
+    )
+
+
+def bootstrap_research_universe(con: duckdb.DuckDBPyConnection) -> None:
+    if not table_exists(con, "research_universe"):
+        raise RuntimeError("missing table research_universe")
+    if not table_exists(con, "market_universe"):
+        raise RuntimeError("missing table market_universe")
+
+    con.execute("DELETE FROM research_universe")
+
+    target_cols = get_columns(con, "research_universe")
+    source_cols = set(get_columns(con, "market_universe"))
+
+    expressions: dict[str, str] = {
+        "symbol": "symbol",
+        "venue_group": "COALESCE(exchange_normalized, exchange_raw, 'UNKNOWN')",
+        "asset_class": "COALESCE(security_type, 'UNKNOWN')",
+        "is_adr": "COALESCE(is_adr, FALSE)",
+        "is_etf": "COALESCE(is_etf, FALSE)",
+        "is_common_stock": "COALESCE(is_common_stock, FALSE)",
+        "include_in_research": "TRUE",
+        "survivor_bias_aware": "TRUE",
+        "manual_override_include": "FALSE",
+        "manual_override_reason": "NULL",
+        "created_at": "CURRENT_TIMESTAMP",
+    }
+
+    insert_cols: list[str] = []
+    select_exprs: list[str] = []
+
+    for col in target_cols:
+        if col in expressions:
+            insert_cols.append(col)
+            select_exprs.append(f"{expressions[col]} AS {col}")
+        else:
+            insert_cols.append(col)
+            select_exprs.append(f"NULL AS {col}")
+
+    con.execute(
+        f"""
+        INSERT INTO research_universe ({", ".join(insert_cols)})
+        SELECT
+            {", ".join(select_exprs)}
+        FROM market_universe
+        WHERE include_in_universe = TRUE
+        """
+    )
+
+
+def bootstrap_universe_membership_history(con: duckdb.DuckDBPyConnection) -> None:
+    if not table_exists(con, "universe_membership_history"):
+        raise RuntimeError("missing table universe_membership_history")
+    if not table_exists(con, "research_universe"):
+        raise RuntimeError("missing table research_universe")
+    if not table_exists(con, "symbol_reference"):
+        raise RuntimeError("missing table symbol_reference")
+
+    con.execute("DELETE FROM universe_membership_history")
+
+    target_cols = get_columns(con, "universe_membership_history")
+
+    expressions: dict[str, str] = {
+        "instrument_id": "COALESCE(sr.symbol, ru.symbol)",
+        "company_id": "COALESCE(sr.cik, ru.symbol)",
+        "symbol": "ru.symbol",
+        "universe_name": "'research_default'",
+        "effective_from": "CURRENT_DATE",
+        "effective_to": "NULL",
+        "membership_status": "'active'",
+        "reason": "'bootstrap_research_inputs'",
+        "source_name": "'bootstrap_research_inputs'",
+        "created_at": "CURRENT_TIMESTAMP",
+    }
+
+    insert_cols: list[str] = []
+    select_exprs: list[str] = []
+
+    for col in target_cols:
+        if col in expressions:
+            insert_cols.append(col)
+            select_exprs.append(f"{expressions[col]} AS {col}")
+        else:
+            insert_cols.append(col)
+            select_exprs.append(f"NULL AS {col}")
+
+    con.execute(
+        f"""
+        INSERT INTO universe_membership_history ({", ".join(insert_cols)})
+        SELECT
+            {", ".join(select_exprs)}
+        FROM research_universe ru
+        LEFT JOIN symbol_reference sr
+          ON UPPER(TRIM(sr.symbol)) = UPPER(TRIM(ru.symbol))
+        """
+    )
 
 
 def main() -> int:
@@ -48,142 +202,18 @@ def main() -> int:
     db_path = Path(args.db_path).expanduser().resolve()
     con = duckdb.connect(str(db_path))
 
-    # ------------------------------------------------------------------
-    # 1) price_history -> price_bars_adjusted
-    # ------------------------------------------------------------------
-    if not table_exists(con, "price_bars_adjusted"):
-        raise SystemExit("missing table price_bars_adjusted; run init_feature_engine_foundation first")
-
-    con.execute("DELETE FROM price_bars_adjusted")
-
-    price_columns = {row[0] for row in con.execute("DESCRIBE price_bars_adjusted").fetchall()}
-
-    # Mapping minimal et robuste vers le schéma research historique.
-    select_parts = [
-        "symbol",
-        "price_date AS bar_date",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]
-
-    if "adjusted_close" in price_columns:
-        select_parts.append("close AS adjusted_close")
-    if "source_name" in price_columns:
-        select_parts.append("source_name")
-    if "created_at" in price_columns:
-        select_parts.append("CURRENT_TIMESTAMP AS created_at")
-    if "ingested_at" in price_columns:
-        select_parts.append("ingested_at")
-
-    insert_cols = [row[0] for row in con.execute("DESCRIBE price_bars_adjusted").fetchall()]
-    select_sql = ",\n                ".join(select_parts)
-    insert_sql = ", ".join(insert_cols)
-
-    con.execute(
-        f"""
-        INSERT INTO price_bars_adjusted ({insert_sql})
-        SELECT
-            {select_sql}
-        FROM price_history
-        """
-    )
-
-    # ------------------------------------------------------------------
-    # 2) market_universe -> research_universe
-    # ------------------------------------------------------------------
-    if not table_exists(con, "research_universe"):
-        raise SystemExit("missing table research_universe; initialize research foundations first")
-
-    con.execute("DELETE FROM research_universe")
-
-    research_cols = {row[0] for row in con.execute("DESCRIBE research_universe").fetchall()}
-
-    ru_insert_cols = []
-    ru_select_cols = []
-
-    mapping = {
-        "instrument_id": "COALESCE(sr.symbol, mu.symbol) AS instrument_id",
-        "company_id": "COALESCE(sr.cik, mu.cik, mu.symbol) AS company_id",
-        "symbol": "mu.symbol",
-        "universe_name": "'research_default' AS universe_name",
-        "effective_date": "mu.as_of_date AS effective_date",
-        "membership_status": "'active' AS membership_status",
-        "reason": "NULL AS reason",
-        "source_name": "COALESCE(mu.source_name, 'bootstrap_research_inputs') AS source_name",
-        "created_at": "CURRENT_TIMESTAMP AS created_at",
-    }
-
-    for col in mapping:
-        if col in research_cols:
-            ru_insert_cols.append(col)
-            ru_select_cols.append(mapping[col])
-
-    con.execute(
-        f"""
-        INSERT INTO research_universe ({", ".join(ru_insert_cols)})
-        SELECT
-            {", ".join(ru_select_cols)}
-        FROM market_universe mu
-        LEFT JOIN symbol_reference sr
-          ON UPPER(TRIM(sr.symbol)) = UPPER(TRIM(mu.symbol))
-        WHERE mu.include_in_universe = TRUE
-        """
-    )
-
-    # ------------------------------------------------------------------
-    # 3) research_universe -> universe_membership_history
-    # ------------------------------------------------------------------
-    if not table_exists(con, "universe_membership_history"):
-        raise SystemExit("missing table universe_membership_history")
-
-    con.execute("DELETE FROM universe_membership_history")
-
-    umh_cols = {row[0] for row in con.execute("DESCRIBE universe_membership_history").fetchall()}
-
-    umh_insert_cols = []
-    umh_select_cols = []
-
-    umh_mapping = {
-        "instrument_id": "instrument_id",
-        "company_id": "company_id",
-        "symbol": "symbol",
-        "universe_name": "universe_name",
-        "effective_from": "COALESCE(effective_date, CURRENT_DATE) AS effective_from",
-        "effective_to": "NULL AS effective_to",
-        "membership_status": "COALESCE(membership_status, 'active') AS membership_status",
-        "reason": "reason",
-        "source_name": "COALESCE(source_name, 'bootstrap_research_inputs') AS source_name",
-        "created_at": "CURRENT_TIMESTAMP AS created_at",
-    }
-
-    for col in umh_mapping:
-        if col in umh_cols:
-            umh_insert_cols.append(col)
-            umh_select_cols.append(umh_mapping[col])
-
-    con.execute(
-        f"""
-        INSERT INTO universe_membership_history ({", ".join(umh_insert_cols)})
-        SELECT
-            {", ".join(umh_select_cols)}
-        FROM research_universe
-        """
-    )
+    bootstrap_price_bars_adjusted(con)
+    bootstrap_research_universe(con)
+    bootstrap_universe_membership_history(con)
 
     if args.verbose:
-        print(f"[bootstrap_research_inputs] db_path={db_path}")
         for table_name in [
             "price_history",
             "price_bars_adjusted",
             "research_universe",
             "universe_membership_history",
         ]:
-            count = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-            print(f"[bootstrap_research_inputs] {table_name} rows={count}")
-
+            print(f"[bootstrap_research_inputs] {table_name} rows={scalar(con, f'SELECT COUNT(*) FROM {table_name}')}")
     con.close()
     return 0
 
