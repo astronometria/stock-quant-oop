@@ -1,101 +1,110 @@
 from __future__ import annotations
 
 """
-YfinancePriceProvider
+YfinancePriceProvider (batch + retry)
 
-Ajouts :
-- fetch_daily_prices_range_frame()
-
-IMPORTANT :
-- single-day = comportement existant
-- range = vrai fetch multi-jours
-- aucune logique business ici (juste accès données)
+Responsabilité :
+- fetch Yahoo
+- batching pour éviter rate limit
 """
 
-from datetime import date, timedelta
+import time
 from typing import List
 import pandas as pd
 import yfinance as yf
+from tqdm import tqdm
 
 
 class YfinancePriceProvider:
-    def fetch_daily_prices_frame(
+    def __init__(
         self,
-        *,
-        symbols: List[str],
-        as_of: date,
-    ) -> pd.DataFrame:
-        """
-        Fetch pour UNE journée (comportement historique)
-        """
-        start = as_of
-        end = as_of + timedelta(days=1)
+        batch_size: int = 200,
+        sleep_seconds: float = 1.0,
+        max_retries: int = 2,
+    ):
+        self.batch_size = batch_size
+        self.sleep_seconds = sleep_seconds
+        self.max_retries = max_retries
 
-        df = yf.download(
-            tickers=" ".join(symbols),
-            start=start,
-            end=end,
-            interval="1d",
-            progress=False,
-            group_by="ticker",
-            auto_adjust=False,
-        )
+    def _chunks(self, lst: List[str]):
+        for i in range(0, len(lst), self.batch_size):
+            yield lst[i:i + self.batch_size]
 
-        return self._normalize(df, symbols)
-
-    def fetch_daily_prices_range_frame(
+    def fetch(
         self,
-        *,
         symbols: List[str],
-        start_date: date,
-        end_date: date,
+        start_date,
+        end_date,
+        requires_range_fetch: bool,
     ) -> pd.DataFrame:
-        """
-        Fetch multi-jours réel
-        """
 
-        # yfinance end is exclusive → +1 jour
-        yf_end = end_date + timedelta(days=1)
+        all_frames = []
 
-        df = yf.download(
-            tickers=" ".join(symbols),
-            start=start_date,
-            end=yf_end,
-            interval="1d",
-            progress=False,
-            group_by="ticker",
-            auto_adjust=False,
-        )
+        batches = list(self._chunks(symbols))
 
-        return self._normalize(df, symbols)
+        for batch in tqdm(batches, desc="yfinance batches"):
+            df = self._fetch_batch_with_retry(
+                batch,
+                start_date,
+                end_date,
+                requires_range_fetch,
+            )
+            if df is not None and not df.empty:
+                all_frames.append(df)
 
-    def _normalize(self, df: pd.DataFrame, symbols: List[str]) -> pd.DataFrame:
-        """
-        Normalisation vers format long standardisé
-        """
+            time.sleep(self.sleep_seconds)
 
-        if df.empty:
-            return df
+        if not all_frames:
+            return pd.DataFrame()
 
-        records = []
+        return pd.concat(all_frames, ignore_index=True)
 
-        for symbol in symbols:
+    def _fetch_batch_with_retry(
+        self,
+        batch,
+        start_date,
+        end_date,
+        requires_range_fetch,
+    ):
+
+        for attempt in range(self.max_retries + 1):
             try:
-                sub = df[symbol]
+                return self._fetch_batch(batch, start_date, end_date)
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    print(f"[WARN] batch failed permanently: {e}")
+                    return None
+
+                print(f"[RETRY] attempt={attempt+1} error={e}")
+                time.sleep(2 * (attempt + 1))
+
+        return None
+
+    def _fetch_batch(self, batch, start_date, end_date):
+
+        data = yf.download(
+            tickers=" ".join(batch),
+            start=start_date,
+            end=end_date,
+            group_by="ticker",
+            progress=False,
+        )
+
+        if data is None or data.empty:
+            return None
+
+        frames = []
+
+        for symbol in batch:
+            try:
+                df = data[symbol].copy()
+                df["symbol"] = symbol
+                df["price_date"] = df.index.date
+                frames.append(df.reset_index(drop=True))
             except Exception:
                 continue
 
-            for idx, row in sub.iterrows():
-                records.append(
-                    {
-                        "symbol": symbol,
-                        "price_date": idx.date(),
-                        "open": row.get("Open"),
-                        "high": row.get("High"),
-                        "low": row.get("Low"),
-                        "close": row.get("Close"),
-                        "volume": row.get("Volume"),
-                    }
-                )
+        if not frames:
+            return None
 
-        return pd.DataFrame(records)
+        return pd.concat(frames, ignore_index=True)

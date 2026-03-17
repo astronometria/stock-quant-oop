@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+build_prices CLI (incremental + provider-aware)
+
+Flow :
+1. resolve canonical symbols
+2. build provider plan (Yahoo)
+3. compute refresh window
+4. fetch via adapter (batching inside provider)
+5. log metrics
+
+IMPORTANT :
+- symbol canonique != symbol provider
+"""
+
 import argparse
 import json
 from datetime import date, datetime
@@ -12,6 +26,7 @@ from stock_quant.infrastructure.repositories.duckdb_price_repository import Duck
 from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
 from stock_quant.infrastructure.providers.prices.provider_frame_adapter import ProviderFrameAdapter
 from stock_quant.app.services.price_refresh_window_service import PriceRefreshWindowService
+from stock_quant.app.services.price_provider_symbol_service import PriceProviderSymbolService
 
 
 def parse_args():
@@ -32,28 +47,35 @@ def parse_date(x):
 
 def main():
     args = parse_args()
-
     Path("logs").mkdir(exist_ok=True)
 
     repo = DuckDbPriceRepository(args.db_path)
-    provider = YfinancePriceProvider()
-    adapter = ProviderFrameAdapter(provider)
 
-    resolved_symbols, symbol_scope_source = repo.get_refresh_symbols(args.symbols)
+    # ------------------------------------------------------------------
+    # 1. resolve canonical scope
+    # ------------------------------------------------------------------
+    canonical_symbols, symbol_scope_source = repo.get_refresh_symbols(args.symbols)
 
-    if not resolved_symbols:
-        output = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": "noop",
-            "error_message": "No symbols resolved for price refresh scope.",
-            "symbol_scope_source": symbol_scope_source,
-            "symbol_count": 0,
-        }
-        with open("logs/build_prices.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps(output) + "\n")
-        print(json.dumps(output, indent=2))
-        return
+    provider_service = PriceProviderSymbolService()
+    plan = provider_service.build_yfinance_plan(canonical_symbols)
 
+    # ------------------------------------------------------------------
+    # 2. log provider plan
+    # ------------------------------------------------------------------
+    log = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "symbol_scope_source": symbol_scope_source,
+        "research_scope_symbol_count": len(canonical_symbols),
+        "provider_candidate_symbol_count": plan.total_input_count,
+        "provider_eligible_symbol_count": plan.eligible_count,
+        "provider_excluded_symbol_count": plan.excluded_count,
+        "mapping_applied_count": plan.mapping_applied_count,
+        "exclusion_breakdown": plan.exclusion_breakdown,
+    }
+
+    # ------------------------------------------------------------------
+    # 3. compute window
+    # ------------------------------------------------------------------
     window = PriceRefreshWindowService(
         repo,
         catchup_max_days=args.catchup_max_days,
@@ -62,45 +84,45 @@ def main():
         requested_end_date=parse_date(args.end_date),
         as_of=parse_date(args.as_of),
         lookback_days=args.lookback_days,
-        symbols=resolved_symbols,
+        symbols=canonical_symbols,
         today=date.today(),
     )
 
-    log = {
-        "timestamp": datetime.utcnow().isoformat(),
+    log.update({
         "effective_start_date": str(window.effective_start_date),
         "effective_end_date": str(window.effective_end_date),
         "gap_days": window.gap_days,
         "window_reason": window.window_reason,
         "is_noop": window.is_noop,
         "requires_range_fetch": window.requires_range_fetch,
-        "catchup_capped": window.catchup_capped,
-        "last_any_date": str(window.last_any_date),
-        "last_complete_date": str(window.last_complete_date),
-        "expected_symbol_count": window.expected_count,
-        "observed_latest_count": window.observed_latest_count,
-        "symbol_count": len(resolved_symbols),
-        "symbol_scope_source": symbol_scope_source,
-    }
+    })
 
-    with open("logs/build_prices.log", "a", encoding="utf-8") as f:
-        f.write(json.dumps(log) + "\n")
-
-    if window.is_noop:
+    # ------------------------------------------------------------------
+    # noop
+    # ------------------------------------------------------------------
+    if window.is_noop or not plan.eligible_provider_symbols:
         print(json.dumps(log, indent=2))
         return
 
+    # ------------------------------------------------------------------
+    # 4. fetch (provider-aware)
+    # ------------------------------------------------------------------
+    provider = YfinancePriceProvider()
+    adapter = ProviderFrameAdapter(provider)
+
     df = adapter.fetch_prices(
-        symbols=resolved_symbols,
+        provider_symbols=plan.eligible_provider_symbols,
+        provider_to_canonical=plan.provider_to_canonical,
         start_date=window.effective_start_date,
         end_date=window.effective_end_date,
         requires_range_fetch=window.requires_range_fetch,
     )
 
+    log["rows_fetched"] = 0 if df is None else len(df)
+
+    # tqdm placeholder (clean terminal)
     for _ in tqdm(range(1), desc="processing"):
         pass
-
-    log["rows_fetched"] = 0 if df is None else len(df)
 
     print(json.dumps(log, indent=2))
 

@@ -4,15 +4,11 @@ from __future__ import annotations
 ProviderFrameAdapter
 
 Responsabilité :
-- router vers :
-    - single-day fetch (as_of)
-    - range fetch (start/end)
-
-IMPORTANT :
-- ne PAS écraser une plage en as_of
+- appeler le provider avec des symboles provider
+- remapper vers symbole canonique
 """
 
-from datetime import date
+import pandas as pd
 
 
 class ProviderFrameAdapter:
@@ -21,27 +17,29 @@ class ProviderFrameAdapter:
 
     def fetch_prices(
         self,
-        *,
-        symbols: list[str],
-        start_date: date,
-        end_date: date,
+        provider_symbols: list[str],
+        provider_to_canonical: dict[str, str],
+        start_date,
+        end_date,
         requires_range_fetch: bool,
-    ):
+    ) -> pd.DataFrame | None:
 
-        # ------------------------------------------------------------------
-        # SINGLE DAY
-        # ------------------------------------------------------------------
-        if not requires_range_fetch:
-            return self._provider.fetch_daily_prices_frame(
-                symbols=symbols,
-                as_of=start_date,
-            )
+        if not provider_symbols:
+            return None
 
-        # ------------------------------------------------------------------
-        # RANGE
-        # ------------------------------------------------------------------
-        return self._provider.fetch_daily_prices_range_frame(
-            symbols=symbols,
+        df = self._provider.fetch(
+            symbols=provider_symbols,
             start_date=start_date,
             end_date=end_date,
+            requires_range_fetch=requires_range_fetch,
         )
+
+        if df is None or df.empty:
+            return df
+
+        # --------------------------------------------------------------
+        # Remap vers symbole canonique
+        # --------------------------------------------------------------
+        df["symbol"] = df["symbol"].map(provider_to_canonical)
+
+        return df
