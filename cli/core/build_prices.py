@@ -39,15 +39,30 @@ def main():
     provider = YfinancePriceProvider()
     adapter = ProviderFrameAdapter(provider)
 
+    resolved_symbols, symbol_scope_source = repo.get_refresh_symbols(args.symbols)
+
+    if not resolved_symbols:
+        output = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": "noop",
+            "error_message": "No symbols resolved for price refresh scope.",
+            "symbol_scope_source": symbol_scope_source,
+            "symbol_count": 0,
+        }
+        with open("logs/build_prices.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(output) + "\n")
+        print(json.dumps(output, indent=2))
+        return
+
     window = PriceRefreshWindowService(
         repo,
-        catchup_max_days=args.catchup_max_days
+        catchup_max_days=args.catchup_max_days,
     ).resolve_window(
         requested_start_date=parse_date(args.start_date),
         requested_end_date=parse_date(args.end_date),
         as_of=parse_date(args.as_of),
         lookback_days=args.lookback_days,
-        symbols=args.symbols,
+        symbols=resolved_symbols,
         today=date.today(),
     )
 
@@ -64,9 +79,11 @@ def main():
         "last_complete_date": str(window.last_complete_date),
         "expected_symbol_count": window.expected_count,
         "observed_latest_count": window.observed_latest_count,
+        "symbol_count": len(resolved_symbols),
+        "symbol_scope_source": symbol_scope_source,
     }
 
-    with open("logs/build_prices.log", "a") as f:
+    with open("logs/build_prices.log", "a", encoding="utf-8") as f:
         f.write(json.dumps(log) + "\n")
 
     if window.is_noop:
@@ -74,7 +91,7 @@ def main():
         return
 
     df = adapter.fetch_prices(
-        symbols=args.symbols,
+        symbols=resolved_symbols,
         start_date=window.effective_start_date,
         end_date=window.effective_end_date,
         requires_range_fetch=window.requires_range_fetch,
