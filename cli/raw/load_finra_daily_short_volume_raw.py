@@ -14,10 +14,7 @@ except Exception:
     def tqdm(iterable, **kwargs):
         return iterable
 
-from stock_quant.infrastructure.config.settings_loader import build_app_config
-from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
 from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManager
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 
 
 EXPECTED_HEADER_5 = "Date|Symbol|ShortVolume|TotalVolume|Market"
@@ -30,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Load FINRA daily short volume raw files into DuckDB using robust historical format handling."
     )
-    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
+    parser.add_argument("--db-path", required=True, help="Path to DuckDB database file.")
     parser.add_argument(
         "--source",
         action="append",
@@ -94,12 +91,12 @@ def _iter_manifest_paths(path: Path) -> list[Path]:
 
 def _expand_source_item(item: str) -> list[Path]:
     if any(ch in item for ch in ["*", "?", "["]):
-        return sorted(Path().glob(item))
+        return [p.resolve() for p in sorted(Path().glob(item)) if p.is_file()]
 
     path = Path(item).expanduser().resolve()
 
     if path.is_dir():
-        return sorted(p for p in path.rglob("*") if p.is_file())
+        return sorted(p.resolve() for p in path.rglob("*") if p.is_file())
 
     if _looks_like_manifest(path):
         return _iter_manifest_paths(path)
@@ -224,7 +221,8 @@ def _create_stage(con: duckdb.DuckDBPyConnection, stage_name: str) -> None:
             market_code VARCHAR,
             source_file VARCHAR,
             publication_date DATE,
-            available_at TIMESTAMP
+            available_at TIMESTAMP,
+            source_name VARCHAR
         )
         """
     )
@@ -237,363 +235,244 @@ def _insert_from_sql(con: duckdb.DuckDBPyConnection, sql: str, stage_name: str) 
     return int(after - before)
 
 
-def _metadata_select(market_expr: str) -> str:
-    return f"""
-        UPPER(
-            COALESCE(
-                NULLIF(TRIM({market_expr}), ''),
-                NULLIF(REGEXP_EXTRACT(filename, '.*/([^/]+)/[^/]+$', 1), '')
-            )
-        ) AS market_code,
-        NULLIF(REGEXP_EXTRACT(filename, '.*/([^/]+)$', 1), '') AS source_file,
-        CAST(
-            TRY_STRPTIME(
-                NULLIF(REGEXP_EXTRACT(filename, '([0-9]{{8}})', 1), ''),
-                '%Y%m%d'
-            ) AS DATE
-        ) AS publication_date,
-        CAST(
-            TRY_STRPTIME(
-                NULLIF(REGEXP_EXTRACT(filename, '([0-9]{{8}})', 1), ''),
-                '%Y%m%d'
-            ) AS TIMESTAMP
-        ) AS available_at
-    """
-
-
-def _load_batch_header_5(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
-    if not files:
-        return 0
-
-    file_list_sql = _sql_file_list(files)
+def _insert_batch_header5(con, stage_name: str, files: list[str], source_name: str) -> int:
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(TRIM("Date"), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(TRIM("Symbol")) AS symbol,
-        TRY_CAST("ShortVolume" AS DOUBLE) AS short_volume,
+        CAST(strptime(Date, '%Y%m%d') AS DATE) AS trade_date,
+        upper(trim(Symbol)) AS symbol,
+        CAST(ShortVolume AS DOUBLE) AS short_volume,
         NULL::DOUBLE AS short_exempt_volume,
-        TRY_CAST("TotalVolume" AS DOUBLE) AS total_volume,
-        {_metadata_select('"Market"')}
+        CAST(TotalVolume AS DOUBLE) AS total_volume,
+        upper(trim(Market)) AS market_code,
+        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
+        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
+        CURRENT_TIMESTAMP AS available_at,
+        {_sql_quote(source_name)} AS source_name
     FROM read_csv(
-        {file_list_sql},
+        {_sql_file_list(files)},
         delim='|',
-        header=TRUE,
-        filename=TRUE,
-        columns={{
-            'Date':'VARCHAR',
-            'Symbol':'VARCHAR',
-            'ShortVolume':'VARCHAR',
-            'TotalVolume':'VARCHAR',
-            'Market':'VARCHAR'
-        }},
-        strict_mode=FALSE,
-        ignore_errors=TRUE,
-        null_padding=TRUE
+        header=true,
+        filename=true,
+        all_varchar=true,
+        ignore_errors=true
     )
+    WHERE trim(coalesce(Symbol, '')) <> ''
     """
     return _insert_from_sql(con, sql, stage_name)
 
 
-def _load_batch_header_6(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
-    if not files:
-        return 0
-
-    file_list_sql = _sql_file_list(files)
+def _insert_batch_header6(con, stage_name: str, files: list[str], source_name: str) -> int:
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(TRIM("Date"), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(TRIM("Symbol")) AS symbol,
-        TRY_CAST("ShortVolume" AS DOUBLE) AS short_volume,
-        TRY_CAST("ShortExemptVolume" AS DOUBLE) AS short_exempt_volume,
-        TRY_CAST("TotalVolume" AS DOUBLE) AS total_volume,
-        {_metadata_select('"Market"')}
+        CAST(strptime(Date, '%Y%m%d') AS DATE) AS trade_date,
+        upper(trim(Symbol)) AS symbol,
+        CAST(ShortVolume AS DOUBLE) AS short_volume,
+        CAST(ShortExemptVolume AS DOUBLE) AS short_exempt_volume,
+        CAST(TotalVolume AS DOUBLE) AS total_volume,
+        upper(trim(Market)) AS market_code,
+        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
+        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
+        CURRENT_TIMESTAMP AS available_at,
+        {_sql_quote(source_name)} AS source_name
     FROM read_csv(
-        {file_list_sql},
+        {_sql_file_list(files)},
         delim='|',
-        header=TRUE,
-        filename=TRUE,
-        columns={{
-            'Date':'VARCHAR',
-            'Symbol':'VARCHAR',
-            'ShortVolume':'VARCHAR',
-            'ShortExemptVolume':'VARCHAR',
-            'TotalVolume':'VARCHAR',
-            'Market':'VARCHAR'
-        }},
-        strict_mode=FALSE,
-        ignore_errors=TRUE,
-        null_padding=TRUE
+        header=true,
+        filename=true,
+        all_varchar=true,
+        ignore_errors=true
     )
+    WHERE trim(coalesce(Symbol, '')) <> ''
     """
     return _insert_from_sql(con, sql, stage_name)
 
 
-def _load_batch_no_header_5(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
-    if not files:
-        return 0
-
-    file_list_sql = _sql_file_list(files)
+def _insert_batch_no_header5(con, stage_name: str, files: list[str], source_name: str) -> int:
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(TRIM(column0), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(TRIM(column1)) AS symbol,
-        TRY_CAST(column2 AS DOUBLE) AS short_volume,
+        CAST(strptime(column0, '%Y%m%d') AS DATE) AS trade_date,
+        upper(trim(column1)) AS symbol,
+        CAST(column2 AS DOUBLE) AS short_volume,
         NULL::DOUBLE AS short_exempt_volume,
-        TRY_CAST(column3 AS DOUBLE) AS total_volume,
-        {_metadata_select('column4')}
+        CAST(column3 AS DOUBLE) AS total_volume,
+        upper(trim(column4)) AS market_code,
+        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
+        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
+        CURRENT_TIMESTAMP AS available_at,
+        {_sql_quote(source_name)} AS source_name
     FROM read_csv(
-        {file_list_sql},
+        {_sql_file_list(files)},
         delim='|',
-        header=FALSE,
-        filename=TRUE,
-        columns={{
-            'column0':'VARCHAR',
-            'column1':'VARCHAR',
-            'column2':'VARCHAR',
-            'column3':'VARCHAR',
-            'column4':'VARCHAR'
-        }},
-        strict_mode=FALSE,
-        ignore_errors=TRUE,
-        null_padding=TRUE
+        header=false,
+        filename=true,
+        all_varchar=true,
+        ignore_errors=true
     )
+    WHERE trim(coalesce(column1, '')) <> ''
     """
     return _insert_from_sql(con, sql, stage_name)
 
 
-def _load_batch_no_header_6(con: duckdb.DuckDBPyConnection, files: list[str], stage_name: str) -> int:
-    if not files:
-        return 0
-
-    file_list_sql = _sql_file_list(files)
+def _insert_batch_no_header6(con, stage_name: str, files: list[str], source_name: str) -> int:
     sql = f"""
     INSERT INTO {stage_name}
     SELECT
-        CAST(TRY_STRPTIME(TRIM(column0), '%Y%m%d') AS DATE) AS trade_date,
-        UPPER(TRIM(column1)) AS symbol,
-        TRY_CAST(column2 AS DOUBLE) AS short_volume,
-        TRY_CAST(column3 AS DOUBLE) AS short_exempt_volume,
-        TRY_CAST(column4 AS DOUBLE) AS total_volume,
-        {_metadata_select('column5')}
+        CAST(strptime(column0, '%Y%m%d') AS DATE) AS trade_date,
+        upper(trim(column1)) AS symbol,
+        CAST(column2 AS DOUBLE) AS short_volume,
+        CAST(column3 AS DOUBLE) AS short_exempt_volume,
+        CAST(column4 AS DOUBLE) AS total_volume,
+        upper(trim(column5)) AS market_code,
+        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
+        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
+        CURRENT_TIMESTAMP AS available_at,
+        {_sql_quote(source_name)} AS source_name
     FROM read_csv(
-        {file_list_sql},
+        {_sql_file_list(files)},
         delim='|',
-        header=FALSE,
-        filename=TRUE,
-        columns={{
-            'column0':'VARCHAR',
-            'column1':'VARCHAR',
-            'column2':'VARCHAR',
-            'column3':'VARCHAR',
-            'column4':'VARCHAR',
-            'column5':'VARCHAR'
-        }},
-        strict_mode=FALSE,
-        ignore_errors=TRUE,
-        null_padding=TRUE
+        header=false,
+        filename=true,
+        all_varchar=true,
+        ignore_errors=true
     )
+    WHERE trim(coalesce(column1, '')) <> ''
     """
     return _insert_from_sql(con, sql, stage_name)
-
-
-def _load_grouped_files(
-    con: duckdb.DuckDBPyConnection,
-    files: list[str],
-    loader,
-    stage_name: str,
-    desc: str,
-) -> int:
-    inserted = 0
-    if not files:
-        return inserted
-
-    batches = list(_chunked(files, BATCH_SIZE))
-    for batch in tqdm(batches, desc=desc, unit="batch", dynamic_ncols=True):
-        inserted += loader(con=con, files=batch, stage_name=stage_name)
-    return inserted
-
-
-def build_into_db(
-    con: duckdb.DuckDBPyConnection,
-    paths: list[Path],
-    source_name: str,
-) -> dict[str, int]:
-    (
-        header_5_files,
-        header_6_files,
-        no_header_5_files,
-        no_header_6_files,
-        empty_files,
-        skipped_bad_payload_files,
-    ) = split_files(paths)
-
-    _create_stage(con, "tmp_finra_stage")
-
-    scanned_header_5_rows = _load_grouped_files(
-        con=con,
-        files=header_5_files,
-        loader=_load_batch_header_5,
-        stage_name="tmp_finra_stage",
-        desc="load_header_5",
-    )
-    scanned_header_6_rows = _load_grouped_files(
-        con=con,
-        files=header_6_files,
-        loader=_load_batch_header_6,
-        stage_name="tmp_finra_stage",
-        desc="load_header_6",
-    )
-    scanned_no_header_5_rows = _load_grouped_files(
-        con=con,
-        files=no_header_5_files,
-        loader=_load_batch_no_header_5,
-        stage_name="tmp_finra_stage",
-        desc="load_no_header_5",
-    )
-    scanned_no_header_6_rows = _load_grouped_files(
-        con=con,
-        files=no_header_6_files,
-        loader=_load_batch_no_header_6,
-        stage_name="tmp_finra_stage",
-        desc="load_no_header_6",
-    )
-
-    con.execute("DROP TABLE IF EXISTS tmp_finra_clean")
-    con.execute(
-        """
-        CREATE TEMP TABLE tmp_finra_clean AS
-        SELECT
-            trade_date,
-            symbol,
-            short_volume,
-            short_exempt_volume,
-            total_volume,
-            market_code,
-            source_file,
-            publication_date,
-            available_at
-        FROM tmp_finra_stage
-        WHERE trade_date IS NOT NULL
-          AND symbol IS NOT NULL
-          AND TRIM(symbol) <> ''
-          AND short_volume IS NOT NULL
-          AND total_volume IS NOT NULL
-          AND short_volume >= 0
-          AND total_volume >= 0
-        """
-    )
-
-    con.execute("DELETE FROM finra_daily_short_volume_source_raw")
-    con.execute(
-        """
-        INSERT INTO finra_daily_short_volume_source_raw (
-            symbol,
-            trade_date,
-            short_volume,
-            total_volume,
-            source_name,
-            ingested_at,
-            short_exempt_volume,
-            market_code,
-            source_file,
-            publication_date,
-            available_at
-        )
-        SELECT
-            symbol,
-            trade_date,
-            SUM(short_volume) AS short_volume,
-            SUM(total_volume) AS total_volume,
-            ? AS source_name,
-            CURRENT_TIMESTAMP AS ingested_at,
-            SUM(short_exempt_volume) AS short_exempt_volume,
-            market_code,
-            source_file,
-            publication_date,
-            available_at
-        FROM tmp_finra_clean
-        GROUP BY
-            symbol,
-            trade_date,
-            market_code,
-            source_file,
-            publication_date,
-            available_at
-        ORDER BY
-            symbol,
-            trade_date,
-            source_file
-        """,
-        [source_name],
-    )
-
-    written = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
-
-    return {
-        "files_discovered": len(paths),
-        "files_header_5": len(header_5_files),
-        "files_header_6": len(header_6_files),
-        "files_no_header_5": len(no_header_5_files),
-        "files_no_header_6": len(no_header_6_files),
-        "files_empty": empty_files,
-        "files_skipped_bad_payload": skipped_bad_payload_files,
-        "rows_scanned_header_5": scanned_header_5_rows,
-        "rows_scanned_header_6": scanned_header_6_rows,
-        "rows_scanned_no_header_5": scanned_no_header_5_rows,
-        "rows_scanned_no_header_6": scanned_no_header_6_rows,
-        "rows_scanned_total": (
-            scanned_header_5_rows
-            + scanned_header_6_rows
-            + scanned_no_header_5_rows
-            + scanned_no_header_6_rows
-        ),
-        "rows_written": written,
-    }
 
 
 def main() -> int:
     args = parse_args()
-    config = build_app_config(db_path=args.db_path)
-    config.ensure_directories()
+    db_path = str(Path(args.db_path).expanduser().resolve())
 
-    files = discover_files(args.sources, args.manifests)
-    session_factory = DuckDbSessionFactory(config.db_path)
+    source_items = list(args.sources or [])
+    manifest_items = list(args.manifests or [])
 
-    with DuckDbUnitOfWork(session_factory) as uow:
-        schema = ShortDataSchemaManager(uow)
-        schema.initialize()
+    if not source_items and not manifest_items:
+        raise SystemExit("At least one --source or --manifest is required.")
 
-    with DuckDbUnitOfWork(session_factory) as uow:
-        if uow.connection is None:
-            raise RuntimeError("active DB connection is required")
+    discovered = discover_files(source_items, manifest_items)
+    if not discovered:
+        raise SystemExit("No FINRA daily short volume files discovered.")
 
-        metrics = build_into_db(
-            con=uow.connection,
-            paths=files,
-            source_name=args.source_name,
+    con = duckdb.connect(db_path)
+    try:
+        schema = ShortDataSchemaManager()
+        if hasattr(schema, "ensure_all"):
+            schema.ensure_all(con)
+        elif hasattr(schema, "ensure_schema"):
+            schema.ensure_schema(con)
+        elif hasattr(schema, "apply"):
+            schema.apply(con)
+        else:
+            raise RuntimeError(
+                "ShortDataSchemaManager does not expose ensure_all(con), ensure_schema(con) or apply(con)."
+            )
+
+        rows_before = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
+
+        stage_name = "tmp_finra_daily_short_volume_stage"
+        _create_stage(con, stage_name)
+
+        h5, h6, nh5, nh6, empty_files, skipped_bad = split_files(discovered)
+
+        inserted = 0
+        for batch in tqdm(list(_chunked(h5, BATCH_SIZE)), desc="load_h5", dynamic_ncols=True):
+            inserted += _insert_batch_header5(con, stage_name, batch, args.source_name)
+        for batch in tqdm(list(_chunked(h6, BATCH_SIZE)), desc="load_h6", dynamic_ncols=True):
+            inserted += _insert_batch_header6(con, stage_name, batch, args.source_name)
+        for batch in tqdm(list(_chunked(nh5, BATCH_SIZE)), desc="load_nh5", dynamic_ncols=True):
+            inserted += _insert_batch_no_header5(con, stage_name, batch, args.source_name)
+        for batch in tqdm(list(_chunked(nh6, BATCH_SIZE)), desc="load_nh6", dynamic_ncols=True):
+            inserted += _insert_batch_no_header6(con, stage_name, batch, args.source_name)
+
+        con.execute("DELETE FROM finra_daily_short_volume_source_raw")
+        con.execute(
+            f"""
+            INSERT INTO finra_daily_short_volume_source_raw (
+                trade_date,
+                symbol,
+                short_volume,
+                short_exempt_volume,
+                total_volume,
+                market_code,
+                source_file,
+                publication_date,
+                available_at,
+                source_name
+            )
+            SELECT
+                trade_date,
+                symbol,
+                short_volume,
+                short_exempt_volume,
+                total_volume,
+                market_code,
+                source_file,
+                publication_date,
+                available_at,
+                source_name
+            FROM {stage_name}
+            """
         )
 
-    payload = {
-        "files_discovered": metrics["files_discovered"],
-        "files_header_5": metrics["files_header_5"],
-        "files_header_6": metrics["files_header_6"],
-        "files_no_header_5": metrics["files_no_header_5"],
-        "files_no_header_6": metrics["files_no_header_6"],
-        "files_empty": metrics["files_empty"],
-        "files_skipped_bad_payload": metrics["files_skipped_bad_payload"],
-        "rows_scanned_header_5": metrics["rows_scanned_header_5"],
-        "rows_scanned_header_6": metrics["rows_scanned_header_6"],
-        "rows_scanned_no_header_5": metrics["rows_scanned_no_header_5"],
-        "rows_scanned_no_header_6": metrics["rows_scanned_no_header_6"],
-        "rows_scanned_total": metrics["rows_scanned_total"],
-        "rows_written": metrics["rows_written"],
-        "source_name": args.source_name,
-    }
-    print(json.dumps(payload, indent=2, default=str))
-    return 0
+        con.execute("DELETE FROM finra_daily_short_volume_sources")
+        con.execute(
+            """
+            INSERT INTO finra_daily_short_volume_sources (
+                source_file,
+                publication_date,
+                market_code,
+                row_count,
+                loaded_at,
+                source_name
+            )
+            SELECT
+                source_file,
+                publication_date,
+                market_code,
+                COUNT(*) AS row_count,
+                CURRENT_TIMESTAMP AS loaded_at,
+                MAX(source_name) AS source_name
+            FROM finra_daily_short_volume_source_raw
+            GROUP BY 1,2,3
+            """
+        )
+
+        rows_after = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
+        source_rows_after = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_sources").fetchone()[0])
+
+        print(f"[load_finra_daily_short_volume_raw] db_path={db_path}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] discovered_files={len(discovered)}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] empty_files={empty_files}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] skipped_bad_payload_files={skipped_bad}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] rows_before={rows_before}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] rows_written={rows_after}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] source_rows_after={source_rows_after}", flush=True)
+        print(
+            json.dumps(
+                {
+                    "db_path": db_path,
+                    "discovered_files": len(discovered),
+                    "header5_files": len(h5),
+                    "header6_files": len(h6),
+                    "no_header5_files": len(nh5),
+                    "no_header6_files": len(nh6),
+                    "empty_files": empty_files,
+                    "skipped_bad_payload_files": skipped_bad,
+                    "stage_inserted_rows": inserted,
+                    "final_raw_rows": rows_after,
+                    "final_source_rows": source_rows_after,
+                },
+                default=str,
+            ),
+            flush=True,
+        )
+        return 0
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
