@@ -1,15 +1,23 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime
 from typing import Any
 
-from stock_quant.domain.entities.backtest_result import BacktestResultSummary, ExperimentResultDaily
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.shared.exceptions import RepositoryError
 
 
 class DuckDbBacktestRepository:
+    """
+    Repository du moteur de backtest.
+
+    Responsabilités :
+    - lire research_dataset_daily
+    - écrire experiment_results_daily
+    - écrire backtest_positions
+    - écrire backtest_daily
+    - écrire backtest_runs
+    """
+
     def __init__(self, uow: DuckDbUnitOfWork) -> None:
         self.uow = uow
 
@@ -19,80 +27,38 @@ class DuckDbBacktestRepository:
             raise RepositoryError("active DB connection is required")
         return self.uow.connection
 
-    def load_dataset_rows(self, dataset_name: str, dataset_version: str) -> list[dict[str, Any]]:
+    def load_dataset_rows(
+        self,
+        dataset_name: str,
+        dataset_version: str,
+    ) -> list[dict[str, Any]]:
         try:
-            rows = self.con.execute(
+            frame = self.con.execute(
                 """
-                SELECT
-                    dataset_name,
-                    dataset_version,
-                    instrument_id,
-                    company_id,
-                    symbol,
-                    as_of_date,
-                    close_to_sma_20,
-                    fwd_return_1d
+                SELECT *
                 FROM research_dataset_daily
                 WHERE dataset_name = ? AND dataset_version = ?
-                ORDER BY symbol, as_of_date
+                ORDER BY as_of_date, symbol
                 """,
                 [dataset_name, dataset_version],
-            ).fetchall()
-
-            return [
-                {
-                    "dataset_name": row[0],
-                    "dataset_version": row[1],
-                    "instrument_id": row[2],
-                    "company_id": row[3],
-                    "symbol": row[4],
-                    "as_of_date": row[5],
-                    "close_to_sma_20": row[6],
-                    "fwd_return_1d": row[7],
-                }
-                for row in rows
-            ]
+            ).fetchdf()
+            return frame.to_dict(orient="records")
         except Exception as exc:
-            raise RepositoryError(f"failed to load research_dataset_daily rows: {exc}") from exc
+            raise RepositoryError(f"failed to load research dataset rows: {exc}") from exc
 
-    def lookup_dataset_version_id(self, dataset_name: str, dataset_version: str) -> int | None:
-        try:
-            row = self.con.execute(
-                """
-                SELECT rowid
-                FROM dataset_versions
-                WHERE dataset_name = ? AND dataset_version = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                [dataset_name, dataset_version],
-            ).fetchone()
-            return int(row[0]) if row else None
-        except Exception as exc:
-            raise RepositoryError(f"failed to lookup dataset_versions rowid: {exc}") from exc
-
-    def replace_experiment_results_daily(self, rows: list[ExperimentResultDaily]) -> int:
+    def clear_outputs(self) -> None:
         try:
             self.con.execute("DELETE FROM experiment_results_daily")
-            if not rows:
-                return 0
+            self.con.execute("DELETE FROM backtest_positions")
+            self.con.execute("DELETE FROM backtest_daily")
+            self.con.execute("DELETE FROM backtest_runs")
+        except Exception as exc:
+            raise RepositoryError(f"failed to clear backtest outputs: {exc}") from exc
 
-            payload = [
-                (
-                    row.experiment_name,
-                    row.dataset_name,
-                    row.dataset_version,
-                    row.instrument_id,
-                    row.company_id,
-                    row.symbol,
-                    row.as_of_date,
-                    row.signal_value,
-                    row.selected_flag,
-                    row.realized_return_1d,
-                    row.created_at or datetime.utcnow(),
-                )
-                for row in rows
-            ]
+    def insert_experiment_results_daily(self, rows: list[tuple]) -> int:
+        if not rows:
+            return 0
+        try:
             self.con.executemany(
                 """
                 INSERT INTO experiment_results_daily (
@@ -110,46 +76,76 @@ class DuckDbBacktestRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                payload,
+                rows,
             )
-            return len(payload)
+            return len(rows)
         except Exception as exc:
-            raise RepositoryError(f"failed to replace experiment_results_daily: {exc}") from exc
+            raise RepositoryError(f"failed to insert experiment_results_daily rows: {exc}") from exc
 
-    def insert_experiment_run(self, payload: dict[str, Any]) -> int:
+    def insert_backtest_positions(self, rows: list[tuple]) -> int:
+        if not rows:
+            return 0
         try:
-            self.con.execute(
+            self.con.executemany(
                 """
-                INSERT INTO experiment_runs (
-                    experiment_name,
-                    status,
-                    dataset_version_id,
-                    started_at,
-                    finished_at,
-                    metrics_json,
-                    config_json,
-                    error_message,
+                INSERT INTO backtest_positions (
+                    backtest_name,
+                    dataset_name,
+                    dataset_version,
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    signal_column,
+                    label_column,
+                    signal_value,
+                    realized_return,
+                    rank_position,
+                    weight,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [
-                    payload["experiment_name"],
-                    payload["status"],
-                    payload["dataset_version_id"],
-                    payload["started_at"],
-                    payload["finished_at"],
-                    payload["metrics_json"],
-                    payload["config_json"],
-                    payload["error_message"],
-                    payload["created_at"],
-                ],
+                rows,
             )
-            return 1
+            return len(rows)
         except Exception as exc:
-            raise RepositoryError(f"failed to insert experiment_runs: {exc}") from exc
+            raise RepositoryError(f"failed to insert backtest_positions rows: {exc}") from exc
 
-    def insert_backtest_run(self, payload: dict[str, Any]) -> int:
+    def insert_backtest_daily(self, rows: list[tuple]) -> int:
+        if not rows:
+            return 0
+        try:
+            self.con.executemany(
+                """
+                INSERT INTO backtest_daily (
+                    backtest_name,
+                    dataset_name,
+                    dataset_version,
+                    as_of_date,
+                    signal_column,
+                    label_column,
+                    selected_count,
+                    gross_return,
+                    hit_rate,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return len(rows)
+        except Exception as exc:
+            raise RepositoryError(f"failed to insert backtest_daily rows: {exc}") from exc
+
+    def insert_backtest_run(
+        self,
+        *,
+        backtest_name: str,
+        status: str,
+        metrics_json: str,
+        config_json: str,
+    ) -> int:
         try:
             self.con.execute(
                 """
@@ -164,29 +160,17 @@ class DuckDbBacktestRepository:
                     error_message,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 [
-                    payload["backtest_name"],
-                    payload["status"],
-                    payload["dataset_version_id"],
-                    payload["started_at"],
-                    payload["finished_at"],
-                    payload["metrics_json"],
-                    payload["config_json"],
-                    payload["error_message"],
-                    payload["created_at"],
+                    backtest_name,
+                    status,
+                    None,
+                    metrics_json,
+                    config_json,
+                    None,
                 ],
             )
             return 1
         except Exception as exc:
-            raise RepositoryError(f"failed to insert backtest_runs: {exc}") from exc
-
-    def summary_as_metrics(self, row: BacktestResultSummary) -> dict[str, Any]:
-        return {
-            "observations": row.observations,
-            "selected_observations": row.selected_observations,
-            "mean_return_1d": row.mean_return_1d,
-            "hit_rate_1d": row.hit_rate_1d,
-            "cumulative_return_proxy": row.cumulative_return_proxy,
-        }
+            raise RepositoryError(f"failed to insert backtest_runs row: {exc}") from exc
