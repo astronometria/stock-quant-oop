@@ -81,8 +81,31 @@ def _extend_repeatable(args: list[str], flag: str, values: list[str]) -> None:
         args.extend([flag, value])
 
 
+def _auto_disable_missing_raw_loads(args: argparse.Namespace) -> None:
+    """
+    Compatibility behavior for tests and lightweight local runs.
+
+    If no explicit raw sources are provided, skip the matching raw load step
+    instead of failing fast.
+    """
+    if not args.symbol_sources:
+        args.skip_symbol_load = True
+
+    if not args.finra_sources:
+        args.skip_finra_load = True
+        # Without FINRA raw load, do not try to build FINRA unless user
+        # explicitly provided sources elsewhere in the DB already.
+        args.skip_finra = True
+
+    if not args.news_sources:
+        args.skip_news_load = True
+        args.skip_news_raw = True
+        args.skip_news_candidates = True
+
+
 def main() -> int:
     args = parse_args()
+    _auto_disable_missing_raw_loads(args)
 
     project_root = Path(args.project_root).expanduser().resolve()
     orchestrator = CorePipelineOrchestrator(
