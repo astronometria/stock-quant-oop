@@ -20,7 +20,7 @@ from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManag
 EXPECTED_HEADER_5 = "Date|Symbol|ShortVolume|TotalVolume|Market"
 EXPECTED_HEADER_6 = "Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market"
 ALLOWED_MARKET_DIRS = {"CNMS", "FNQC", "FNRA", "FNSQ", "FNYX"}
-BATCH_SIZE = 250
+BATCH_SIZE = 100
 
 
 def parse_args() -> argparse.Namespace:
@@ -255,7 +255,8 @@ def _insert_batch_header5(con, stage_name: str, files: list[str], source_name: s
         header=true,
         filename=true,
         all_varchar=true,
-        ignore_errors=true
+        ignore_errors=true,
+        union_by_name=true
     )
     WHERE trim(coalesce(Symbol, '')) <> ''
     """
@@ -282,7 +283,8 @@ def _insert_batch_header6(con, stage_name: str, files: list[str], source_name: s
         header=true,
         filename=true,
         all_varchar=true,
-        ignore_errors=true
+        ignore_errors=true,
+        union_by_name=true
     )
     WHERE trim(coalesce(Symbol, '')) <> ''
     """
@@ -309,7 +311,8 @@ def _insert_batch_no_header5(con, stage_name: str, files: list[str], source_name
         header=false,
         filename=true,
         all_varchar=true,
-        ignore_errors=true
+        ignore_errors=true,
+        union_by_name=true
     )
     WHERE trim(coalesce(column1, '')) <> ''
     """
@@ -336,7 +339,8 @@ def _insert_batch_no_header6(con, stage_name: str, files: list[str], source_name
         header=false,
         filename=true,
         all_varchar=true,
-        ignore_errors=true
+        ignore_errors=true,
+        union_by_name=true
     )
     WHERE trim(coalesce(column1, '')) <> ''
     """
@@ -360,16 +364,7 @@ def main() -> int:
     con = duckdb.connect(db_path)
     try:
         schema = ShortDataSchemaManager()
-        if hasattr(schema, "ensure_all"):
-            schema.ensure_all(con)
-        elif hasattr(schema, "ensure_schema"):
-            schema.ensure_schema(con)
-        elif hasattr(schema, "apply"):
-            schema.apply(con)
-        else:
-            raise RuntimeError(
-                "ShortDataSchemaManager does not expose ensure_all(con), ensure_schema(con) or apply(con)."
-            )
+        schema.ensure_all(con)
 
         rows_before = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
 
