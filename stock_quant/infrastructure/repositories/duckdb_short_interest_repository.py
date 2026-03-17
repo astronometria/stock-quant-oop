@@ -8,6 +8,7 @@ Design goals:
 - process only unloaded source_file values
 - keep latest derived from history
 - preserve compatibility with the existing normalized FINRA schema
+- keep backward-compatible methods required by the repository port
 """
 
 from typing import Any
@@ -29,8 +30,12 @@ from stock_quant.shared.exceptions import RepositoryError
 
 class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
     def __init__(self, con: Any) -> None:
+        # Active DuckDB connection injected by the CLI.
         self._con = con
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
     def _require_connection(self):
         if self._con is None:
             raise RepositoryError("active DB connection is required")
@@ -44,11 +49,141 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
         rows = con.execute("SHOW TABLES").fetchall()
         return {str(row[0]).strip().lower() for row in rows}
 
-    def list_loaded_source_files(self) -> set[str]:
+    # ------------------------------------------------------------------
+    # Port compatibility methods
+    # ------------------------------------------------------------------
+    def load_raw_short_interest_records(self) -> list[RawShortInterestRecord]:
         """
-        Source files déjà normalisés dans finra_short_interest_sources.
+        Backward-compatible full raw loader required by the abstract port.
+
+        This reads the entire normalized raw staging table.
+        The incremental pipeline usually prefers the per-source-file version
+        to avoid reprocessing already loaded files.
         """
         con = self._require_connection()
+
+        try:
+            rows = con.execute(
+                f"""
+                SELECT
+                    symbol,
+                    settlement_date,
+                    short_interest,
+                    previous_short_interest,
+                    avg_daily_volume,
+                    shares_float,
+                    revision_flag,
+                    source_market,
+                    source_file,
+                    source_date
+                FROM {FINRA_SHORT_INTEREST_SOURCE_RAW}
+                ORDER BY settlement_date, symbol, source_file
+                """
+            ).fetchall()
+
+            return [
+                RawShortInterestRecord(
+                    symbol=row[0],
+                    settlement_date=row[1],
+                    short_interest=row[2],
+                    previous_short_interest=row[3],
+                    avg_daily_volume=row[4],
+                    shares_float=row[5],
+                    revision_flag=row[6],
+                    source_market=row[7] or "unknown",
+                    source_file=row[8] or "unknown",
+                    source_date=row[9],
+                )
+                for row in rows
+            ]
+        except Exception as exc:
+            raise RepositoryError(
+                f"failed to load raw short interest records: {exc}"
+            ) from exc
+
+    def load_included_symbols(self) -> set[str]:
+        """
+        Backward-compatible symbol loader required by the abstract port.
+
+        Survivor-bias aware preference order:
+        1) ticker_history
+        2) instrument_master
+        3) market_universe as fallback only for minimal DBs
+        """
+        con = self._require_connection()
+
+        try:
+            tables = self._list_tables()
+            union_parts: list[str] = []
+
+            if "ticker_history" in tables:
+                union_parts.append("SELECT symbol FROM ticker_history")
+
+            if "instrument_master" in tables:
+                union_parts.append("SELECT symbol FROM instrument_master")
+
+            if union_parts:
+                rows = con.execute(
+                    f"""
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                    FROM (
+                        {' UNION '.join(union_parts)}
+                    ) t
+                    WHERE symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+
+                result = {row[0] for row in rows}
+                if result:
+                    return result
+
+            if "market_universe" in tables:
+                rows = con.execute(
+                    """
+                    SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol
+                    FROM market_universe
+                    WHERE include_in_universe = TRUE
+                      AND symbol IS NOT NULL
+                      AND TRIM(symbol) <> ''
+                    ORDER BY symbol
+                    """
+                ).fetchall()
+                return {row[0] for row in rows}
+
+            return set()
+
+        except Exception as exc:
+            raise RepositoryError(f"failed to load included symbols: {exc}") from exc
+
+    def replace_short_interest_history(self, entries: list[ShortInterestRecord]) -> int:
+        """
+        Backward-compatible alias required by the abstract port.
+
+        In the new incremental design this is intentionally an UPSERT,
+        not a destructive full replacement.
+        """
+        return self.upsert_short_interest_history(entries)
+
+    def replace_short_interest_sources(self, entries: list[ShortInterestSourceFile]) -> int:
+        """
+        Backward-compatible alias required by the abstract port.
+
+        In the new incremental design this is intentionally an UPSERT,
+        not a destructive full replacement.
+        """
+        return self.upsert_short_interest_sources(entries)
+
+    # ------------------------------------------------------------------
+    # Incremental source-file discovery
+    # ------------------------------------------------------------------
+    def list_loaded_source_files(self) -> set[str]:
+        """
+        Source files already normalized into finra_short_interest_sources.
+        """
+        con = self._require_connection()
+
         try:
             rows = con.execute(
                 f"""
@@ -64,9 +199,10 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
 
     def list_available_raw_source_files(self) -> set[str]:
         """
-        Source files présents dans la raw table.
+        Source files currently present in the raw staging table.
         """
         con = self._require_connection()
+
         try:
             rows = con.execute(
                 f"""
@@ -82,17 +218,19 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
 
     def list_pending_source_files(self) -> list[str]:
         """
-        Détecte les raw source files non encore chargés dans la couche normalisée.
+        Raw source files not yet loaded into the normalized tables.
         """
         available = self.list_available_raw_source_files()
         loaded = self.list_loaded_source_files()
-        pending = sorted(available - loaded)
-        return pending
+        return sorted(available - loaded)
 
     def load_raw_short_interest_records_for_source_files(
         self,
         source_files: list[str],
     ) -> list[RawShortInterestRecord]:
+        """
+        Incremental loader restricted to a subset of source_file values.
+        """
         con = self._require_connection()
 
         if not source_files:
@@ -140,6 +278,9 @@ class DuckDbShortInterestRepository(ShortInterestRepositoryPort):
                 f"failed to load raw short interest records for source files: {exc}"
             ) from exc
 
+    # ------------------------------------------------------------------
+    # Incremental upserts
+    # ------------------------------------------------------------------
     def upsert_short_interest_history(self, entries: list[ShortInterestRecord]) -> int:
         con = self._require_connection()
 
