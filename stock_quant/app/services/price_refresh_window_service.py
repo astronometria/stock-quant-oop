@@ -1,22 +1,5 @@
 from __future__ import annotations
 
-"""
-PriceRefreshWindowService
-
-Responsabilité :
-- Déterminer la fenêtre effective de refresh des prix en mode incremental
-- Gérer :
-    - catch-up multi-jours
-    - borne max (anti backfill implicite)
-    - noop propre
-    - distinction single-day vs range
-
-IMPORTANT (quant research) :
-- utilise UNIQUEMENT price_history (canonique)
-- ne touche jamais price_latest (serving)
-- pas de survivorship bias implicite
-"""
-
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
@@ -34,15 +17,16 @@ class PriceRefreshWindowResult:
     window_reason: str
     catchup_capped: bool
 
+    # debug / audit
+    last_any_date: Optional[date]
+    last_complete_date: Optional[date]
+    expected_count: int
+    observed_latest_count: int
+
 
 class PriceRefreshWindowService:
-    def __init__(
-        self,
-        price_repository,
-        *,
-        catchup_max_days: int = 30,
-    ):
-        self._repo = price_repository
+    def __init__(self, repo, *, catchup_max_days: int = 30):
+        self._repo = repo
         self._catchup_max_days = catchup_max_days
 
     def resolve_window(
@@ -57,98 +41,131 @@ class PriceRefreshWindowService:
     ) -> PriceRefreshWindowResult:
 
         # ------------------------------------------------------------------
-        # 1) Cas explicite utilisateur
+        # explicit user
         # ------------------------------------------------------------------
-        if as_of is not None:
+        if as_of:
             return PriceRefreshWindowResult(
-                effective_start_date=as_of,
-                effective_end_date=as_of,
-                gap_days=1,
-                is_noop=False,
-                requires_range_fetch=False,
-                window_reason="explicit_as_of",
-                catchup_capped=False,
+                as_of, as_of, 1, False, False,
+                "explicit_as_of", False,
+                None, None, 0, 0
             )
 
         if requested_start_date or requested_end_date:
             return PriceRefreshWindowResult(
-                effective_start_date=requested_start_date,
-                effective_end_date=requested_end_date,
-                gap_days=1,
-                is_noop=False,
-                requires_range_fetch=False,
-                window_reason="explicit_dates",
-                catchup_capped=False,
+                requested_start_date, requested_end_date, 1, False, False,
+                "explicit_dates", False,
+                None, None, 0, 0
             )
 
         # ------------------------------------------------------------------
-        # 2) Mode incremental auto
+        # coverage-aware probe
         # ------------------------------------------------------------------
-        last_date = self._repo.get_max_price_date(symbols=symbols)
+        last_complete, last_any, expected, observed = \
+            self._repo.get_latest_complete_price_date(symbols)
 
         effective_end = today
 
-        # Aucun historique → bootstrap borné
-        if last_date is None:
+        # ------------------------------------------------------------------
+        # bootstrap
+        # ------------------------------------------------------------------
+        if last_complete is None:
             if not lookback_days:
                 return PriceRefreshWindowResult(
-                    None,
-                    None,
-                    0,
-                    True,
-                    False,
-                    "no_history_no_lookback",
-                    False,
+                    None, None, 0, True, False,
+                    "no_history", False,
+                    last_any, last_complete, expected, observed
                 )
 
             start = today - timedelta(days=lookback_days - 1)
 
             return PriceRefreshWindowResult(
-                effective_start_date=start,
-                effective_end_date=today,
-                gap_days=lookback_days,
-                is_noop=False,
-                requires_range_fetch=True,
-                window_reason="bootstrap_lookback",
-                catchup_capped=False,
+                start, today, lookback_days, False, True,
+                "bootstrap", False,
+                last_any, last_complete, expected, observed
             )
 
         # ------------------------------------------------------------------
-        # 3) Calcul gap réel
+        # detect partial latest
         # ------------------------------------------------------------------
-        candidate_start = last_date + timedelta(days=1)
+        if last_any and last_any > last_complete:
+            candidate_start = last_complete + timedelta(days=1)
+            gap_days = (effective_end - candidate_start).days + 1
+
+            return self._finalize(
+                candidate_start,
+                effective_end,
+                gap_days,
+                "partial_latest_detected",
+                last_any,
+                last_complete,
+                expected,
+                observed
+            )
+
+        # ------------------------------------------------------------------
+        # normal incremental
+        # ------------------------------------------------------------------
+        candidate_start = last_complete + timedelta(days=1)
 
         if candidate_start > effective_end:
             return PriceRefreshWindowResult(
-                None,
-                None,
+                last_complete,
+                last_complete,
                 0,
                 True,
                 False,
                 "already_up_to_date",
                 False,
+                last_any,
+                last_complete,
+                expected,
+                observed
             )
 
         gap_days = (effective_end - candidate_start).days + 1
 
-        # ------------------------------------------------------------------
-        # 4) Cap anti backfill implicite
-        # ------------------------------------------------------------------
-        catchup_capped = False
+        return self._finalize(
+            candidate_start,
+            effective_end,
+            gap_days,
+            "incremental_catchup",
+            last_any,
+            last_complete,
+            expected,
+            observed
+        )
+
+    # ------------------------------------------------------------------
+    # finalize (cap + flags)
+    # ------------------------------------------------------------------
+    def _finalize(
+        self,
+        start: date,
+        end: date,
+        gap_days: int,
+        reason: str,
+        last_any,
+        last_complete,
+        expected,
+        observed,
+    ):
+        capped = False
 
         if gap_days > self._catchup_max_days:
-            candidate_start = effective_end - timedelta(days=self._catchup_max_days - 1)
+            start = end - timedelta(days=self._catchup_max_days - 1)
             gap_days = self._catchup_max_days
-            catchup_capped = True
-
-        requires_range = gap_days > 1
+            capped = True
 
         return PriceRefreshWindowResult(
-            effective_start_date=candidate_start,
-            effective_end_date=effective_end,
-            gap_days=gap_days,
-            is_noop=False,
-            requires_range_fetch=requires_range,
-            window_reason="incremental_catchup",
-            catchup_capped=catchup_capped,
+            start,
+            end,
+            gap_days,
+            False,
+            gap_days > 1,
+            reason,
+            capped,
+            last_any,
+            last_complete,
+            expected,
+            observed
         )
