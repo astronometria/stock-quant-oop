@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 """
-YfinancePriceProvider (batch + retry)
+YfinancePriceProvider
 
 Responsabilité :
-- fetch Yahoo
-- batching pour éviter rate limit
+- fetch Yahoo Finance
+- batching pour limiter le rate limit
+- normalisation robuste mono / multi-symboles
 """
 
+from datetime import timedelta
 import time
-from typing import List
+from typing import Iterable
+
 import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
@@ -18,7 +21,7 @@ from tqdm import tqdm
 class YfinancePriceProvider:
     def __init__(
         self,
-        batch_size: int = 200,
+        batch_size: int = 100,
         sleep_seconds: float = 1.0,
         max_retries: int = 2,
     ):
@@ -26,85 +29,192 @@ class YfinancePriceProvider:
         self.sleep_seconds = sleep_seconds
         self.max_retries = max_retries
 
-    def _chunks(self, lst: List[str]):
-        for i in range(0, len(lst), self.batch_size):
-            yield lst[i:i + self.batch_size]
+    def _chunked(self, symbols: list[str]) -> Iterable[list[str]]:
+        for i in range(0, len(symbols), self.batch_size):
+            yield symbols[i:i + self.batch_size]
 
     def fetch(
         self,
-        symbols: List[str],
+        symbols: list[str],
         start_date,
         end_date,
         requires_range_fetch: bool,
     ) -> pd.DataFrame:
+        """
+        Yahoo traite `end` comme exclusif.
+        Donc pour inclure `end_date`, on passe `end_date + 1 jour`.
+        """
 
-        all_frames = []
+        if not symbols:
+            return pd.DataFrame()
 
-        batches = list(self._chunks(symbols))
+        yahoo_end_date = end_date + timedelta(days=1)
+
+        all_frames: list[pd.DataFrame] = []
+        batches = list(self._chunked(symbols))
 
         for batch in tqdm(batches, desc="yfinance batches"):
-            df = self._fetch_batch_with_retry(
-                batch,
-                start_date,
-                end_date,
-                requires_range_fetch,
+            batch_df = self._fetch_batch_with_retry(
+                batch=batch,
+                start_date=start_date,
+                end_date_exclusive=yahoo_end_date,
             )
-            if df is not None and not df.empty:
-                all_frames.append(df)
+            if batch_df is not None and not batch_df.empty:
+                all_frames.append(batch_df)
 
             time.sleep(self.sleep_seconds)
 
         if not all_frames:
             return pd.DataFrame()
 
-        return pd.concat(all_frames, ignore_index=True)
+        combined = pd.concat(all_frames, ignore_index=True)
+
+        # Déduplication défensive au niveau provider.
+        combined = combined.drop_duplicates(subset=["symbol", "price_date"]).reset_index(drop=True)
+
+        return combined
 
     def _fetch_batch_with_retry(
         self,
-        batch,
+        batch: list[str],
         start_date,
-        end_date,
-        requires_range_fetch,
-    ):
-
+        end_date_exclusive,
+    ) -> pd.DataFrame | None:
         for attempt in range(self.max_retries + 1):
             try:
-                return self._fetch_batch(batch, start_date, end_date)
-            except Exception as e:
+                return self._fetch_batch(
+                    batch=batch,
+                    start_date=start_date,
+                    end_date_exclusive=end_date_exclusive,
+                )
+            except Exception as exc:
                 if attempt >= self.max_retries:
-                    print(f"[WARN] batch failed permanently: {e}")
+                    print(f"[WARN] yfinance batch failed permanently size={len(batch)} error={exc}")
                     return None
 
-                print(f"[RETRY] attempt={attempt+1} error={e}")
-                time.sleep(2 * (attempt + 1))
+                sleep_for = 2.0 * (attempt + 1)
+                print(
+                    f"[RETRY] yfinance batch retry={attempt + 1}/{self.max_retries} "
+                    f"size={len(batch)} sleep={sleep_for}s error={exc}"
+                )
+                time.sleep(sleep_for)
 
         return None
 
-    def _fetch_batch(self, batch, start_date, end_date):
-
-        data = yf.download(
+    def _fetch_batch(
+        self,
+        batch: list[str],
+        start_date,
+        end_date_exclusive,
+    ) -> pd.DataFrame | None:
+        raw = yf.download(
             tickers=" ".join(batch),
             start=start_date,
-            end=end_date,
-            group_by="ticker",
+            end=end_date_exclusive,
+            interval="1d",
+            auto_adjust=False,
             progress=False,
+            group_by="ticker",
+            threads=False,
         )
 
-        if data is None or data.empty:
+        if raw is None or raw.empty:
             return None
 
-        frames = []
+        return self._normalize_download_frame(raw=raw, batch=batch)
 
-        for symbol in batch:
-            try:
-                df = data[symbol].copy()
-                df["symbol"] = symbol
-                df["price_date"] = df.index.date
-                frames.append(df.reset_index(drop=True))
-            except Exception:
-                continue
+    def _normalize_download_frame(
+        self,
+        raw: pd.DataFrame,
+        batch: list[str],
+    ) -> pd.DataFrame | None:
+        """
+        Normalise les 2 formes principales de yfinance :
+
+        1) batch multi-symboles :
+           colonnes MultiIndex, ex. ('AAPL', 'Open')
+
+        2) batch mono-symbole :
+           colonnes simples ou parfois MultiIndex selon version/comportement
+        """
+
+        frames: list[pd.DataFrame] = []
+
+        # --------------------------------------------------------------
+        # Cas MultiIndex
+        # --------------------------------------------------------------
+        if isinstance(raw.columns, pd.MultiIndex):
+            level0 = set(raw.columns.get_level_values(0))
+
+            for provider_symbol in batch:
+                if provider_symbol not in level0:
+                    continue
+
+                symbol_frame = raw[provider_symbol].copy()
+                normalized = self._normalize_symbol_frame(
+                    symbol_frame=symbol_frame,
+                    provider_symbol=provider_symbol,
+                )
+                if normalized is not None and not normalized.empty:
+                    frames.append(normalized)
+
+        else:
+            # ----------------------------------------------------------
+            # Cas colonnes simples : on suppose batch mono-symbole.
+            # ----------------------------------------------------------
+            if len(batch) != 1:
+                return None
+
+            provider_symbol = batch[0]
+            normalized = self._normalize_symbol_frame(
+                symbol_frame=raw.copy(),
+                provider_symbol=provider_symbol,
+            )
+            if normalized is not None and not normalized.empty:
+                frames.append(normalized)
 
         if not frames:
             return None
 
         return pd.concat(frames, ignore_index=True)
+
+    def _normalize_symbol_frame(
+        self,
+        symbol_frame: pd.DataFrame,
+        provider_symbol: str,
+    ) -> pd.DataFrame | None:
+        if symbol_frame is None or symbol_frame.empty:
+            return None
+
+        frame = symbol_frame.copy()
+
+        # Harmonisation défensive des noms de colonnes.
+        rename_map = {
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Adj Close": "adj_close",
+            "Volume": "volume",
+        }
+        frame = frame.rename(columns=rename_map)
+
+        required = ["open", "high", "low", "close", "volume"]
+        missing = [col for col in required if col not in frame.columns]
+        if missing:
+            return None
+
+        frame = frame.reset_index()
+
+        # yfinance retourne souvent une colonne Date ou Datetime en index reset.
+        index_col = frame.columns[0]
+        frame = frame.rename(columns={index_col: "price_date"})
+
+        frame["price_date"] = pd.to_datetime(frame["price_date"]).dt.date
+        frame["symbol"] = provider_symbol
+
+        out = frame[["symbol", "price_date", "open", "high", "low", "close", "volume"]].copy()
+
+        # Nettoyage minimal.
+        out = out.dropna(subset=["price_date", "close"])
+        return out.reset_index(drop=True)

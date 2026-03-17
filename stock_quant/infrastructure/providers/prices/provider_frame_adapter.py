@@ -4,8 +4,8 @@ from __future__ import annotations
 ProviderFrameAdapter
 
 Responsabilité :
-- appeler le provider avec des symboles provider
-- remapper vers symbole canonique
+- appeler le provider avec les symboles provider
+- remapper les résultats vers les symboles canoniques
 """
 
 import pandas as pd
@@ -23,9 +23,8 @@ class ProviderFrameAdapter:
         end_date,
         requires_range_fetch: bool,
     ) -> pd.DataFrame | None:
-
         if not provider_symbols:
-            return None
+            return pd.DataFrame()
 
         df = self._provider.fetch(
             symbols=provider_symbols,
@@ -35,11 +34,15 @@ class ProviderFrameAdapter:
         )
 
         if df is None or df.empty:
-            return df
+            return pd.DataFrame()
 
-        # --------------------------------------------------------------
-        # Remap vers symbole canonique
-        # --------------------------------------------------------------
+        df = df.copy()
         df["symbol"] = df["symbol"].map(provider_to_canonical)
+
+        # Élimine tout symbole provider qui ne remappe pas correctement.
+        df = df.dropna(subset=["symbol"]).reset_index(drop=True)
+
+        # Déduplication défensive.
+        df = df.drop_duplicates(subset=["symbol", "price_date"]).reset_index(drop=True)
 
         return df

@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-build_prices CLI (incremental + provider-aware)
-
-Flow :
-1. resolve canonical symbols
-2. build provider plan (Yahoo)
-3. compute refresh window
-4. fetch via adapter (batching inside provider)
-5. log metrics
-
-IMPORTANT :
-- symbol canonique != symbol provider
-"""
-
 import argparse
 import json
 from datetime import date, datetime
@@ -22,11 +8,11 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
-from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
-from stock_quant.infrastructure.providers.prices.provider_frame_adapter import ProviderFrameAdapter
-from stock_quant.app.services.price_refresh_window_service import PriceRefreshWindowService
 from stock_quant.app.services.price_provider_symbol_service import PriceProviderSymbolService
+from stock_quant.app.services.price_refresh_window_service import PriceRefreshWindowService
+from stock_quant.infrastructure.providers.prices.provider_frame_adapter import ProviderFrameAdapter
+from stock_quant.infrastructure.providers.prices.yfinance_price_provider import YfinancePriceProvider
+from stock_quant.infrastructure.repositories.duckdb_price_repository import DuckDbPriceRepository
 
 
 def parse_args():
@@ -41,8 +27,8 @@ def parse_args():
     return p.parse_args()
 
 
-def parse_date(x):
-    return date.fromisoformat(x) if x else None
+def parse_date(value):
+    return date.fromisoformat(value) if value else None
 
 
 def main():
@@ -51,17 +37,11 @@ def main():
 
     repo = DuckDbPriceRepository(args.db_path)
 
-    # ------------------------------------------------------------------
-    # 1. resolve canonical scope
-    # ------------------------------------------------------------------
     canonical_symbols, symbol_scope_source = repo.get_refresh_symbols(args.symbols)
 
     provider_service = PriceProviderSymbolService()
     plan = provider_service.build_yfinance_plan(canonical_symbols)
 
-    # ------------------------------------------------------------------
-    # 2. log provider plan
-    # ------------------------------------------------------------------
     log = {
         "timestamp": datetime.utcnow().isoformat(),
         "symbol_scope_source": symbol_scope_source,
@@ -73,9 +53,6 @@ def main():
         "exclusion_breakdown": plan.exclusion_breakdown,
     }
 
-    # ------------------------------------------------------------------
-    # 3. compute window
-    # ------------------------------------------------------------------
     window = PriceRefreshWindowService(
         repo,
         catchup_max_days=args.catchup_max_days,
@@ -88,27 +65,25 @@ def main():
         today=date.today(),
     )
 
-    log.update({
-        "effective_start_date": str(window.effective_start_date),
-        "effective_end_date": str(window.effective_end_date),
-        "gap_days": window.gap_days,
-        "window_reason": window.window_reason,
-        "is_noop": window.is_noop,
-        "requires_range_fetch": window.requires_range_fetch,
-    })
+    log.update(
+        {
+            "effective_start_date": str(window.effective_start_date),
+            "effective_end_date": str(window.effective_end_date),
+            "gap_days": window.gap_days,
+            "window_reason": window.window_reason,
+            "is_noop": window.is_noop,
+            "requires_range_fetch": window.requires_range_fetch,
+        }
+    )
 
-    # ------------------------------------------------------------------
-    # noop
-    # ------------------------------------------------------------------
     if window.is_noop or not plan.eligible_provider_symbols:
         print(json.dumps(log, indent=2))
         return
 
-    # ------------------------------------------------------------------
-    # 4. fetch (provider-aware)
-    # ------------------------------------------------------------------
     provider = YfinancePriceProvider()
     adapter = ProviderFrameAdapter(provider)
+
+    log["provider_fetch_input_count"] = len(plan.eligible_provider_symbols)
 
     df = adapter.fetch_prices(
         provider_symbols=plan.eligible_provider_symbols,
@@ -120,7 +95,9 @@ def main():
 
     log["rows_fetched"] = 0 if df is None else len(df)
 
-    # tqdm placeholder (clean terminal)
+    with open("logs/build_prices.log", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(log) + "\n")
+
     for _ in tqdm(range(1), desc="processing"):
         pass
 
