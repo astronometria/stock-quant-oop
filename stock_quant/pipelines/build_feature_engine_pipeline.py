@@ -267,13 +267,13 @@ class BuildFeatureEnginePipeline(BasePipeline):
         con.execute(
             """
             CREATE TEMP TABLE tmp_fundamental_snapshot_meta AS
-            SELECT company_id, period_type, period_end_date AS as_of_date, available_at
+            SELECT company_id, period_type, CAST(available_at AS DATE) AS as_of_date, available_at
             FROM fundamental_snapshot_quarterly
             UNION ALL
-            SELECT company_id, period_type, period_end_date AS as_of_date, available_at
+            SELECT company_id, period_type, CAST(available_at AS DATE) AS as_of_date, available_at
             FROM fundamental_snapshot_annual
             UNION ALL
-            SELECT company_id, period_type, period_end_date AS as_of_date, available_at
+            SELECT company_id, period_type, CAST(available_at AS DATE) AS as_of_date, available_at
             FROM fundamental_ttm
             """
         )
@@ -303,8 +303,8 @@ class BuildFeatureEnginePipeline(BasePipeline):
             SELECT
                 company_id,
                 period_end_date,
-                COALESCE(available_at, period_end_date) AS available_at,
-                COALESCE(available_at, period_end_date) AS effective_as_of_date,
+                available_at AS available_at,
+                CAST(available_at AS DATE) AS effective_as_of_date,
                 revenue,
                 net_income,
                 net_margin,

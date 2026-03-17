@@ -76,10 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finra-truncate-raw", action="store_true", help="Delete existing finra_short_interest_source_raw before load.")
 
     parser.add_argument(
-        "--disallow-adr",
+        "--allow-adr",
         action="store_true",
-        default=True,
-        help="Explicitly disallow ADR in market universe build. This project should stay ADR-free.",
+        default=False,
+        help="Allow ADR in market universe build. Default is ADR-free.",
     )
 
     parser.add_argument("--verbose", action="store_true", help="Enable verbose child command output.")
@@ -220,7 +220,7 @@ def main() -> int:
             "--db-path",
             str(db_path),
             "--verbose",
-            "--disallow-adr",
+            "--allow-adr",
         ]
         _run_step("BUILD MARKET UNIVERSE", cmd)
 
