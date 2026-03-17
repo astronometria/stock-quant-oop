@@ -31,6 +31,11 @@ def parse_date(value):
     return date.fromisoformat(value) if value else None
 
 
+def write_jsonl_log(path: str, payload: dict) -> None:
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+
+
 def main():
     args = parse_args()
     Path("logs").mkdir(exist_ok=True)
@@ -42,8 +47,10 @@ def main():
     provider_service = PriceProviderSymbolService()
     plan = provider_service.build_yfinance_plan(canonical_symbols)
 
+    run_started_at = datetime.utcnow()
+
     log = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": run_started_at.isoformat(),
         "symbol_scope_source": symbol_scope_source,
         "research_scope_symbol_count": len(canonical_symbols),
         "provider_candidate_symbol_count": plan.total_input_count,
@@ -52,6 +59,24 @@ def main():
         "mapping_applied_count": plan.mapping_applied_count,
         "exclusion_breakdown": plan.exclusion_breakdown,
     }
+
+    if plan.excluded_count > 0:
+        exclusion_payload = {
+            "timestamp": run_started_at.isoformat(),
+            "provider_name": plan.provider_name,
+            "excluded_count": plan.excluded_count,
+            "exclusion_breakdown": plan.exclusion_breakdown,
+            "sample_excluded_records": [
+                {
+                    "canonical_symbol": record.canonical_symbol,
+                    "provider_symbol": record.provider_symbol,
+                    "exclusion_reason": record.exclusion_reason,
+                }
+                for record in plan.records
+                if not record.is_fetchable
+            ][:100]
+        }
+        write_jsonl_log("logs/provider_symbol_mapping.log", exclusion_payload)
 
     window = PriceRefreshWindowService(
         repo,
@@ -77,6 +102,7 @@ def main():
     )
 
     if window.is_noop or not plan.eligible_provider_symbols:
+        write_jsonl_log("logs/build_prices.log", log)
         print(json.dumps(log, indent=2))
         return
 
@@ -95,8 +121,19 @@ def main():
 
     log["rows_fetched"] = 0 if df is None else len(df)
 
-    with open("logs/build_prices.log", "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(log) + "\n")
+    write_result = repo.upsert_price_history(
+        df,
+        source_name="yfinance",
+        ingested_at=run_started_at,
+    )
+    log["write_result"] = write_result
+
+    latest_result = repo.refresh_price_latest(
+        symbols=list(df["symbol"].dropna().astype(str).unique()) if df is not None and not df.empty else []
+    )
+    log["price_latest_refresh_result"] = latest_result
+
+    write_jsonl_log("logs/build_prices.log", log)
 
     for _ in tqdm(range(1), desc="processing"):
         pass
