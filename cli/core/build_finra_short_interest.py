@@ -2,69 +2,72 @@
 from __future__ import annotations
 
 """
-Canonical FINRA short interest builder.
+Canonical FINRA short-interest builder.
 
-Responsabilités :
-- point d'entrée unique du pipeline short interest
-- wiring propre repository -> service -> pipeline
-- aucune logique métier ici
-
-Important :
-- ne dépend PAS du short volume
-- ne dépend PAS des features
+Ce CLI doit rester le point d'entrée unique du build short interest.
+Important:
+- on garde la logique d'orchestration la plus mince possible ici
+- la logique métier et SQL-first vivent dans le repository / pipeline
+- ce fichier ne doit PAS réintroduire d'ancienne signature cassée
 """
 
 import argparse
 from pathlib import Path
-import json
+
 import duckdb
 
-from stock_quant.pipelines.build_short_interest_pipeline import BuildShortInterestPipeline
 from stock_quant.app.services.short_interest_service import ShortInterestService
 from stock_quant.infrastructure.repositories.duckdb_short_interest_repository import (
     DuckDbShortInterestRepository,
 )
+from stock_quant.pipelines.build_short_interest_pipeline import BuildShortInterestPipeline
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build FINRA short interest (incremental, canonical)")
-    p.add_argument("--db-path", required=True)
-    return p.parse_args()
+    """
+    Parse les arguments CLI.
+
+    On garde un contrat simple:
+    --db-path est obligatoire pour éviter toute ambiguïté d'environnement.
+    """
+    parser = argparse.ArgumentParser(
+        description="Build FINRA short interest (canonical SQL-first pipeline)."
+    )
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Path to DuckDB database file.",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
+    """
+    Point d'entrée principal.
 
-    db_path = str(Path(args.db_path).expanduser().resolve())
+    Très important:
+    - le repository est branché sur une connexion DuckDB active
+    - le service reçoit le repository
+    - le pipeline reçoit uniquement le service
+      (et NON repository=..., car cette signature n'existe plus)
+    """
+    args = parse_args()
+    db_path = Path(args.db_path).expanduser().resolve()
 
     print(f"[build_finra_short_interest] db_path={db_path}", flush=True)
 
-    # ---------------------------------------------------------
-    # DB connection
-    # ---------------------------------------------------------
-    con = duckdb.connect(db_path)
-
+    con = duckdb.connect(str(db_path))
     try:
-        # -----------------------------------------------------
-        # Wiring
-        # -----------------------------------------------------
         repository = DuckDbShortInterestRepository(con)
         service = ShortInterestService(repository=repository)
 
-        pipeline = BuildShortInterestPipeline(
-            repository=repository,
-            service=service,
-        )
+        # Correction clé:
+        # l'ancienne signature avec repository=... n'est plus supportée.
+        pipeline = BuildShortInterestPipeline(service=service)
 
-        # -----------------------------------------------------
-        # Run
-        # -----------------------------------------------------
         result = pipeline.run()
-
-        print(json.dumps(result.to_dict(), default=str), flush=True)
-
+        print(result.to_json(), flush=True)
         return 0
-
     finally:
         con.close()
 
