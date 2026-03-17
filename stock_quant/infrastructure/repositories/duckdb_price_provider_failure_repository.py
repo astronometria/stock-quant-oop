@@ -5,17 +5,18 @@ DuckDbPriceProviderFailureRepository
 
 Responsabilités :
 - stocker les échecs provider (yfinance)
-- éviter les retry inutiles
-- fournir une blacklist dynamique
+- éviter les retries inutiles sur les mêmes symboles morts
+- fournir une blacklist dynamique récente
 
 IMPORTANT :
-- utilisé AVANT fetch pour filtrer
-- utilisé APRÈS fetch pour enregistrer les erreurs
+- filtrage AVANT fetch
+- enregistrement APRÈS fetch
+- pas de logique métier Yahoo complexe ici : seulement persistence / lecture
 """
 
 import duckdb
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import Dict, List
 
 
 class DuckDbPriceProviderFailureRepository:
@@ -28,7 +29,7 @@ class DuckDbPriceProviderFailureRepository:
     # ---------------------------------------------------------
     # INIT TABLE (idempotent)
     # ---------------------------------------------------------
-    def ensure_table(self):
+    def ensure_table(self) -> None:
         with self._connect() as con:
             con.execute("""
                 CREATE TABLE IF NOT EXISTS price_provider_failures (
@@ -52,22 +53,28 @@ class DuckDbPriceProviderFailureRepository:
         min_failure_count: int = 2,
     ) -> List[str]:
         """
-        Retourne les provider_symbol à exclure du fetch.
+        Retourne les provider_symbol à exclure temporairement du fetch.
 
-        On ne bloque que :
-        - erreurs répétées
-        - récentes
+        Politique :
+        - uniquement les erreurs répétées
+        - uniquement les erreurs récentes
+
+        NOTE :
+        DuckDB ne supporte pas bien `INTERVAL ? DAY` avec placeholder.
+        On calcule donc le cutoff en Python, puis on passe un timestamp normal.
         """
+        cutoff_ts = datetime.utcnow() - timedelta(days=max_age_days)
+
         with self._connect() as con:
             rows = con.execute("""
                 SELECT provider_symbol
                 FROM price_provider_failures
                 WHERE provider_name = ?
                   AND failure_count >= ?
-                  AND last_seen >= NOW() - INTERVAL ? DAY
-            """, [provider_name, min_failure_count, max_age_days]).fetchall()
+                  AND last_seen >= ?
+            """, [provider_name, min_failure_count, cutoff_ts]).fetchall()
 
-        return [r[0] for r in rows if r[0]]
+        return [row[0] for row in rows if row[0]]
 
     # ---------------------------------------------------------
     # WRITE — upsert failures
@@ -76,7 +83,7 @@ class DuckDbPriceProviderFailureRepository:
         self,
         provider_name: str,
         failures: List[Dict],
-    ):
+    ) -> None:
         """
         failures = [
             {
@@ -92,41 +99,44 @@ class DuckDbPriceProviderFailureRepository:
         now = datetime.utcnow()
 
         with self._connect() as con:
-            for f in failures:
+            for failure in failures:
                 con.execute("""
-                    MERGE INTO price_provider_failures t
+                    MERGE INTO price_provider_failures AS target
                     USING (
                         SELECT
                             ? AS provider_name,
                             ? AS canonical_symbol,
                             ? AS provider_symbol,
                             ? AS failure_reason
-                    ) s
-                    ON t.provider_name = s.provider_name
-                       AND t.provider_symbol = s.provider_symbol
+                    ) AS src
+                    ON target.provider_name = src.provider_name
+                       AND target.provider_symbol = src.provider_symbol
                     WHEN MATCHED THEN UPDATE SET
-                        failure_count = t.failure_count + 1,
+                        failure_count = target.failure_count + 1,
+                        failure_reason = src.failure_reason,
+                        canonical_symbol = src.canonical_symbol,
                         last_seen = ?
-                    WHEN NOT MATCHED THEN INSERT (
-                        provider_name,
-                        canonical_symbol,
-                        provider_symbol,
-                        failure_reason,
-                        failure_count,
-                        first_seen,
-                        last_seen
-                    )
-                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                    WHEN NOT MATCHED THEN
+                        INSERT (
+                            provider_name,
+                            canonical_symbol,
+                            provider_symbol,
+                            failure_reason,
+                            failure_count,
+                            first_seen,
+                            last_seen
+                        )
+                        VALUES (?, ?, ?, ?, 1, ?, ?)
                 """, [
                     provider_name,
-                    f["canonical_symbol"],
-                    f["provider_symbol"],
-                    f["failure_reason"],
+                    failure["canonical_symbol"],
+                    failure["provider_symbol"],
+                    failure["failure_reason"],
                     now,
                     provider_name,
-                    f["canonical_symbol"],
-                    f["provider_symbol"],
-                    f["failure_reason"],
+                    failure["canonical_symbol"],
+                    failure["provider_symbol"],
+                    failure["failure_reason"],
                     now,
                     now,
                 ])
