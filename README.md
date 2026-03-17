@@ -1,67 +1,62 @@
 # stock-quant-oop
 
-Quant research pipeline (OOP) with strict point-in-time guarantees.
+Quant research pipeline (OOP + SQL-first) with strict point-in-time guarantees.
 
-## Core Principles
+## Core principles
+- `price_history` is the canonical price table.
+- `price_latest` is serving-only and never used for research.
+- all research joins must respect `available_at`.
+- no fallback from `available_at` to business dates.
+- historical tables must avoid survivor bias.
+- canonical pipelines must be idempotent and rebuildable.
 
-- `price_history` = canonical price table
-- `price_latest` = serving only, never used for research
-- all research joins are point-in-time with `available_at`
-- no fallback from `available_at` to `period_end_date`
-- datasets are reproducible and versionable
+## Current state
+Implemented and stable:
+- daily Yahoo prices with provider symbol compatibility and batching
+- SEC filing normalization
+- FINRA short interest canonical history and latest
 
-## Data Layers
+Restored / in progress:
+- FINRA daily short volume raw + canonical history
+- short_features_daily derived from short volume + short interest
+
+## Data layers
 
 ### Raw
-- SEC raw filings and XBRL facts
+- SEC raw inputs
 - symbol raw sources
-- FINRA raw short-interest sources
-- price raw sources (historical + daily)
+- FINRA short interest raw sources
+- FINRA daily short volume raw sources
+- price raw sources
 
 ### Normalized
-- `symbol_reference`
-- `sec_filing`
-- `sec_fact_normalized`
-- `price_history`
-- `finra_short_interest_history`
+- symbol_reference
+- sec_filing
+- sec_fact_normalized
+- price_history
+- finra_short_interest_history
+- daily_short_volume_history
 
 ### Derived
-- `market_universe`
-- `fundamental_features_daily`
-- `short_features_daily`
-- `training_dataset_daily`
-- `dataset_versions`
+- market_universe
+- fundamental_features_daily
+- short_features_daily
+- training_dataset_daily
+- dataset_versions
 
-## Rebuild
+## Canonical pipeline docs
+See:
+- docs/pipelines/build_prices.md
+- docs/pipelines/build_sec_filings.md
+- docs/pipelines/build_finra_short_interest.md
+- docs/pipelines/build_finra_daily_short_volume.md
+- docs/pipelines/build_short_features.md
+- docs/pipelines/run_daily_pipeline.md
 
-Canonical rebuild entry point:
+## Rebuild from scratch
+See:
+- docs/operations/rebuild_from_scratch.md
 
-    python3 cli/ops/rebuild_database_from_scratch.py --db-path ~/stock-quant-oop/market.duckdb
-
-Rebuild includes:
-- symbol staging
-- market universe
-- symbol reference
-- SEC filings
-- SEC fact normalization
-- fundamentals
-- historical price backfill
-- daily price refresh
-- FINRA short interest
-
-## Research Guarantees
-
-- fundamentals become visible only after `available_at`
-- short interest becomes visible only after `available_at`
-- research never reads `price_latest`
-- datasets must be point-in-time safe and deduplicated per `(symbol, price_date)`
-
-## Repo Structure
-
-- `stock_quant/` : application package
-- `cli/core/` : main builders
-- `cli/ops/` : orchestration
-- `cli/raw/` : raw ingestion / staging
-- `docs/` : architecture and pipeline docs
-- `tests/` : unit and integration coverage
-
+## Repo walkthrough
+See:
+- docs/walkthrough/repo_walkthrough.md
