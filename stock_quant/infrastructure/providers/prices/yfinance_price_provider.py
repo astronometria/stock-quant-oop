@@ -1,244 +1,481 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from datetime import date
-from typing import Any
+"""
+Yahoo Finance provider robuste pour le refresh daily.
+
+Objectifs principaux
+--------------------
+- Garder un design mince côté provider.
+- Filtrer les symboles manifestement incompatibles avec Yahoo avant appel réseau.
+- Exécuter les requêtes en petits batches pour réduire les rate limits.
+- Continuer malgré les erreurs non fatales, tout en les journalisant.
+- Retourner un DataFrame propre et stable pour le pipeline build_prices.
+
+Notes importantes
+-----------------
+- Ce provider est volontairement "best effort" :
+  on privilégie l'ingestion partielle utile plutôt qu'un échec global.
+- La table canonique de sortie du pipeline demeure `price_history`.
+- Ce provider ne décide pas des règles de recherche; il ne fait que récupérer
+  et normaliser des prix Yahoo dans un format compatible avec le service.
+"""
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from time import sleep
+from typing import Iterable
 
 import pandas as pd
+import yfinance as yf
+from tqdm import tqdm
 
-from stock_quant.domain.ports.providers import PriceSourcePort
+from stock_quant.shared.exceptions import ServiceError
 
 
-class YfinancePriceProvider(PriceSourcePort):
-    def __init__(self, auto_adjust: bool = False, threads: bool = True) -> None:
-        self._auto_adjust = auto_adjust
-        self._threads = threads
+@dataclass(slots=True)
+class YahooBatchStats:
+    """
+    Petit conteneur de métriques pour faciliter le debug futur.
+    """
+    requested_batches: int = 0
+    completed_batches: int = 0
+    requested_symbols: int = 0
+    accepted_symbols: int = 0
+    skipped_symbols: int = 0
+    rows_returned: int = 0
 
-    def fetch_daily_prices(self, symbols: list[str], as_of: date | None = None) -> Iterable[Any]:
-        frame = self.fetch_daily_prices_frame(symbols=symbols, as_of=as_of)
-        return frame.to_dict(orient="records")
 
-    def fetch_history(
+class YfinancePriceProvider:
+    """
+    Provider Yahoo Finance orienté DataFrame.
+
+    Stratégie retenue
+    -----------------
+    Option A choisie :
+    - batch petit
+    - retry souple
+    - sleep entre batches
+    - skip des erreurs individuelles avec logs
+    """
+
+    def __init__(
         self,
-        symbols: list[str],
-        start_date: date | None = None,
-        end_date: date | None = None,
-    ) -> Iterable[Any]:
-        frame = self.fetch_history_frame(symbols=symbols, start_date=start_date, end_date=end_date)
-        return frame.to_dict(orient="records")
+        *,
+        batch_size: int = 20,
+        max_retries: int = 3,
+        sleep_seconds: float = 1.5,
+        timeout_seconds: int = 20,
+        progress_desc: str = "yfinance daily batches",
+    ) -> None:
+        # Taille de lot volontairement petite pour éviter de surcharger Yahoo.
+        self.batch_size = max(1, int(batch_size))
 
-    def fetch_daily_prices_frame(self, symbols: list[str], as_of: date | None = None) -> pd.DataFrame:
-        normalized_symbols = [symbol.strip().upper() for symbol in symbols if str(symbol).strip()]
+        # Nombre maximal de tentatives par batch.
+        self.max_retries = max(1, int(max_retries))
+
+        # Petite pause entre batches / retries pour réduire la pression.
+        self.sleep_seconds = max(0.0, float(sleep_seconds))
+
+        # Timeout transmis à yfinance.
+        self.timeout_seconds = max(1, int(timeout_seconds))
+
+        # Libellé tqdm.
+        self.progress_desc = str(progress_desc)
+
+    # ------------------------------------------------------------------
+    # API publique attendue par ProviderFrameAdapter / build_prices
+    # ------------------------------------------------------------------
+
+    def fetch_daily_prices_frame(
+        self,
+        *,
+        symbols: list[str] | None,
+        as_of: date | None = None,
+    ) -> pd.DataFrame:
+        """
+        Retourne les prix journaliers Yahoo pour une date cible.
+
+        Convention :
+        - si `as_of` est fourni, on récupère la fenêtre [as_of, as_of + 1 jour)
+        - cela correspond au comportement usuel de yfinance en daily
+        """
+        normalized_symbols = self._prepare_symbols(symbols)
+
         if not normalized_symbols:
             return self._empty_frame()
 
-        try:
-            import yfinance as yf
-        except Exception as exc:
-            raise RuntimeError("yfinance is not installed or could not be imported") from exc
-
         target_date = as_of or date.today()
-        start = target_date.isoformat()
-        end = (pd.Timestamp(target_date) + pd.Timedelta(days=1)).date().isoformat()
+        start_str = target_date.isoformat()
+        end_str = (pd.Timestamp(target_date) + pd.Timedelta(days=1)).date().isoformat()
 
-        data = yf.download(
-            tickers=normalized_symbols,
-            start=start,
-            end=end,
-            auto_adjust=self._auto_adjust,
-            group_by="ticker",
-            progress=False,
-            threads=self._threads,
-        )
-
-        return self._normalize_downloaded_data(
-            data=data,
-            normalized_symbols=normalized_symbols,
-            default_source_name="yfinance",
+        return self._fetch_batches(
+            symbols=normalized_symbols,
+            start_date=start_str,
+            end_date=end_str,
         )
 
     def fetch_history_frame(
         self,
-        symbols: list[str],
+        *,
+        symbols: list[str] | None,
         start_date: date | None = None,
         end_date: date | None = None,
     ) -> pd.DataFrame:
-        normalized_symbols = [symbol.strip().upper() for symbol in symbols if str(symbol).strip()]
+        """
+        Support secondaire pour compat future backfill ciblé via Yahoo.
+        """
+        normalized_symbols = self._prepare_symbols(symbols)
+
         if not normalized_symbols:
             return self._empty_frame()
 
-        try:
-            import yfinance as yf
-        except Exception as exc:
-            raise RuntimeError("yfinance is not installed or could not be imported") from exc
+        start_str = start_date.isoformat() if start_date is not None else None
+        end_str = end_date.isoformat() if end_date is not None else None
 
-        download_start = start_date.isoformat() if start_date is not None else None
-        download_end = None
-        if end_date is not None:
-            download_end = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).date().isoformat()
+        return self._fetch_batches(
+            symbols=normalized_symbols,
+            start_date=start_str,
+            end_date=end_str,
+        )
 
-        data = yf.download(
-            tickers=normalized_symbols,
-            start=download_start,
-            end=download_end,
-            auto_adjust=self._auto_adjust,
+    # ------------------------------------------------------------------
+    # Coeur de récupération
+    # ------------------------------------------------------------------
+
+    def _fetch_batches(
+        self,
+        *,
+        symbols: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
+        stats = YahooBatchStats(
+            requested_batches=len(self._chunk(symbols, self.batch_size)),
+            requested_symbols=len(symbols),
+            accepted_symbols=len(symbols),
+            skipped_symbols=0,
+        )
+
+        batch_frames: list[pd.DataFrame] = []
+        batches = self._chunk(symbols, self.batch_size)
+
+        for batch in tqdm(
+            batches,
+            desc=self.progress_desc,
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        ):
+            frame = self._fetch_single_batch_with_retry(
+                batch=batch,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            stats.completed_batches += 1
+
+            if frame is not None and not frame.empty:
+                stats.rows_returned += int(len(frame))
+                batch_frames.append(frame)
+
+            # Pause légère entre lots pour limiter les erreurs 429 / rate limit.
+            if self.sleep_seconds > 0:
+                sleep(self.sleep_seconds)
+
+        if not batch_frames:
+            return self._empty_frame()
+
+        merged = pd.concat(batch_frames, ignore_index=True)
+        merged = self._normalize_output_frame(merged)
+
+        return merged
+
+    def _fetch_single_batch_with_retry(
+        self,
+        *,
+        batch: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame | None:
+        """
+        Exécute un batch Yahoo avec retries.
+
+        En mode Option A :
+        - on log l'erreur
+        - on réessaie quelques fois
+        - si ça échoue encore, on skip le batch
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                frame = self._download_batch(
+                    batch=batch,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                return frame
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                print(
+                    f"[yfinance_price_provider] batch_failed "
+                    f"attempt={attempt}/{self.max_retries} "
+                    f"batch_size={len(batch)} "
+                    f"symbols={','.join(batch[:5])}{'...' if len(batch) > 5 else ''} "
+                    f"error={exc}"
+                )
+
+                if attempt < self.max_retries and self.sleep_seconds > 0:
+                    sleep(self.sleep_seconds)
+
+        print(
+            f"[yfinance_price_provider] batch_skipped "
+            f"batch_size={len(batch)} "
+            f"symbols={','.join(batch[:5])}{'...' if len(batch) > 5 else ''} "
+            f"error={last_error}"
+        )
+        return None
+
+    def _download_batch(
+        self,
+        *,
+        batch: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
+        """
+        Télécharge un batch via yfinance et retourne un DataFrame long :
+        symbol, price_date, open, high, low, close, volume, source_name, ingested_at
+
+        On utilise group_by='ticker' pour un parsing plus prévisible.
+        """
+        if not batch:
+            return self._empty_frame()
+
+        joined = " ".join(batch)
+
+        raw = yf.download(
+            tickers=joined,
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
+            threads=False,
             group_by="ticker",
             progress=False,
-            threads=self._threads,
+            timeout=self.timeout_seconds,
         )
 
-        return self._normalize_downloaded_data(
-            data=data,
-            normalized_symbols=normalized_symbols,
-            default_source_name="yfinance",
+        if raw is None or raw.empty:
+            return self._empty_frame()
+
+        # Cas 1 : un seul ticker -> colonnes simples
+        if len(batch) == 1 and not isinstance(raw.columns, pd.MultiIndex):
+            return self._normalize_single_symbol_download(
+                frame=raw,
+                symbol=batch[0],
+            )
+
+        # Cas 2 : plusieurs tickers -> colonnes MultiIndex attendues
+        if isinstance(raw.columns, pd.MultiIndex):
+            long_frames: list[pd.DataFrame] = []
+
+            # Premier niveau ou second niveau selon la structure renvoyée par yfinance.
+            level0 = list(raw.columns.get_level_values(0))
+            level1 = list(raw.columns.get_level_values(1))
+
+            for symbol in batch:
+                if symbol in level0:
+                    symbol_frame = raw[symbol].copy()
+                    normalized = self._normalize_single_symbol_download(
+                        frame=symbol_frame,
+                        symbol=symbol,
+                    )
+                    if not normalized.empty:
+                        long_frames.append(normalized)
+                    continue
+
+                if symbol in level1:
+                    symbol_frame = raw.xs(symbol, axis=1, level=1).copy()
+                    normalized = self._normalize_single_symbol_download(
+                        frame=symbol_frame,
+                        symbol=symbol,
+                    )
+                    if not normalized.empty:
+                        long_frames.append(normalized)
+
+            if not long_frames:
+                return self._empty_frame()
+
+            return pd.concat(long_frames, ignore_index=True)
+
+        # Fallback très défensif.
+        raise ServiceError(
+            f"unexpected yfinance response structure for batch of size {len(batch)}"
         )
 
-    def _normalize_downloaded_data(
+    # ------------------------------------------------------------------
+    # Préparation / filtrage des symboles
+    # ------------------------------------------------------------------
+
+    def _prepare_symbols(self, symbols: Iterable[str] | None) -> list[str]:
+        """
+        Normalise et filtre les symboles avant appel réseau.
+
+        Règles retenues pour Yahoo-safe v1 :
+        - trim + upper
+        - exclure '$'
+        - exclure '.'
+        - exclure longueur > 5
+        - garder le tiret '-' car plusieurs symboles US Yahoo l'utilisent
+          (ex: preferred / warrants transformés côté univers en forme Yahoo-compatible)
+        """
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for raw_symbol in symbols or []:
+            symbol = self._normalize_symbol(raw_symbol)
+            if not symbol:
+                continue
+            if symbol in seen:
+                continue
+
+            if not self._is_yahoo_safe_symbol(symbol):
+                print(f"[yfinance_price_provider] skip_symbol symbol={symbol} reason=not_yahoo_safe")
+                continue
+
+            seen.add(symbol)
+            normalized.append(symbol)
+
+        return normalized
+
+    def _is_yahoo_safe_symbol(self, symbol: str) -> bool:
+        if not symbol:
+            return False
+        if "$" in symbol:
+            return False
+        if "." in symbol:
+            return False
+        if len(symbol) > 5:
+            return False
+        return True
+
+    def _normalize_symbol(self, value: object) -> str:
+        if value is None:
+            return ""
+        symbol = str(value).strip().upper()
+
+        # Harmonisation minimale vers le style Yahoo :
+        # certains systèmes internes utilisent suffixes préférentiels avec underscore.
+        symbol = symbol.replace("_", "-")
+
+        return symbol
+
+    # ------------------------------------------------------------------
+    # Normalisation DataFrame
+    # ------------------------------------------------------------------
+
+    def _normalize_single_symbol_download(
         self,
-        data: pd.DataFrame,
-        normalized_symbols: list[str],
-        default_source_name: str,
+        *,
+        frame: pd.DataFrame,
+        symbol: str,
     ) -> pd.DataFrame:
-        if data is None or data.empty:
+        if frame is None or frame.empty:
             return self._empty_frame()
 
-        frames: list[pd.DataFrame] = []
+        normalized = frame.copy()
 
-        if isinstance(data.columns, pd.MultiIndex):
-            level0 = [str(v).strip().upper() for v in data.columns.get_level_values(0)]
-            level1 = [str(v).strip().upper() for v in data.columns.get_level_values(1)]
+        # Le nom de l'index peut varier; on le remet en colonne.
+        normalized = normalized.reset_index()
 
-            symbols_in_level0 = set(level0)
-            symbols_in_level1 = set(level1)
+        rename_map = {}
+        lower_map = {str(col).strip().lower(): col for col in normalized.columns}
 
-            if any(symbol in symbols_in_level0 for symbol in normalized_symbols):
-                for symbol in normalized_symbols:
-                    if symbol not in symbols_in_level0:
-                        continue
-                    symbol_frame = data[symbol].copy()
-                    if symbol_frame.empty:
-                        continue
-                    frames.append(self._normalize_symbol_frame(symbol, symbol_frame, default_source_name))
-            elif any(symbol in symbols_in_level1 for symbol in normalized_symbols):
-                for symbol in normalized_symbols:
-                    if symbol not in symbols_in_level1:
-                        continue
-                    symbol_frame = data.xs(symbol, axis=1, level=1).copy()
-                    if symbol_frame.empty:
-                        continue
-                    frames.append(self._normalize_symbol_frame(symbol, symbol_frame, default_source_name))
-            else:
-                flattened = data.copy()
-                flattened.columns = [
-                    "_".join(str(part).strip() for part in col if str(part).strip())
-                    if isinstance(col, tuple)
-                    else str(col).strip()
-                    for col in flattened.columns
-                ]
-                if len(normalized_symbols) == 1:
-                    frames.append(self._normalize_symbol_frame(normalized_symbols[0], flattened, default_source_name))
-                else:
-                    return self._empty_frame()
-        else:
-            if len(normalized_symbols) != 1:
-                raise RuntimeError("unexpected yfinance output shape for multi-symbol download")
-            frames.append(self._normalize_symbol_frame(normalized_symbols[0], data.copy(), default_source_name))
+        for src, dst in {
+            "date": "price_date",
+            "datetime": "price_date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "adj close": "adj_close",
+            "adj close*": "adj_close",
+            "volume": "volume",
+        }.items():
+            if src in lower_map:
+                rename_map[lower_map[src]] = dst
 
-        if not frames:
-            return self._empty_frame()
+        normalized = normalized.rename(columns=rename_map)
 
-        combined = pd.concat(frames, ignore_index=True)
-        combined = combined.sort_values(["symbol", "price_date"]).reset_index(drop=True)
-        return combined
-
-    def _normalize_symbol_frame(self, symbol: str, frame: pd.DataFrame, default_source_name: str) -> pd.DataFrame:
-        working = frame.reset_index().copy()
-
-        if isinstance(working.columns, pd.MultiIndex):
-            working.columns = [
-                "_".join(str(part).strip() for part in col if str(part).strip())
-                if isinstance(col, tuple)
-                else str(col).strip()
-                for col in working.columns
-            ]
-        else:
-            working.columns = [str(col).strip() for col in working.columns]
-
-        # Normaliser d'abord les noms de colonnes en majuscules pour inspection
-        original_columns = list(working.columns)
-        normalized_lookup = {col: str(col).strip().upper() for col in original_columns}
-
-        # Date / index
-        date_col = None
-        for col, col_upper in normalized_lookup.items():
-            if col_upper in {"DATE", "DATETIME", "INDEX"}:
-                date_col = col
-                break
-        if date_col is not None and date_col != "price_date":
-            working = working.rename(columns={date_col: "price_date"})
-
-        # Choix explicite de la colonne close :
-        # on préfère Adj Close si présent, sinon Close.
-        adj_close_candidates = [col for col, col_upper in normalized_lookup.items() if "ADJ CLOSE" in col_upper]
-        close_candidates = [
-            col for col, col_upper in normalized_lookup.items()
-            if col_upper == "CLOSE" or col_upper.endswith("_CLOSE")
-        ]
-        chosen_close = adj_close_candidates[0] if adj_close_candidates else (close_candidates[0] if close_candidates else None)
-
-        rename_map: dict[str, str] = {}
-        for col in original_columns:
-            col_upper = normalized_lookup[col]
-
-            if col == date_col:
-                continue
-            if chosen_close is not None and col == chosen_close:
-                rename_map[col] = "close"
-                continue
-
-            if "OPEN" in col_upper and col_upper != "OPENINTEREST":
-                rename_map[col] = "open"
-            elif "HIGH" in col_upper:
-                rename_map[col] = "high"
-            elif col_upper == "LOW" or col_upper.endswith("_LOW"):
-                rename_map[col] = "low"
-            elif "VOLUME" in col_upper:
-                rename_map[col] = "volume"
-
-        working = working.rename(columns=rename_map)
-
-        # Si Adj Close et Close coexistent, on élimine la colonne non retenue.
-        candidate_drop_cols: list[str] = []
-        for col in working.columns:
-            col_upper = str(col).strip().upper()
-            if col == "close":
-                continue
-            if "ADJ CLOSE" in col_upper or col_upper == "CLOSE" or col_upper.endswith("_CLOSE"):
-                candidate_drop_cols.append(col)
-        if candidate_drop_cols:
-            working = working.drop(columns=candidate_drop_cols, errors="ignore")
-
-        # Protection supplémentaire : si des colonnes dupliquées subsistent, on garde la première.
-        if working.columns.duplicated().any():
-            working = working.loc[:, ~working.columns.duplicated()]
+        # Si Close absent mais Adj Close présent, on reprend Adj Close.
+        if "close" not in normalized.columns and "adj_close" in normalized.columns:
+            normalized["close"] = normalized["adj_close"]
 
         required = ["price_date", "open", "high", "low", "close", "volume"]
-        missing = [col for col in required if col not in working.columns]
+        missing = [col for col in required if col not in normalized.columns]
         if missing:
-            raise ValueError(f"yfinance frame missing required columns for {symbol}: {missing}")
+            raise ServiceError(
+                f"yfinance single-symbol frame missing required columns for {symbol}: {missing}"
+            )
 
-        working["symbol"] = symbol
-        working["price_date"] = pd.to_datetime(working["price_date"], errors="coerce").dt.date
-        working["open"] = pd.to_numeric(working["open"], errors="coerce")
-        working["high"] = pd.to_numeric(working["high"], errors="coerce")
-        working["low"] = pd.to_numeric(working["low"], errors="coerce")
-        working["close"] = pd.to_numeric(working["close"], errors="coerce")
-        working["volume"] = pd.to_numeric(working["volume"], errors="coerce").fillna(0).astype("int64")
-        working["source_name"] = default_source_name
-        working["ingested_at"] = pd.Timestamp.utcnow()
+        normalized["symbol"] = symbol
+        normalized["source_name"] = "yfinance"
+        normalized["ingested_at"] = pd.Timestamp.utcnow()
 
-        working = working.dropna(subset=["price_date", "open", "high", "low", "close"])
-        return working.loc[:, ["symbol", "price_date", "open", "high", "low", "close", "volume", "source_name", "ingested_at"]]
+        normalized = normalized[
+            [
+                "symbol",
+                "price_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "source_name",
+                "ingested_at",
+            ]
+        ]
+
+        return normalized
+
+    def _normalize_output_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame is None or frame.empty:
+            return self._empty_frame()
+
+        normalized = frame.copy()
+
+        normalized["symbol"] = normalized["symbol"].astype(str).str.strip().str.upper()
+        normalized["price_date"] = pd.to_datetime(normalized["price_date"], errors="coerce").dt.date
+        normalized["open"] = pd.to_numeric(normalized["open"], errors="coerce")
+        normalized["high"] = pd.to_numeric(normalized["high"], errors="coerce")
+        normalized["low"] = pd.to_numeric(normalized["low"], errors="coerce")
+        normalized["close"] = pd.to_numeric(normalized["close"], errors="coerce")
+        normalized["volume"] = pd.to_numeric(normalized["volume"], errors="coerce").fillna(0).astype("int64")
+        normalized["source_name"] = normalized["source_name"].astype(str).str.strip().replace("", "yfinance")
+        normalized["ingested_at"] = pd.to_datetime(
+            normalized["ingested_at"],
+            errors="coerce",
+        ).fillna(pd.Timestamp.utcnow())
+
+        # Écarter les lignes inexploitables.
+        normalized = normalized.dropna(
+            subset=["symbol", "price_date", "open", "high", "low", "close"]
+        )
+
+        if normalized.empty:
+            return self._empty_frame()
+
+        # Déduplication stable : on garde la dernière écriture.
+        normalized = normalized.sort_values(
+            by=["symbol", "price_date", "ingested_at"],
+            ascending=[True, True, True],
+        ).drop_duplicates(
+            subset=["symbol", "price_date"],
+            keep="last",
+        )
+
+        return normalized.reset_index(drop=True)
 
     def _empty_frame(self) -> pd.DataFrame:
         return pd.DataFrame(
@@ -254,3 +491,12 @@ class YfinancePriceProvider(PriceSourcePort):
                 "ingested_at",
             ]
         )
+
+    # ------------------------------------------------------------------
+    # Utilitaires
+    # ------------------------------------------------------------------
+
+    def _chunk(self, values: list[str], chunk_size: int) -> list[list[str]]:
+        if not values:
+            return []
+        return [values[i : i + chunk_size] for i in range(0, len(values), chunk_size)]
