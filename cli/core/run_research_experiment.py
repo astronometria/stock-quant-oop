@@ -24,15 +24,58 @@ def _now() -> datetime:
 
 
 def _extract_last_json_object(stdout: str) -> dict[str, Any]:
-    lines = stdout.strip().splitlines()
-    start_index = None
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip().startswith("{"):
-            start_index = i
-            break
-    if start_index is None:
+    """
+    Extrait le dernier objet JSON complet présent dans stdout.
+
+    Pourquoi cette version:
+    - les sous-scripts peuvent écrire des logs avant le JSON final
+    - un JSON final peut contenir des sous-objets imbriqués
+    - prendre simplement "la dernière ligne commençant par {" n'est pas robuste
+    """
+    text = stdout.strip()
+    if not text:
+        raise RuntimeError("empty stdout, expected trailing JSON object")
+
+    end = text.rfind("}")
+    if end == -1:
         raise RuntimeError(f"no JSON object found in stdout:\n{stdout}")
-    return json.loads("\n".join(lines[start_index:]))
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(end, -1, -1):
+        ch = text[i]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "}":
+            depth += 1
+            continue
+
+        if ch == "{":
+            depth -= 1
+            if depth == 0:
+                candidate = text[i:end + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"failed to parse trailing JSON object from stdout:\n{stdout}"
+                    ) from exc
+
+    raise RuntimeError(f"no complete trailing JSON object found in stdout:\n{stdout}")
 
 
 def _run(cmd: list[str]) -> dict[str, Any]:
