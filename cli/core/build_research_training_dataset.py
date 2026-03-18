@@ -10,6 +10,7 @@ Philosophie
 - point-in-time safe
 - aucune fuite future
 - robuste si certaines tables dérivées optionnelles ne sont pas encore présentes
+- robuste si le nom de la colonne date diffère selon le schéma réel
 """
 
 import argparse
@@ -45,6 +46,33 @@ def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     return bool(row and int(row[0]) > 0)
 
 
+def _choose_price_date_column(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str = "price_history",
+) -> str:
+    rows = con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    cols = {str(row[1]).strip().lower() for row in rows}
+
+    preferred_order = [
+        "price_date",
+        "date",
+        "trade_date",
+        "as_of_date",
+        "business_date",
+    ]
+    for col in preferred_order:
+        if col in cols:
+            return col
+
+    for col in cols:
+        if "date" in col or "time" in col:
+            return col
+
+    raise RuntimeError(
+        f"unable to detect price date column in {table_name}; available columns={sorted(cols)}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
@@ -78,10 +106,9 @@ def main() -> int:
             raise RuntimeError("snapshot not completed")
 
         dataset_id = _dataset_id(args.snapshot_id)
-
         has_short_features = _table_exists(con, "short_features_daily")
+        price_date_col = _choose_price_date_column(con, "price_history")
 
-        # Idempotence simple pour éviter de dupliquer un dataset_id
         con.execute(
             """
             DELETE FROM research_training_dataset
@@ -102,20 +129,21 @@ def main() -> int:
                     short_volume_ratio
                 )
                 SELECT
-                    '{dataset_id}' AS dataset_id,
-                    '{args.snapshot_id}' AS snapshot_id,
+                    ? AS dataset_id,
+                    ? AS snapshot_id,
                     p.symbol,
-                    p.date AS as_of_date,
+                    p.{price_date_col} AS as_of_date,
                     p.close,
                     sf.short_volume_ratio
                 FROM price_history p
                 LEFT JOIN short_features_daily sf
                   ON sf.symbol = p.symbol
-                 AND sf.as_of_date = p.date
-                WHERE p.date IS NOT NULL
+                 AND sf.as_of_date = p.{price_date_col}
+                WHERE p.{price_date_col} IS NOT NULL
                   AND p.symbol IS NOT NULL
                   AND TRIM(p.symbol) <> ''
-                """
+                """,
+                [dataset_id, args.snapshot_id],
             )
         else:
             con.execute(
@@ -129,17 +157,18 @@ def main() -> int:
                     short_volume_ratio
                 )
                 SELECT
-                    '{dataset_id}' AS dataset_id,
-                    '{args.snapshot_id}' AS snapshot_id,
+                    ? AS dataset_id,
+                    ? AS snapshot_id,
                     p.symbol,
-                    p.date AS as_of_date,
+                    p.{price_date_col} AS as_of_date,
                     p.close,
                     NULL AS short_volume_ratio
                 FROM price_history p
-                WHERE p.date IS NOT NULL
+                WHERE p.{price_date_col} IS NOT NULL
                   AND p.symbol IS NOT NULL
                   AND TRIM(p.symbol) <> ''
-                """
+                """,
+                [dataset_id, args.snapshot_id],
             )
 
         row_count = con.execute(
@@ -156,6 +185,7 @@ def main() -> int:
             "snapshot_id": args.snapshot_id,
             "row_count": int(row_count),
             "used_short_features_daily": has_short_features,
+            "price_date_column": price_date_col,
         }
 
         print(json.dumps(output, indent=2), flush=True)
