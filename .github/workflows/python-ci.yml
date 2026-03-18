@@ -22,10 +22,16 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e '.[dev]'
 
-      - name: Compile
+      - name: Compile project files
         run: |
-          python -m compileall stock_quant
+          python -m compileall cli stock_quant tests
 
-      - name: Run tests
+      - name: Run research-grade targeted tests
+        run: |
+          pytest -q \
+            tests/integration/test_research_snapshot_manifest.py \
+            tests/unit/test_table_signature_utils.py
+
+      - name: Run full test suite
         run: |
           pytest -ra
