@@ -2,317 +2,349 @@
 from __future__ import annotations
 
 """
-Orchestrateur quotidien incrémental.
+Daily pipeline with research-grade signature guards.
 
-Objectif
+Important
+---------
+Cette version évite explicitement de garder une connexion DuckDB ouverte
+pendant l'exécution d'un sous-processus pipeline.
+
+Pourquoi
 --------
-Lancer, en séquence :
-- prix
-- FINRA daily short volume
-- FINRA short interest
-- short features
-- SEC filings
+Le repo utilise plusieurs CLI qui ouvrent chacun leur propre connexion
+DuckDB. Si l'orchestrateur garde déjà un handle ouvert, on risque un
+conflit de lock au moment d'appeler un autre script.
 
-Principe critique
------------------
-On ne garde JAMAIS une connexion DuckDB ouverte pendant qu'un subprocess
-pipeline s'exécute, sinon on crée un conflit de lock sur market.duckdb.
+Règle
+-----
+- ouvrir une connexion courte
+- lire ou écrire les signatures
+- fermer immédiatement
+- seulement ensuite lancer les sous-processus
 """
 
 import json
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
+from stock_quant.infrastructure.repositories.duckdb_research_manifest_repository import (
+    DuckDbResearchManifestRepository,
+    ResearchBuildSignature,
+)
 
-PROJECT_ROOT = Path("/home/marty/stock-quant-oop")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "market.duckdb"
 LOG_DIR = PROJECT_ROOT / "logs"
 
 
-def utc_stamp() -> str:
-    """Timestamp UTC compact pour nommer les logs."""
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-
-def run_step(step_name: str, cmd: list[str]) -> None:
-    """
-    Exécute une étape en streaming stdout/stderr.
-
-    Important :
-    - sortie live pour garder tqdm visible
-    - sortie persistée dans un log dédié
-    - arrêt immédiat en cas d'échec
-    """
+def _ensure_log_dir() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOG_DIR / f"{step_name}_{utc_stamp()}.log"
 
-    print(f"\n===== RUN STEP: {step_name} =====", flush=True)
+
+def _run_step(name: str, cmd: list[str]) -> None:
+    print(f"\n===== RUN STEP: {name} =====")
     print("cmd =", " ".join(cmd), flush=True)
-    print("log =", str(log_path), flush=True)
 
-    with log_path.open("w", encoding="utf-8") as handle:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"❌ STEP FAILED: {name} (exit={result.returncode})", flush=True)
+        raise SystemExit(result.returncode)
 
-        assert process.stdout is not None
-
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            handle.write(line)
-
-        return_code = process.wait()
-
-    if return_code != 0:
-        print(f"\n❌ STEP FAILED: {step_name} (exit={return_code})", flush=True)
-        raise SystemExit(return_code)
-
-    print(f"✅ STEP OK: {step_name}", flush=True)
+    print(f"✅ STEP OK: {name}", flush=True)
 
 
-def with_db(fn):
+def _with_repo(fn):
     """
-    Helper minimaliste :
-    ouvre la DB, exécute une fonction, referme immédiatement.
+    Ouvre une connexion courte, exécute l'action, puis referme.
+
+    Très important pour éviter les conflits de lock DuckDB avec les
+    sous-processus lancés par l'orchestrateur.
     """
     con = duckdb.connect(str(DB_PATH))
     try:
-        return fn(con)
+        repo = DuckDbResearchManifestRepository(con)
+        repo.ensure_tables()
+        return fn(con, repo)
     finally:
         con.close()
 
 
-def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
-    """Teste l'existence d'une table."""
-    rows = con.execute("SHOW TABLES").fetchall()
-    existing = {str(row[0]).strip().lower() for row in rows}
-    return table_name.strip().lower() in existing
+def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE lower(table_name) = lower(?)
+        """,
+        [table_name],
+    ).fetchone()
+    return bool(row and int(row[0]) > 0)
 
 
-def ensure_pipeline_watermark_table() -> None:
-    """Crée la table de watermarks si nécessaire."""
-    def _impl(con: duckdb.DuckDBPyConnection) -> None:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pipeline_run_watermark (
-                pipeline_name VARCHAR PRIMARY KEY,
-                source_signature VARCHAR NOT NULL,
-                updated_at TIMESTAMP NOT NULL
-            )
-            """
-        )
-    with_db(_impl)
-
-
-def read_saved_signature(pipeline_name: str) -> str | None:
-    """Lit la dernière signature connue pour un pipeline."""
-    def _impl(con: duckdb.DuckDBPyConnection) -> str | None:
-        row = con.execute(
-            """
-            SELECT source_signature
-            FROM pipeline_run_watermark
-            WHERE pipeline_name = ?
-            """,
-            [pipeline_name],
-        ).fetchone()
-        return None if row is None else str(row[0])
-
-    return with_db(_impl)
-
-
-def write_saved_signature(pipeline_name: str, source_signature: str) -> None:
-    """Upsert de la signature source après succès."""
-    def _impl(con: duckdb.DuckDBPyConnection) -> None:
-        con.execute(
-            """
-            INSERT INTO pipeline_run_watermark (
-                pipeline_name,
-                source_signature,
-                updated_at
-            )
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT (pipeline_name) DO UPDATE
-            SET
-                source_signature = EXCLUDED.source_signature,
-                updated_at = EXCLUDED.updated_at
-            """,
-            [pipeline_name, source_signature],
-        )
-
-    with_db(_impl)
-
-
-def daily_short_volume_signature() -> dict:
+def _choose_date_column(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str,
+) -> str | None:
     """
-    Signature simple pour build_finra_daily_short_volume.
+    Choisit la colonne date métier la plus pertinente parmi les conventions
+    déjà présentes dans le repo.
     """
-    def _impl(con: duckdb.DuckDBPyConnection) -> dict:
-        payload: dict[str, object] = {
-            "raw_row_count": 0,
-            "raw_max_trade_date": None,
-            "history_row_count": 0,
-            "history_max_trade_date": None,
-        }
+    rows = con.execute(
+        f"PRAGMA table_info('{table_name}')"
+    ).fetchall()
+    cols = {str(row[1]).strip().lower() for row in rows}
 
-        if table_exists(con, "finra_daily_short_volume_source_raw"):
-            payload["raw_row_count"] = int(
-                con.execute(
-                    "SELECT COUNT(*) FROM finra_daily_short_volume_source_raw"
-                ).fetchone()[0]
-            )
-            payload["raw_max_trade_date"] = str(
-                con.execute(
-                    "SELECT MAX(trade_date) FROM finra_daily_short_volume_source_raw"
-                ).fetchone()[0]
-            )
+    preferred_order = [
+        "date",
+        "price_date",
+        "trade_date",
+        "settlement_date",
+        "as_of_date",
+        "filing_date",
+        "timestamp",
+        "datetime",
+        "created_at",
+        "updated_at",
 
-        if table_exists(con, "daily_short_volume_history"):
-            payload["history_row_count"] = int(
-                con.execute(
-                    "SELECT COUNT(*) FROM daily_short_volume_history"
-                ).fetchone()[0]
-            )
-            payload["history_max_trade_date"] = str(
-                con.execute(
-                    "SELECT MAX(trade_date) FROM daily_short_volume_history"
-                ).fetchone()[0]
-            )
+        "trade_date",
+        "settlement_date",
+        "as_of_date",
+        "date",
+        "filing_date",
+        "latest_price_date",
+    ]
+    for col in preferred_order:
+        if col in cols:
+            return col
+    # fallback: detect any column containing "date" or "time"
+    for col in cols:
+        if "date" in col or "time" in col:
+            return col
 
-        return payload
-
-    return with_db(_impl)
+    return None
 
 
-def should_run_daily_short_volume() -> tuple[bool, dict]:
+def _choose_symbol_column(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str,
+) -> str | None:
+    rows = con.execute(
+        f"PRAGMA table_info('{table_name}')"
+    ).fetchall()
+    cols = {str(row[1]).strip().lower() for row in rows}
+
+    preferred_order = [
+        "date",
+        "price_date",
+        "trade_date",
+        "settlement_date",
+        "as_of_date",
+        "filing_date",
+        "timestamp",
+        "datetime",
+        "created_at",
+        "updated_at",
+
+        "symbol",
+        "raw_symbol",
+        "normalized_symbol",
+    ]
+    for col in preferred_order:
+        if col in cols:
+            return col
+    # fallback: detect any column containing "date" or "time"
+    for col in cols:
+        if "date" in col or "time" in col:
+            return col
+
+    return None
+
+
+def _compute_table_signature(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str,
+) -> dict[str, Any]:
     """
-    Décide si build_finra_daily_short_volume doit tourner.
+    Calcule une signature SQL-first d'une table source.
 
     Important
     ---------
-    Le raw et l'history n'ont pas le même grain, donc comparer les row counts
-    provoque des faux positifs permanents.
-
-    Règle volontairement simple et conservative :
-    - raw vide => skip
-    - history vide => run
-    - date max raw différente de date max history => run
-    - sinon skip
+    On ne cherche pas ici un hash crypto parfait.
+    On cherche une signature:
+    - stable
+    - lisible
+    - suffisamment sensible aux changements réels
     """
-    sig = daily_short_volume_signature()
-
-    raw_row_count = int(sig["raw_row_count"] or 0)
-    raw_max_trade_date = sig["raw_max_trade_date"]
-    history_row_count = int(sig["history_row_count"] or 0)
-    history_max_trade_date = sig["history_max_trade_date"]
-
-    if raw_row_count == 0:
-        return False, sig
-
-    if history_row_count == 0:
-        return True, sig
-
-    if str(raw_max_trade_date) != str(history_max_trade_date):
-        return True, sig
-
-    return False, sig
-
-
-def short_features_signature() -> dict:
-    """
-    Signature source pour build_short_features.
-    """
-    def _impl(con: duckdb.DuckDBPyConnection) -> dict:
-        payload: dict[str, object] = {
-            "daily_short_volume_history_count": 0,
-            "daily_short_volume_history_max_trade_date": None,
-            "finra_short_interest_history_count": 0,
-            "finra_short_interest_history_max_settlement_date": None,
-            "symbol_normalization_active_count": 0,
+    if not _table_exists(con, table_name):
+        return {
+            "table_name": table_name,
+            "row_count": 0,
+            "min_business_date": None,
+            "max_business_date": None,
+            "checksum": None,
+            "signature_hash": f"{table_name}|missing",
         }
 
-        if table_exists(con, "daily_short_volume_history"):
-            payload["daily_short_volume_history_count"] = int(
-                con.execute(
-                    "SELECT COUNT(*) FROM daily_short_volume_history"
-                ).fetchone()[0]
-            )
-            payload["daily_short_volume_history_max_trade_date"] = str(
-                con.execute(
-                    "SELECT MAX(trade_date) FROM daily_short_volume_history"
-                ).fetchone()[0]
-            )
+    date_col = _choose_date_column(con, table_name)
+    symbol_col = _choose_symbol_column(con, table_name)
 
-        if table_exists(con, "finra_short_interest_history"):
-            payload["finra_short_interest_history_count"] = int(
-                con.execute(
-                    "SELECT COUNT(*) FROM finra_short_interest_history"
-                ).fetchone()[0]
-            )
-            payload["finra_short_interest_history_max_settlement_date"] = str(
-                con.execute(
-                    "SELECT MAX(settlement_date) FROM finra_short_interest_history"
-                ).fetchone()[0]
-            )
+    date_expr_min = f"MIN({date_col})" if date_col else "NULL"
+    date_expr_max = f"MAX({date_col})" if date_col else "NULL"
 
-        if table_exists(con, "symbol_normalization"):
-            payload["symbol_normalization_active_count"] = int(
-                con.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM symbol_normalization
-                    WHERE is_active = TRUE
-                    """
-                ).fetchone()[0]
-            )
+    # Checksum conservative:
+    # - si symbol + date existent, on les utilise
+    # - sinon on retombe sur count + min/max
+    if symbol_col and date_col:
+        checksum_expr = (
+            f"SUM(hash(COALESCE(CAST({symbol_col} AS VARCHAR), ''), "
+            f"COALESCE(CAST({date_col} AS VARCHAR), '')))"
+        )
+    elif symbol_col:
+        checksum_expr = (
+            f"SUM(hash(COALESCE(CAST({symbol_col} AS VARCHAR), '')))"
+        )
+    elif date_col:
+        checksum_expr = (
+            f"SUM(hash(COALESCE(CAST({date_col} AS VARCHAR), '')))"
+        )
+    else:
+        checksum_expr = "NULL"
 
-        return payload
-
-    return with_db(_impl)
-
-
-def canonical_signature(payload: dict) -> str:
-    """Sérialise une signature de façon stable."""
-    return json.dumps(payload, sort_keys=True, default=str)
-
-
-def should_run_short_features() -> tuple[bool, dict, str | None]:
+    sql = f"""
+        SELECT
+            COUNT(*) AS row_count,
+            {date_expr_min} AS min_business_date,
+            {date_expr_max} AS max_business_date,
+            {checksum_expr} AS checksum
+        FROM {table_name}
     """
-    Décide si build_short_features doit tourner.
+
+    row = con.execute(sql).fetchone()
+    row_count = int(row[0]) if row and row[0] is not None else 0
+    min_business_date = row[1] if row else None
+    max_business_date = row[2] if row else None
+    checksum = row[3] if row else None
+
+    signature_hash = (
+        f"{table_name}|"
+        f"{row_count}|"
+        f"{min_business_date}|"
+        f"{max_business_date}|"
+        f"{checksum}"
+    )
+
+    return {
+        "table_name": table_name,
+        "row_count": row_count,
+        "min_business_date": min_business_date,
+        "max_business_date": max_business_date,
+        "checksum": checksum,
+        "signature_hash": signature_hash,
+    }
+
+
+def _load_signature_map(
+    pipeline_name: str,
+    source_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    def _impl(con: duckdb.DuckDBPyConnection, repo: DuckDbResearchManifestRepository):
+        out: dict[str, dict[str, Any]] = {}
+        for source_name in source_names:
+            current = _compute_table_signature(con, source_name)
+            previous = repo.get_latest_build_signature(
+                pipeline_name=pipeline_name,
+                signature_scope="default",
+                source_name=source_name,
+            )
+            out[source_name] = {
+                "current": current,
+                "previous": previous,
+            }
+        return out
+
+    return _with_repo(_impl)
+
+
+def _persist_signatures(
+    pipeline_name: str,
+    source_names: list[str],
+) -> None:
+    def _impl(con: duckdb.DuckDBPyConnection, repo: DuckDbResearchManifestRepository):
+        for source_name in source_names:
+            current = _compute_table_signature(con, source_name)
+            repo.insert_build_signature(
+                ResearchBuildSignature(
+                    pipeline_name=pipeline_name,
+                    signature_scope="default",
+                    source_name=source_name,
+                    signature_hash=current["signature_hash"],
+                    row_count=current["row_count"],
+                    min_business_date=current["min_business_date"],
+                    max_business_date=current["max_business_date"],
+                    notes="persisted by daily pipeline signature guard",
+                )
+            )
+
+    _with_repo(_impl)
+
+
+def _should_skip_from_signature_map(
+    signature_map: dict[str, dict[str, Any]],
+) -> bool:
     """
-    payload = short_features_signature()
+    Skip seulement si:
+    - toutes les sources ont déjà une signature précédente
+    - et toutes les signatures sont identiques
+    """
+    if not signature_map:
+        return False
 
-    daily_count = int(payload["daily_short_volume_history_count"] or 0)
-    short_interest_count = int(payload["finra_short_interest_history_count"] or 0)
+    for _, item in signature_map.items():
+        previous = item["previous"]
+        current = item["current"]
 
-    if daily_count == 0 or short_interest_count == 0:
-        return False, payload, None
+        if previous is None:
+            return False
 
-    current_signature = canonical_signature(payload)
-    saved_signature = read_saved_signature("build_short_features")
+        if previous["signature_hash"] != current["signature_hash"]:
+            return False
 
-    return current_signature != saved_signature, payload, current_signature
+    return True
 
 
-def main() -> int:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+def _print_signature_probe(
+    pipeline_name: str,
+    signature_map: dict[str, dict[str, Any]],
+) -> None:
+    printable: dict[str, Any] = {}
+    for source_name, item in signature_map.items():
+        printable[source_name] = {
+            "current": item["current"],
+            "previous_signature_hash": (
+                item["previous"]["signature_hash"]
+                if item["previous"] is not None
+                else None
+            ),
+        }
+
+    print(f"\n===== SIGNATURE PROBE: {pipeline_name} =====", flush=True)
+    print(json.dumps(printable, default=str, indent=2), flush=True)
+
+
+def main() -> None:
+    _ensure_log_dir()
 
     print("===== DAILY PIPELINE START =====", flush=True)
-    print("db_path =", str(DB_PATH), flush=True)
+    print("db_path =", DB_PATH, flush=True)
 
-    # Table de watermarks.
-    ensure_pipeline_watermark_table()
-
+    # ------------------------------------------------------------------
     # 1) Prices
-    run_step(
+    # ------------------------------------------------------------------
+    _run_step(
         "build_prices",
         [
             "python3",
@@ -322,13 +354,26 @@ def main() -> int:
         ],
     )
 
-    # 2) FINRA daily short volume
-    run_dsv, dsv_sig = should_run_daily_short_volume()
-    print("\n===== INCREMENTAL PROBE: build_finra_daily_short_volume =====", flush=True)
-    print(json.dumps(dsv_sig, default=str, indent=2), flush=True)
+    # ------------------------------------------------------------------
+    # 2) FINRA daily short volume canonical build
+    # ------------------------------------------------------------------
+    finra_daily_sources = [
+        "finra_daily_short_volume_source_raw",
+        "daily_short_volume_history",
+    ]
+    finra_daily_signature_map = _load_signature_map(
+        pipeline_name="build_finra_daily_short_volume",
+        source_names=finra_daily_sources,
+    )
+    _print_signature_probe(
+        "build_finra_daily_short_volume",
+        finra_daily_signature_map,
+    )
 
-    if run_dsv:
-        run_step(
+    if _should_skip_from_signature_map(finra_daily_signature_map):
+        print("⏭️  SKIP build_finra_daily_short_volume (signature unchanged)", flush=True)
+    else:
+        _run_step(
             "build_finra_daily_short_volume",
             [
                 "python3",
@@ -337,11 +382,15 @@ def main() -> int:
                 str(DB_PATH),
             ],
         )
-    else:
-        print("⏭️  SKIP build_finra_daily_short_volume (already aligned)", flush=True)
+        _persist_signatures(
+            pipeline_name="build_finra_daily_short_volume",
+            source_names=finra_daily_sources,
+        )
 
+    # ------------------------------------------------------------------
     # 3) FINRA short interest
-    run_step(
+    # ------------------------------------------------------------------
+    _run_step(
         "build_finra_short_interest",
         [
             "python3",
@@ -351,13 +400,27 @@ def main() -> int:
         ],
     )
 
+    # ------------------------------------------------------------------
     # 4) Short features
-    run_sf, sf_sig, sf_signature_text = should_run_short_features()
-    print("\n===== INCREMENTAL PROBE: build_short_features =====", flush=True)
-    print(json.dumps(sf_sig, default=str, indent=2), flush=True)
+    # ------------------------------------------------------------------
+    short_feature_sources = [
+        "daily_short_volume_history",
+        "finra_short_interest_history",
+        "symbol_normalization",
+    ]
+    short_feature_signature_map = _load_signature_map(
+        pipeline_name="build_short_features",
+        source_names=short_feature_sources,
+    )
+    _print_signature_probe(
+        "build_short_features",
+        short_feature_signature_map,
+    )
 
-    if run_sf:
-        run_step(
+    if _should_skip_from_signature_map(short_feature_signature_map):
+        print("⏭️  SKIP build_short_features (signature unchanged)", flush=True)
+    else:
+        _run_step(
             "build_short_features",
             [
                 "python3",
@@ -370,14 +433,15 @@ def main() -> int:
                 "36GB",
             ],
         )
+        _persist_signatures(
+            pipeline_name="build_short_features",
+            source_names=short_feature_sources,
+        )
 
-        assert sf_signature_text is not None
-        write_saved_signature("build_short_features", sf_signature_text)
-    else:
-        print("⏭️  SKIP build_short_features (source signature unchanged)", flush=True)
-
-    # 5) SEC filings
-    run_step(
+    # ------------------------------------------------------------------
+    # 5) SEC
+    # ------------------------------------------------------------------
+    _run_step(
         "build_sec_filings",
         [
             "python3",
@@ -388,8 +452,7 @@ def main() -> int:
     )
 
     print("\n===== DAILY PIPELINE SUCCESS =====", flush=True)
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
