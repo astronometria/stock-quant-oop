@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-Build research training dataset from snapshot_id.
-
-Principes
----------
-- SQL-first
-- point-in-time safe
-- aucune fuite future
-- as-of join backward pour short_features_daily
-- robuste aux variantes de nom de colonne date dans price_history
-"""
-
 import argparse
 import json
 from datetime import datetime, timezone
@@ -29,9 +17,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _dataset_id(snapshot_id: str) -> str:
+def _dataset_id(snapshot_id: str, split_id: str) -> str:
     stamp = _now_utc().strftime("%Y%m%dT%H%M%SZ")
-    return f"{snapshot_id}_dataset_{stamp}"
+    return f"{snapshot_id}_{split_id}_dataset_{stamp}"
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
@@ -80,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
+    p.add_argument("--split-id", required=True)
     return p.parse_args()
 
 
@@ -93,7 +82,6 @@ def main() -> int:
     try:
         ResearchTrainingDatasetSchemaManager(con).ensure_tables()
 
-        # 1) Échouer d'abord proprement sur le snapshot, avant tout autre probe.
         snapshot = con.execute(
             """
             SELECT snapshot_id, status
@@ -109,13 +97,33 @@ def main() -> int:
         if snapshot[1] != "completed":
             raise RuntimeError("snapshot not completed")
 
-        # 2) Seulement ensuite, on inspecte les tables source.
+        split = con.execute(
+            """
+            SELECT
+                split_id,
+                train_start,
+                train_end,
+                valid_start,
+                valid_end,
+                test_start,
+                test_end,
+                embargo_days
+            FROM research_split_manifest
+            WHERE split_id = ?
+            """,
+            [args.split_id],
+        ).fetchone()
+
+        if split is None:
+            raise RuntimeError("split_id not found")
+
+        split_id, train_start, train_end, valid_start, valid_end, test_start, test_end, embargo_days = split
+
         price_date_col = _choose_price_date_column(con, "price_history")
         has_short_features = _table_exists(con, "short_features_daily")
 
-        dataset_id = _dataset_id(args.snapshot_id)
+        dataset_id = _dataset_id(args.snapshot_id, args.split_id)
 
-        # Idempotence simple
         con.execute(
             """
             DELETE FROM research_training_dataset
@@ -125,9 +133,6 @@ def main() -> int:
         )
 
         if has_short_features:
-            # As-of join backward PIT-safe:
-            # pour chaque ligne prix, on prend la dernière feature short disponible
-            # avec sf.as_of_date <= p.price_date.
             con.execute(
                 f"""
                 INSERT INTO research_training_dataset (
@@ -157,6 +162,7 @@ def main() -> int:
                     WHERE p.{price_date_col} IS NOT NULL
                       AND p.symbol IS NOT NULL
                       AND TRIM(p.symbol) <> ''
+                      AND p.{price_date_col} BETWEEN ? AND ?
                 )
                 SELECT
                     dataset_id,
@@ -168,7 +174,7 @@ def main() -> int:
                 FROM joined
                 WHERE rn = 1
                 """,
-                [dataset_id, args.snapshot_id],
+                [dataset_id, args.snapshot_id, train_start, test_end],
             )
         else:
             con.execute(
@@ -192,8 +198,9 @@ def main() -> int:
                 WHERE p.{price_date_col} IS NOT NULL
                   AND p.symbol IS NOT NULL
                   AND TRIM(p.symbol) <> ''
+                  AND p.{price_date_col} BETWEEN ? AND ?
                 """,
-                [dataset_id, args.snapshot_id],
+                [dataset_id, args.snapshot_id, train_start, test_end],
             )
 
         row_count = con.execute(
@@ -208,10 +215,15 @@ def main() -> int:
         output = {
             "dataset_id": dataset_id,
             "snapshot_id": args.snapshot_id,
+            "split_id": args.split_id,
             "row_count": int(row_count),
             "used_short_features_daily": has_short_features,
             "price_date_column": price_date_col,
             "join_mode": "asof_backward" if has_short_features else "prices_only",
+            "date_window": {
+                "start": str(train_start),
+                "end": str(test_end),
+            },
         }
 
         print(json.dumps(output, indent=2), flush=True)

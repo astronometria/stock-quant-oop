@@ -36,12 +36,7 @@ def _extract_last_json_object(stdout: str) -> dict[str, Any]:
         raise RuntimeError(f"no JSON object found in stdout:\n{stdout}")
 
     candidate = "\n".join(lines[start_index:])
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"failed to parse trailing JSON from stdout:\n{stdout}"
-        ) from exc
+    return json.loads(candidate)
 
 
 def _run(cmd: list[str]) -> dict[str, Any]:
@@ -65,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
-    p.add_argument("--experiment-name", default="exp_v3")
+    p.add_argument("--split-id", required=True)
+    p.add_argument("--experiment-name", default="exp_v_scientific")
     p.add_argument("--parameters-json", default=None)
     p.add_argument("--notes", default=None)
     return p.parse_args()
@@ -89,6 +85,7 @@ def main() -> int:
         str(PROJECT_ROOT / "cli/core/build_research_training_dataset.py"),
         "--db-path", str(db),
         "--snapshot-id", args.snapshot_id,
+        "--split-id", args.split_id,
     ])
     dataset_id = dataset_result["dataset_id"]
 
@@ -98,6 +95,7 @@ def main() -> int:
         "--db-path", str(db),
         "--snapshot-id", args.snapshot_id,
         "--dataset-id", dataset_id,
+        "--split-id", args.split_id,
     ])
 
     backtest_result = _run([
@@ -115,6 +113,7 @@ def main() -> int:
         exp_id = f"{args.experiment_name}_{_now().strftime('%Y%m%dT%H%M%SZ')}"
 
         metrics_payload = {
+            "split_id": args.split_id,
             "dataset_build": dataset_result,
             "labels_build": labels_result,
             "backtest": backtest_result,
@@ -132,7 +131,7 @@ def main() -> int:
                 metrics_json=metrics_json,
                 status="completed",
                 notes=args.notes,
-                created_by_pipeline="run_research_experiment_v3",
+                created_by_pipeline="run_research_experiment_scientific",
             )
         )
 
@@ -141,6 +140,7 @@ def main() -> int:
                 {
                     "experiment_id": exp_id,
                     "dataset_id": dataset_id,
+                    "split_id": args.split_id,
                     "metrics": metrics_payload,
                 },
                 indent=2,

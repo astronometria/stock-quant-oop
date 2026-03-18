@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-Build research labels (forward returns).
-
-IMPORTANT
----------
-- no look-ahead bias
-- labels séparés des features
-- schema assuré avant écriture
-- robuste si le nom de la colonne date diffère dans price_history
-"""
-
 import argparse
 import json
 from pathlib import Path
@@ -70,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
     p.add_argument("--dataset-id", required=True)
+    p.add_argument("--split-id", required=True)
     return p.parse_args()
 
 
@@ -98,6 +88,27 @@ def main() -> int:
         if snap[0] != "completed":
             raise RuntimeError("snapshot not completed")
 
+        split = con.execute(
+            """
+            SELECT
+                split_id,
+                train_start,
+                train_end,
+                valid_start,
+                valid_end,
+                test_start,
+                test_end,
+                embargo_days
+            FROM research_split_manifest
+            WHERE split_id = ?
+            """,
+            [args.split_id],
+        ).fetchone()
+
+        if split is None:
+            raise RuntimeError("split_id not found")
+
+        split_id, train_start, train_end, valid_start, valid_end, test_start, test_end, embargo_days = split
         price_date_col = _choose_price_date_column(con, "price_history")
 
         con.execute(
@@ -153,13 +164,14 @@ def main() -> int:
             WHERE p.{price_date_col} IS NOT NULL
               AND p.symbol IS NOT NULL
               AND TRIM(p.symbol) <> ''
+              AND p.{price_date_col} BETWEEN ? AND ?
 
             WINDOW w AS (
                 PARTITION BY p.symbol
                 ORDER BY p.{price_date_col}
             )
             """,
-            [args.dataset_id, args.snapshot_id],
+            [args.dataset_id, args.snapshot_id, train_start, test_end],
         )
 
         count = con.execute(
@@ -176,8 +188,13 @@ def main() -> int:
                 {
                     "dataset_id": args.dataset_id,
                     "snapshot_id": args.snapshot_id,
+                    "split_id": args.split_id,
                     "rows": int(count),
                     "price_date_column": price_date_col,
+                    "date_window": {
+                        "start": str(train_start),
+                        "end": str(test_end),
+                    },
                 },
                 indent=2,
             ),
