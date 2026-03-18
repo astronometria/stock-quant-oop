@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""
+Integration test for run_research_experiment.py
+
+Version research-grade only:
+- pas de comportement legacy
+- snapshot completed requis
+- price_history minimal requis
+- manifest d'expérience attendu en sortie
+"""
+
 import json
 import subprocess
 import sys
@@ -11,6 +21,7 @@ import duckdb
 def _create_snapshot_ready_db(db_path: Path) -> str:
     con = duckdb.connect(str(db_path))
     try:
+        # Snapshot manifest minimal requis par le runner V2
         con.execute("""
             CREATE TABLE research_dataset_manifest (
                 snapshot_id VARCHAR,
@@ -72,6 +83,38 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
             "pytest snapshot",
         ])
 
+        # Donnée minimale requise par build_research_training_dataset.py
+        con.execute("""
+            CREATE TABLE price_history (
+                symbol VARCHAR,
+                date DATE,
+                close DOUBLE
+            )
+        """)
+
+        con.execute("""
+            INSERT INTO price_history VALUES
+                ('AAPL', DATE '2026-03-10', 100.0),
+                ('AAPL', DATE '2026-03-11', 110.0),
+                ('AAPL', DATE '2026-03-12', 121.0)
+        """)
+
+        # Table optionnelle mais utile pour couvrir le chemin moderne complet
+        con.execute("""
+            CREATE TABLE short_features_daily (
+                symbol VARCHAR,
+                as_of_date DATE,
+                short_volume_ratio DOUBLE
+            )
+        """)
+
+        con.execute("""
+            INSERT INTO short_features_daily VALUES
+                ('AAPL', DATE '2026-03-10', 0.40),
+                ('AAPL', DATE '2026-03-11', 0.50),
+                ('AAPL', DATE '2026-03-12', 0.60)
+        """)
+
         return snapshot_id
     finally:
         con.close()
@@ -111,15 +154,34 @@ def test_run_research_experiment_success(tmp_path: Path) -> None:
         rows = con.execute("""
             SELECT
                 snapshot_id,
+                dataset_id,
                 experiment_name,
-                status
+                status,
+                parameters_json,
+                notes
             FROM research_experiment_manifest
         """).fetchall()
 
         assert len(rows) == 1
         assert rows[0][0] == snapshot_id
-        assert rows[0][1] == "pytest_experiment"
-        assert rows[0][2] == "completed"
+        assert rows[0][1] is not None
+        assert rows[0][2] == "pytest_experiment"
+        assert rows[0][3] == "completed"
+        assert rows[0][4] is not None
+        assert rows[0][5] == "integration test experiment"
+
+        dataset_rows = con.execute("""
+            SELECT COUNT(*)
+            FROM research_training_dataset
+        """).fetchone()[0]
+        assert dataset_rows > 0
+
+        label_rows = con.execute("""
+            SELECT COUNT(*)
+            FROM research_labels
+        """).fetchone()[0]
+        assert label_rows > 0
+
     finally:
         con.close()
 
@@ -146,6 +208,7 @@ def test_run_research_experiment_fails_when_snapshot_missing(tmp_path: Path) -> 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         con.execute("""
             CREATE TABLE research_dataset_input_signature (
                 snapshot_id VARCHAR,
