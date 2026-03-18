@@ -26,17 +26,13 @@ def _now() -> datetime:
 def _extract_last_json_object(stdout: str) -> dict[str, Any]:
     lines = stdout.strip().splitlines()
     start_index = None
-
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].lstrip().startswith("{"):
             start_index = i
             break
-
     if start_index is None:
         raise RuntimeError(f"no JSON object found in stdout:\n{stdout}")
-
-    candidate = "\n".join(lines[start_index:])
-    return json.loads(candidate)
+    return json.loads("\n".join(lines[start_index:]))
 
 
 def _run(cmd: list[str]) -> dict[str, Any]:
@@ -52,8 +48,7 @@ def _normalize_json(raw: str | None) -> str | None:
     value = raw.strip()
     if not value:
         return None
-    parsed = json.loads(value)
-    return json.dumps(parsed, sort_keys=True)
+    return json.dumps(json.loads(value), sort_keys=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--experiment-name", default="exp_v_scientific")
     p.add_argument("--parameters-json", default=None)
     p.add_argument("--notes", default=None)
+    p.add_argument("--transaction-cost-bps", type=float, default=10.0)
+    p.add_argument("--signal-threshold", type=float, default=0.5)
     return p.parse_args()
 
 
@@ -103,6 +100,9 @@ def main() -> int:
         str(PROJECT_ROOT / "cli/core/build_research_backtest.py"),
         "--db-path", str(db),
         "--dataset-id", dataset_id,
+        "--split-id", args.split_id,
+        "--transaction-cost-bps", str(args.transaction_cost_bps),
+        "--signal-threshold", str(args.signal_threshold),
     ])
 
     con = duckdb.connect(str(db))
@@ -111,14 +111,12 @@ def main() -> int:
         repo.ensure_tables()
 
         exp_id = f"{args.experiment_name}_{_now().strftime('%Y%m%dT%H%M%SZ')}"
-
         metrics_payload = {
             "split_id": args.split_id,
             "dataset_build": dataset_result,
             "labels_build": labels_result,
             "backtest": backtest_result,
         }
-        metrics_json = json.dumps(metrics_payload, sort_keys=True)
 
         repo.insert(
             ResearchExperimentManifest(
@@ -128,25 +126,19 @@ def main() -> int:
                 experiment_name=args.experiment_name,
                 git_commit=None,
                 parameters_json=_normalize_json(args.parameters_json),
-                metrics_json=metrics_json,
+                metrics_json=json.dumps(metrics_payload, sort_keys=True),
                 status="completed",
                 notes=args.notes,
                 created_by_pipeline="run_research_experiment_scientific",
             )
         )
 
-        print(
-            json.dumps(
-                {
-                    "experiment_id": exp_id,
-                    "dataset_id": dataset_id,
-                    "split_id": args.split_id,
-                    "metrics": metrics_payload,
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
+        print(json.dumps({
+            "experiment_id": exp_id,
+            "dataset_id": dataset_id,
+            "split_id": args.split_id,
+            "metrics": metrics_payload,
+        }, indent=2), flush=True)
         return 0
 
     finally:
