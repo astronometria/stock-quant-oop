@@ -9,6 +9,7 @@ Philosophie
 - SQL-first
 - point-in-time safe
 - aucune fuite future
+- robuste si certaines tables dérivées optionnelles ne sont pas encore présentes
 """
 
 import argparse
@@ -30,6 +31,18 @@ def _now_utc() -> datetime:
 def _dataset_id(snapshot_id: str) -> str:
     stamp = _now_utc().strftime("%Y%m%dT%H%M%SZ")
     return f"{snapshot_id}_dataset_{stamp}"
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE lower(table_name) = lower(?)
+        """,
+        [table_name],
+    ).fetchone()
+    return bool(row and int(row[0]) > 0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,33 +79,68 @@ def main() -> int:
 
         dataset_id = _dataset_id(args.snapshot_id)
 
-        # Important:
-        # On cible explicitement les colonnes d'insertion pour laisser
-        # DuckDB appliquer le DEFAULT CURRENT_TIMESTAMP sur created_at.
+        has_short_features = _table_exists(con, "short_features_daily")
+
+        # Idempotence simple pour éviter de dupliquer un dataset_id
         con.execute(
-            f"""
-            INSERT INTO research_training_dataset (
-                dataset_id,
-                snapshot_id,
-                symbol,
-                as_of_date,
-                close,
-                short_volume_ratio
-            )
-            SELECT
-                '{dataset_id}' AS dataset_id,
-                '{args.snapshot_id}' AS snapshot_id,
-                p.symbol,
-                p.date AS as_of_date,
-                p.close,
-                sf.short_volume_ratio
-            FROM price_history p
-            LEFT JOIN short_features_daily sf
-              ON sf.symbol = p.symbol
-             AND sf.as_of_date = p.date
-            WHERE p.date IS NOT NULL
             """
+            DELETE FROM research_training_dataset
+            WHERE dataset_id = ?
+            """,
+            [dataset_id],
         )
+
+        if has_short_features:
+            con.execute(
+                f"""
+                INSERT INTO research_training_dataset (
+                    dataset_id,
+                    snapshot_id,
+                    symbol,
+                    as_of_date,
+                    close,
+                    short_volume_ratio
+                )
+                SELECT
+                    '{dataset_id}' AS dataset_id,
+                    '{args.snapshot_id}' AS snapshot_id,
+                    p.symbol,
+                    p.date AS as_of_date,
+                    p.close,
+                    sf.short_volume_ratio
+                FROM price_history p
+                LEFT JOIN short_features_daily sf
+                  ON sf.symbol = p.symbol
+                 AND sf.as_of_date = p.date
+                WHERE p.date IS NOT NULL
+                  AND p.symbol IS NOT NULL
+                  AND TRIM(p.symbol) <> ''
+                """
+            )
+        else:
+            con.execute(
+                f"""
+                INSERT INTO research_training_dataset (
+                    dataset_id,
+                    snapshot_id,
+                    symbol,
+                    as_of_date,
+                    close,
+                    short_volume_ratio
+                )
+                SELECT
+                    '{dataset_id}' AS dataset_id,
+                    '{args.snapshot_id}' AS snapshot_id,
+                    p.symbol,
+                    p.date AS as_of_date,
+                    p.close,
+                    NULL AS short_volume_ratio
+                FROM price_history p
+                WHERE p.date IS NOT NULL
+                  AND p.symbol IS NOT NULL
+                  AND TRIM(p.symbol) <> ''
+                """
+            )
 
         row_count = con.execute(
             """
@@ -107,6 +155,7 @@ def main() -> int:
             "dataset_id": dataset_id,
             "snapshot_id": args.snapshot_id,
             "row_count": int(row_count),
+            "used_short_features_daily": has_short_features,
         }
 
         print(json.dumps(output, indent=2), flush=True)
