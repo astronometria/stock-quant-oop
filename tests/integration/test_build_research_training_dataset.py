@@ -7,9 +7,8 @@ from pathlib import Path
 import duckdb
 
 
-def _create_minimal_db(db_path: Path):
+def _create_minimal_db(db_path: Path) -> None:
     con = duckdb.connect(str(db_path))
-
     try:
         con.execute("""
             CREATE TABLE research_dataset_manifest (
@@ -17,10 +16,37 @@ def _create_minimal_db(db_path: Path):
                 status VARCHAR
             )
         """)
+        con.execute("""
+            INSERT INTO research_dataset_manifest VALUES ('snap1', 'completed')
+        """)
 
         con.execute("""
-            INSERT INTO research_dataset_manifest VALUES
-            ('snap1', 'completed')
+            CREATE TABLE research_split_manifest (
+                split_id VARCHAR,
+                train_start DATE,
+                train_end DATE,
+                valid_start DATE,
+                valid_end DATE,
+                test_start DATE,
+                test_end DATE,
+                embargo_days INTEGER,
+                notes VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO research_split_manifest (
+                split_id, train_start, train_end, valid_start, valid_end,
+                test_start, test_end, embargo_days, notes
+            )
+            VALUES (
+                'split1',
+                DATE '2026-03-01', DATE '2026-03-10',
+                DATE '2026-03-11', DATE '2026-03-11',
+                DATE '2026-03-12', DATE '2026-03-12',
+                0,
+                'pytest split'
+            )
         """)
 
         con.execute("""
@@ -30,10 +56,9 @@ def _create_minimal_db(db_path: Path):
                 close DOUBLE
             )
         """)
-
         con.execute("""
             INSERT INTO price_history VALUES
-            ('AAPL', DATE '2026-03-10', 200)
+                ('AAPL', DATE '2026-03-10', 200)
         """)
 
         con.execute("""
@@ -43,17 +68,15 @@ def _create_minimal_db(db_path: Path):
                 short_volume_ratio DOUBLE
             )
         """)
-
         con.execute("""
             INSERT INTO short_features_daily VALUES
-            ('AAPL', DATE '2026-03-10', 0.5)
+                ('AAPL', DATE '2026-03-10', 0.5)
         """)
-
     finally:
         con.close()
 
 
-def test_build_dataset(tmp_path: Path):
+def test_build_dataset(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     db_path = tmp_path / "test.duckdb"
 
@@ -66,11 +89,12 @@ def test_build_dataset(tmp_path: Path):
         str(db_path),
         "--snapshot-id",
         "snap1",
+        "--split-id",
+        "split1",
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr or result.stdout
 
     con = duckdb.connect(str(db_path))
     try:
@@ -83,6 +107,5 @@ def test_build_dataset(tmp_path: Path):
         assert rows[0][0] == "AAPL"
         assert rows[0][1] == 200
         assert rows[0][2] == 0.5
-
     finally:
         con.close()

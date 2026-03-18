@@ -1,15 +1,5 @@
 from __future__ import annotations
 
-"""
-Integration test for run_research_experiment.py
-
-Version research-grade only:
-- pas de comportement legacy
-- snapshot completed requis
-- price_history minimal requis
-- manifest d'expérience attendu en sortie
-"""
-
 import json
 import subprocess
 import sys
@@ -21,7 +11,6 @@ import duckdb
 def _create_snapshot_ready_db(db_path: Path) -> str:
     con = duckdb.connect(str(db_path))
     try:
-        # Snapshot manifest minimal requis par le runner V2
         con.execute("""
             CREATE TABLE research_dataset_manifest (
                 snapshot_id VARCHAR,
@@ -38,7 +27,6 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
         con.execute("""
             CREATE TABLE research_dataset_input_signature (
                 snapshot_id VARCHAR,
@@ -51,22 +39,42 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        con.execute("""
+            CREATE TABLE research_split_manifest (
+                split_id VARCHAR,
+                train_start DATE,
+                train_end DATE,
+                valid_start DATE,
+                valid_end DATE,
+                test_start DATE,
+                test_end DATE,
+                embargo_days INTEGER,
+                notes VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO research_split_manifest (
+                split_id, train_start, train_end, valid_start, valid_end,
+                test_start, test_end, embargo_days, notes
+            )
+            VALUES (
+                'split1',
+                DATE '2026-03-01', DATE '2026-03-10',
+                DATE '2026-03-11', DATE '2026-03-11',
+                DATE '2026-03-12', DATE '2026-03-12',
+                0,
+                'pytest split'
+            )
+        """)
 
         snapshot_id = "pytest_snapshot_20260318T000000Z"
 
         con.execute("""
             INSERT INTO research_dataset_manifest (
-                snapshot_id,
-                dataset_name,
-                git_commit,
-                parameters_json,
-                start_date,
-                end_date,
-                created_by_pipeline,
-                source_count,
-                total_row_count,
-                status,
-                notes
+                snapshot_id, dataset_name, git_commit, parameters_json,
+                start_date, end_date, created_by_pipeline, source_count,
+                total_row_count, status, notes
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [
@@ -83,7 +91,6 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
             "pytest snapshot",
         ])
 
-        # Donnée minimale requise par build_research_training_dataset.py
         con.execute("""
             CREATE TABLE price_history (
                 symbol VARCHAR,
@@ -91,7 +98,6 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
                 close DOUBLE
             )
         """)
-
         con.execute("""
             INSERT INTO price_history VALUES
                 ('AAPL', DATE '2026-03-10', 100.0),
@@ -99,7 +105,6 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
                 ('AAPL', DATE '2026-03-12', 121.0)
         """)
 
-        # Table optionnelle mais utile pour couvrir le chemin moderne complet
         con.execute("""
             CREATE TABLE short_features_daily (
                 symbol VARCHAR,
@@ -107,7 +112,6 @@ def _create_snapshot_ready_db(db_path: Path) -> str:
                 short_volume_ratio DOUBLE
             )
         """)
-
         con.execute("""
             INSERT INTO short_features_daily VALUES
                 ('AAPL', DATE '2026-03-10', 0.40),
@@ -128,16 +132,12 @@ def test_run_research_experiment_success(tmp_path: Path) -> None:
     cmd = [
         sys.executable,
         str(repo_root / "cli/core/run_research_experiment.py"),
-        "--db-path",
-        str(db_path),
-        "--snapshot-id",
-        snapshot_id,
-        "--experiment-name",
-        "pytest_experiment",
-        "--parameters-json",
-        json.dumps({"alpha": 1, "mode": "pytest"}),
-        "--notes",
-        "integration test experiment",
+        "--db-path", str(db_path),
+        "--snapshot-id", snapshot_id,
+        "--split-id", "split1",
+        "--experiment-name", "pytest_experiment",
+        "--parameters-json", json.dumps({"alpha": 1, "mode": "pytest"}),
+        "--notes", "integration test experiment",
     ]
 
     result = subprocess.run(
@@ -152,13 +152,7 @@ def test_run_research_experiment_success(tmp_path: Path) -> None:
     con = duckdb.connect(str(db_path))
     try:
         rows = con.execute("""
-            SELECT
-                snapshot_id,
-                dataset_id,
-                experiment_name,
-                status,
-                parameters_json,
-                notes
+            SELECT snapshot_id, dataset_id, experiment_name, status, parameters_json, notes
             FROM research_experiment_manifest
         """).fetchall()
 
@@ -171,17 +165,14 @@ def test_run_research_experiment_success(tmp_path: Path) -> None:
         assert rows[0][5] == "integration test experiment"
 
         dataset_rows = con.execute("""
-            SELECT COUNT(*)
-            FROM research_training_dataset
+            SELECT COUNT(*) FROM research_training_dataset
         """).fetchone()[0]
         assert dataset_rows > 0
 
         label_rows = con.execute("""
-            SELECT COUNT(*)
-            FROM research_labels
+            SELECT COUNT(*) FROM research_labels
         """).fetchone()[0]
         assert label_rows > 0
-
     finally:
         con.close()
 
@@ -208,7 +199,6 @@ def test_run_research_experiment_fails_when_snapshot_missing(tmp_path: Path) -> 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
         con.execute("""
             CREATE TABLE research_dataset_input_signature (
                 snapshot_id VARCHAR,
@@ -221,16 +211,43 @@ def test_run_research_experiment_fails_when_snapshot_missing(tmp_path: Path) -> 
                 recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        con.execute("""
+            CREATE TABLE research_split_manifest (
+                split_id VARCHAR,
+                train_start DATE,
+                train_end DATE,
+                valid_start DATE,
+                valid_end DATE,
+                test_start DATE,
+                test_end DATE,
+                embargo_days INTEGER,
+                notes VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO research_split_manifest (
+                split_id, train_start, train_end, valid_start, valid_end,
+                test_start, test_end, embargo_days, notes
+            )
+            VALUES (
+                'split1',
+                DATE '2026-03-01', DATE '2026-03-10',
+                DATE '2026-03-11', DATE '2026-03-11',
+                DATE '2026-03-12', DATE '2026-03-12',
+                0,
+                'pytest split'
+            )
+        """)
     finally:
         con.close()
 
     cmd = [
         sys.executable,
         str(repo_root / "cli/core/run_research_experiment.py"),
-        "--db-path",
-        str(db_path),
-        "--snapshot-id",
-        "missing_snapshot",
+        "--db-path", str(db_path),
+        "--snapshot-id", "missing_snapshot",
+        "--split-id", "split1",
     ]
 
     result = subprocess.run(

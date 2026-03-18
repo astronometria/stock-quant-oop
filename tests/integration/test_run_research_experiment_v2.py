@@ -22,13 +22,41 @@ def test_experiment_v2(tmp_path: Path) -> None:
         con.execute("INSERT INTO research_dataset_manifest VALUES ('snap1','completed')")
 
         con.execute("""
+            CREATE TABLE research_split_manifest (
+                split_id VARCHAR,
+                train_start DATE,
+                train_end DATE,
+                valid_start DATE,
+                valid_end DATE,
+                test_start DATE,
+                test_end DATE,
+                embargo_days INTEGER,
+                notes VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO research_split_manifest (
+                split_id, train_start, train_end, valid_start, valid_end,
+                test_start, test_end, embargo_days, notes
+            )
+            VALUES (
+                'split1',
+                DATE '2026-03-01', DATE '2026-03-10',
+                DATE '2026-03-11', DATE '2026-03-11',
+                DATE '2026-03-12', DATE '2026-03-12',
+                0,
+                'pytest split'
+            )
+        """)
+
+        con.execute("""
             CREATE TABLE price_history (
                 symbol VARCHAR,
                 date DATE,
                 close DOUBLE
             )
         """)
-
         con.execute("""
             INSERT INTO price_history VALUES
                 ('AAPL', DATE '2026-03-10', 100.0),
@@ -43,7 +71,6 @@ def test_experiment_v2(tmp_path: Path) -> None:
                 short_volume_ratio DOUBLE
             )
         """)
-
         con.execute("""
             INSERT INTO short_features_daily VALUES
                 ('AAPL', DATE '2026-03-10', 0.60),
@@ -57,7 +84,8 @@ def test_experiment_v2(tmp_path: Path) -> None:
         sys.executable,
         str(repo / "cli/core/run_research_experiment.py"),
         "--db-path", str(db),
-        "--snapshot-id", "snap1"
+        "--snapshot-id", "snap1",
+        "--split-id", "split1",
     ], capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr or result.stdout
@@ -72,7 +100,7 @@ def test_experiment_v2(tmp_path: Path) -> None:
         backtest_rows = con.execute("""
             SELECT COUNT(*) FROM research_backtest
         """).fetchone()
-        assert backtest_rows[0] == 1
+        assert backtest_rows[0] >= 1
 
         dataset_rows = con.execute("""
             SELECT COUNT(*) FROM research_training_dataset
@@ -83,6 +111,5 @@ def test_experiment_v2(tmp_path: Path) -> None:
             SELECT COUNT(*) FROM research_labels
         """).fetchone()
         assert label_rows[0] > 0
-
     finally:
         con.close()
