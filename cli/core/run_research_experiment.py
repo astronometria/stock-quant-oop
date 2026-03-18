@@ -24,6 +24,10 @@ def _now() -> datetime:
 
 
 def _extract_last_json_object(stdout: str) -> dict[str, Any]:
+    """
+    Les builders peuvent écrire des logs avant le JSON final.
+    On récupère donc le dernier objet JSON présent dans stdout.
+    """
     lines = stdout.strip().splitlines()
     start_index = None
 
@@ -65,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
-    p.add_argument("--experiment-name", default="exp_v2")
+    p.add_argument("--experiment-name", default="exp_v3")
     p.add_argument("--parameters-json", default=None)
     p.add_argument("--notes", default=None)
     return p.parse_args()
@@ -77,7 +81,7 @@ def main() -> int:
 
     print(f"[run_research_experiment] db_path={db}", flush=True)
 
-    # 1) ensure experiment schema, then close before subprocesses
+    # Phase 1: assurer le schéma de manifest puis relâcher le lock DB.
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -85,17 +89,17 @@ def main() -> int:
     finally:
         con.close()
 
-    # 2) build dataset without holding DB lock
-    ds = _run([
+    # Phase 2: construire le dataset sans garder la DB verrouillée.
+    dataset_result = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_training_dataset.py"),
         "--db-path", str(db),
         "--snapshot-id", args.snapshot_id,
     ])
-    dataset_id = ds["dataset_id"]
+    dataset_id = dataset_result["dataset_id"]
 
-    # 3) build labels without holding DB lock
-    _run([
+    # Phase 3: construire les labels.
+    labels_result = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_labels.py"),
         "--db-path", str(db),
@@ -103,35 +107,28 @@ def main() -> int:
         "--dataset-id", dataset_id,
     ])
 
-    # 4) reopen DB for metrics + manifest persistence
+    # Phase 4: lancer le backtest.
+    backtest_result = _run([
+        sys.executable,
+        str(PROJECT_ROOT / "cli/core/build_research_backtest.py"),
+        "--db-path", str(db),
+        "--dataset-id", dataset_id,
+    ])
+
+    # Phase 5: persister l'expérience avec les métriques de backtest.
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
         repo.ensure_tables()
 
-        metrics = con.execute(
-            """
-            SELECT
-                AVG(fwd_return_1d) AS avg_return,
-                COUNT(*) AS n
-            FROM research_labels
-            WHERE dataset_id = ?
-            """,
-            [dataset_id],
-        ).fetchone()
-
-        avg_return_1d = float(metrics[0]) if metrics and metrics[0] is not None else None
-        n = int(metrics[1]) if metrics and metrics[1] is not None else 0
-
-        metrics_json = json.dumps(
-            {
-                "avg_return_1d": avg_return_1d,
-                "n": n,
-            },
-            sort_keys=True,
-        )
-
         exp_id = f"{args.experiment_name}_{_now().strftime('%Y%m%dT%H%M%SZ')}"
+
+        metrics_payload = {
+            "dataset_build": dataset_result,
+            "labels_build": labels_result,
+            "backtest": backtest_result,
+        }
+        metrics_json = json.dumps(metrics_payload, sort_keys=True)
 
         repo.insert(
             ResearchExperimentManifest(
@@ -144,7 +141,7 @@ def main() -> int:
                 metrics_json=metrics_json,
                 status="completed",
                 notes=args.notes,
-                created_by_pipeline="run_research_experiment_v2",
+                created_by_pipeline="run_research_experiment_v3",
             )
         )
 
@@ -153,7 +150,7 @@ def main() -> int:
                 {
                     "experiment_id": exp_id,
                     "dataset_id": dataset_id,
-                    "metrics": json.loads(metrics_json),
+                    "metrics": metrics_payload,
                 },
                 indent=2,
             ),
