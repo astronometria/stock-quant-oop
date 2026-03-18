@@ -24,10 +24,6 @@ def _now() -> datetime:
 
 
 def _extract_last_json_object(stdout: str) -> dict[str, Any]:
-    """
-    Les builders peuvent écrire des logs avant le JSON final.
-    On récupère donc le dernier objet JSON présent dans stdout.
-    """
     lines = stdout.strip().splitlines()
     start_index = None
 
@@ -81,7 +77,6 @@ def main() -> int:
 
     print(f"[run_research_experiment] db_path={db}", flush=True)
 
-    # Phase 1: assurer le schéma de manifest puis relâcher le lock DB.
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -89,7 +84,6 @@ def main() -> int:
     finally:
         con.close()
 
-    # Phase 2: construire le dataset sans garder la DB verrouillée.
     dataset_result = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_training_dataset.py"),
@@ -98,7 +92,6 @@ def main() -> int:
     ])
     dataset_id = dataset_result["dataset_id"]
 
-    # Phase 3: construire les labels.
     labels_result = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_labels.py"),
@@ -107,7 +100,6 @@ def main() -> int:
         "--dataset-id", dataset_id,
     ])
 
-    # Phase 4: lancer le backtest.
     backtest_result = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_backtest.py"),
@@ -115,7 +107,6 @@ def main() -> int:
         "--dataset-id", dataset_id,
     ])
 
-    # Phase 5: persister l'expérience avec les métriques de backtest.
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
