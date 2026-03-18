@@ -5,8 +5,9 @@ import argparse
 import json
 import subprocess
 import sys
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -18,18 +19,43 @@ from stock_quant.infrastructure.repositories.duckdb_research_experiment_reposito
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _now():
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _run(cmd):
+def _extract_last_json_object(stdout: str) -> dict[str, Any]:
+    """
+    Certains builders écrivent des logs avant le JSON final.
+    On récupère donc le dernier bloc JSON trouvé dans stdout.
+    """
+    lines = stdout.strip().splitlines()
+    start_index = None
+
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().startswith("{"):
+            start_index = i
+            break
+
+    if start_index is None:
+        raise RuntimeError(f"no JSON object found in stdout:\n{stdout}")
+
+    candidate = "\n".join(lines[start_index:])
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"failed to parse trailing JSON from stdout:\n{stdout}"
+        ) from exc
+
+
+def _run(cmd: list[str]) -> dict[str, Any]:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout)
-    return json.loads(result.stdout)
+    return _extract_last_json_object(result.stdout)
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
@@ -37,67 +63,101 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    db = Path(args.db_path).resolve()
+    db = Path(args.db_path).expanduser().resolve()
 
+    print(f"[run_research_experiment] db_path={db}", flush=True)
+
+    # Phase 1:
+    # Ouvrir brièvement la DB pour assurer le schéma manifest, puis fermer.
     con = duckdb.connect(str(db))
-    repo = DuckDbResearchExperimentRepository(con)
-    repo.ensure_tables()
+    try:
+        repo = DuckDbResearchExperimentRepository(con)
+        repo.ensure_tables()
+    finally:
+        con.close()
 
-    # --- dataset ---
+    # Phase 2:
+    # Aucun lock DuckDB ouvert pendant les sous-processus.
     ds = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_training_dataset.py"),
         "--db-path", str(db),
-        "--snapshot-id", args.snapshot_id
+        "--snapshot-id", args.snapshot_id,
     ])
     dataset_id = ds["dataset_id"]
 
-    # --- labels ---
     _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_labels.py"),
         "--db-path", str(db),
         "--snapshot-id", args.snapshot_id,
-        "--dataset-id", dataset_id
+        "--dataset-id", dataset_id,
     ])
 
-    # --- métriques simples ---
-    metrics = con.execute(f"""
-        SELECT
-            AVG(fwd_return_1d) AS avg_return,
-            COUNT(*) AS n
-        FROM research_labels
-        WHERE dataset_id = '{dataset_id}'
-    """).fetchone()
+    # Phase 3:
+    # Réouvrir la DB pour calculer les métriques et persister le manifest.
+    con = duckdb.connect(str(db))
+    try:
+        repo = DuckDbResearchExperimentRepository(con)
+        repo.ensure_tables()
 
-    metrics_json = json.dumps({
-        "avg_return_1d": float(metrics[0]) if metrics[0] else None,
-        "n": int(metrics[1])
-    })
+        metrics = con.execute(
+            """
+            SELECT
+                AVG(fwd_return_1d) AS avg_return,
+                COUNT(*) AS n
+            FROM research_labels
+            WHERE dataset_id = ?
+            """,
+            [dataset_id],
+        ).fetchone()
 
-    exp_id = f"{args.experiment_name}_{_now().strftime('%Y%m%dT%H%M%SZ')}"
+        avg_return_1d = float(metrics[0]) if metrics and metrics[0] is not None else None
+        n = int(metrics[1]) if metrics and metrics[1] is not None else 0
 
-    repo.insert(ResearchExperimentManifest(
-        experiment_id=exp_id,
-        snapshot_id=args.snapshot_id,
-        dataset_id=dataset_id,
-        experiment_name=args.experiment_name,
-        git_commit=None,
-        parameters_json=None,
-        metrics_json=metrics_json,
-        status="completed",
-        notes=None,
-        created_by_pipeline="run_research_experiment_v2"
-    ))
+        metrics_json = json.dumps(
+            {
+                "avg_return_1d": avg_return_1d,
+                "n": n,
+            },
+            sort_keys=True,
+        )
 
-    print(json.dumps({
-        "experiment_id": exp_id,
-        "dataset_id": dataset_id,
-        "metrics": json.loads(metrics_json)
-    }, indent=2))
+        exp_id = f"{args.experiment_name}_{_now().strftime('%Y%m%dT%H%M%SZ')}"
+
+        repo.insert(
+            ResearchExperimentManifest(
+                experiment_id=exp_id,
+                snapshot_id=args.snapshot_id,
+                dataset_id=dataset_id,
+                experiment_name=args.experiment_name,
+                git_commit=None,
+                parameters_json=None,
+                metrics_json=metrics_json,
+                status="completed",
+                notes=None,
+                created_by_pipeline="run_research_experiment_v2",
+            )
+        )
+
+        print(
+            json.dumps(
+                {
+                    "experiment_id": exp_id,
+                    "dataset_id": dataset_id,
+                    "metrics": json.loads(metrics_json),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        return 0
+
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
