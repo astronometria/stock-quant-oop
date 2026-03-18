@@ -99,6 +99,17 @@ def _choose_date_column(
     cols = {str(row[1]).strip().lower() for row in rows}
 
     preferred_order = [
+        "date",
+        "price_date",
+        "trade_date",
+        "settlement_date",
+        "as_of_date",
+        "filing_date",
+        "timestamp",
+        "datetime",
+        "created_at",
+        "updated_at",
+
         "trade_date",
         "settlement_date",
         "as_of_date",
@@ -109,6 +120,11 @@ def _choose_date_column(
     for col in preferred_order:
         if col in cols:
             return col
+    # fallback: detect any column containing "date" or "time"
+    for col in cols:
+        if "date" in col or "time" in col:
+            return col
+
     return None
 
 
@@ -122,6 +138,17 @@ def _choose_symbol_column(
     cols = {str(row[1]).strip().lower() for row in rows}
 
     preferred_order = [
+        "date",
+        "price_date",
+        "trade_date",
+        "settlement_date",
+        "as_of_date",
+        "filing_date",
+        "timestamp",
+        "datetime",
+        "created_at",
+        "updated_at",
+
         "symbol",
         "raw_symbol",
         "normalized_symbol",
@@ -129,6 +156,11 @@ def _choose_symbol_column(
     for col in preferred_order:
         if col in cols:
             return col
+    # fallback: detect any column containing "date" or "time"
+    for col in cols:
+        if "date" in col or "time" in col:
+            return col
+
     return None
 
 
