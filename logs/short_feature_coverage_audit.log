@@ -1,0 +1,100 @@
+===== DATE =====
+Tue 17 Mar 2026 10:10:49 PM EDT
+
+===== GIT HEAD =====
+cc754f9
+
+===== SHORT FEATURE COVERAGE AUDIT =====
+short_features_total 33329443
+short_features_with_short_interest 17877831
+short_features_without_short_interest 15451612
+distinct_symbols_total 31221
+distinct_symbols_with_short_interest 20113
+latest_day_total 11252
+latest_day_with_short_interest 10710
+
+===== TOP SYMBOLS WITHOUT SHORT INTEREST =====
+('GSPD', 4036, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('USBPH', 4002, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('GSPA', 3989, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('MSPA', 3896, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('METPA', 3860, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('MERPK', 3849, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('BMLPL', 3799, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('BACPL', 3775, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('BACPE', 3756, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('GSPC', 3703, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('BMLPJ', 3695, datetime.date(2009, 11, 12), datetime.date(2026, 3, 13))
+('BMLPH', 3633, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('AHTPD', 3508, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('WFCPL', 3418, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('BF/B', 3362, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('BRK/B', 3362, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('PBR/A', 3362, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('MOG/A', 3318, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('HEI/A', 3234, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('CRD/B', 3198, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('CPJ', 3191, datetime.date(2010, 3, 19), datetime.date(2024, 3, 28))
+('PBIPB', 3181, datetime.date(2013, 3, 18), datetime.date(2026, 3, 13))
+('VNOPL', 3151, datetime.date(2013, 2, 6), datetime.date(2026, 3, 13))
+('LEN/B', 3132, datetime.date(2012, 11, 1), datetime.date(2026, 3, 13))
+('ALLPB', 3129, datetime.date(2013, 1, 16), datetime.date(2026, 3, 13))
+('MSPE', 3116, datetime.date(2013, 10, 2), datetime.date(2026, 3, 13))
+('JPMPD', 3110, datetime.date(2012, 9, 6), datetime.date(2026, 3, 13))
+('SCEPG', 3109, datetime.date(2013, 4, 2), datetime.date(2026, 3, 13))
+('BF/A', 3094, datetime.date(2012, 11, 9), datetime.date(2026, 3, 13))
+('EBR/B', 3083, datetime.date(2012, 10, 18), datetime.date(2025, 11, 7))
+('MFAPB', 3082, datetime.date(2013, 7, 17), datetime.date(2026, 3, 13))
+('AKO/B', 3081, datetime.date(2012, 10, 18), datetime.date(2026, 3, 13))
+('MSPF', 3079, datetime.date(2013, 12, 13), datetime.date(2026, 3, 13))
+('BMLPG', 3059, datetime.date(2009, 11, 10), datetime.date(2026, 3, 13))
+('CRD/A', 3049, datetime.date(2012, 11, 1), datetime.date(2026, 3, 13))
+('SLGPI', 3001, datetime.date(2012, 8, 14), datetime.date(2026, 3, 13))
+('MITTPB', 2971, datetime.date(2013, 9, 26), datetime.date(2026, 3, 13))
+('BRK/A', 2970, datetime.date(2013, 4, 3), datetime.date(2026, 3, 13))
+('GEF/B', 2956, datetime.date(2012, 11, 8), datetime.date(2026, 3, 13))
+('JPMPC', 2945, datetime.date(2010, 4, 6), datetime.date(2026, 3, 13))
+('PCGPA', 2927, datetime.date(2009, 11, 13), datetime.date(2026, 3, 13))
+('MSPI', 2885, datetime.date(2014, 9, 23), datetime.date(2026, 3, 13))
+('GSLPB', 2841, datetime.date(2014, 8, 25), datetime.date(2026, 3, 13))
+('PSAPF', 2840, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('GAMPB', 2838, datetime.date(2009, 11, 10), datetime.date(2026, 3, 13))
+('CMREPC', 2837, datetime.date(2014, 1, 22), datetime.date(2026, 3, 13))
+('EPRPC', 2822, datetime.date(2009, 11, 9), datetime.date(2026, 3, 13))
+('AHLPC', 2806, datetime.date(2013, 5, 9), datetime.date(2024, 12, 31))
+('GABPH', 2786, datetime.date(2012, 10, 5), datetime.date(2026, 3, 13))
+('PUKPA', 2746, datetime.date(2009, 11, 9), datetime.date(2021, 12, 27))
+
+===== COVERAGE BY DATE =====
+(datetime.date(2026, 3, 13), 11252, 10710, 95.18)
+(datetime.date(2026, 3, 12), 11268, 10714, 95.08)
+(datetime.date(2026, 3, 11), 11311, 10765, 95.17)
+(datetime.date(2026, 3, 10), 11323, 10772, 95.13)
+(datetime.date(2026, 3, 9), 11374, 10838, 95.29)
+(datetime.date(2026, 3, 6), 11378, 10843, 95.3)
+(datetime.date(2026, 3, 5), 11340, 10824, 95.45)
+(datetime.date(2026, 3, 4), 11357, 10830, 95.36)
+(datetime.date(2026, 3, 3), 11418, 10887, 95.35)
+(datetime.date(2026, 3, 2), 11411, 10883, 95.37)
+(datetime.date(2026, 2, 27), 11376, 10853, 95.4)
+(datetime.date(2026, 2, 26), 11277, 10761, 95.42)
+(datetime.date(2026, 2, 25), 11274, 10790, 95.71)
+(datetime.date(2026, 2, 24), 11257, 10772, 95.69)
+(datetime.date(2026, 2, 23), 11344, 10860, 95.73)
+(datetime.date(2026, 2, 20), 11267, 10800, 95.86)
+(datetime.date(2026, 2, 19), 11246, 10780, 95.86)
+(datetime.date(2026, 2, 18), 11353, 10897, 95.98)
+(datetime.date(2026, 2, 17), 11408, 10946, 95.95)
+(datetime.date(2026, 2, 13), 11310, 10873, 96.14)
+(datetime.date(2026, 2, 12), 11355, 10752, 94.69)
+(datetime.date(2026, 2, 11), 11319, 10734, 94.83)
+(datetime.date(2026, 2, 10), 11355, 10779, 94.93)
+(datetime.date(2026, 2, 9), 11388, 10818, 94.99)
+(datetime.date(2026, 2, 6), 11358, 10797, 95.06)
+(datetime.date(2026, 2, 5), 11340, 10786, 95.11)
+(datetime.date(2026, 2, 4), 11339, 10793, 95.18)
+(datetime.date(2026, 2, 3), 11406, 10863, 95.24)
+(datetime.date(2026, 2, 2), 11415, 10871, 95.23)
+(datetime.date(2026, 1, 30), 11354, 10836, 95.44)
+
+===== DONE =====
