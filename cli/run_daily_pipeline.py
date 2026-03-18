@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""
-Daily pipeline orchestrator
+from __future__ import annotations
 
-Runs:
-- prices (yfinance)
-- FINRA short volume + short interest
+"""
+Orchestrateur quotidien principal.
+
+Objectif
+--------
+Lancer, en séquence et avec logs dédiés :
+- mise à jour des prix
+- FINRA daily short volume
+- FINRA short interest
+- short features
 - SEC filings
 
-Design goals:
-- sequential (avoid DB contention)
-- visible tqdm output
-- logs written to logs/
-- fail-fast but logged
+Contraintes de conception
+-------------------------
+- séquentiel pour éviter les locks DuckDB
+- sortie live conservée pour voir tqdm
+- un log par étape dans logs/
+- fail-fast : on arrête au premier échec
+- beaucoup de commentaires pour faciliter la maintenance
 """
-
-from __future__ import annotations
 
 import subprocess
 import sys
@@ -22,118 +28,140 @@ from datetime import datetime
 from pathlib import Path
 
 
+# Racine du projet.
 PROJECT_ROOT = Path("/home/marty/stock-quant-oop")
+
+# Base DuckDB canonique du projet.
 DB_PATH = PROJECT_ROOT / "market.duckdb"
+
+# Répertoire de logs du repo.
 LOG_DIR = PROJECT_ROOT / "logs"
 
 
-def run_step(name: str, cmd: list[str]) -> None:
+def utc_stamp() -> str:
     """
-    Run a subprocess step with logging and clear output.
-
-    - Streams output live (keeps tqdm visible)
-    - Writes to dedicated log file
+    Retourne un timestamp UTC compact pour nommer les logs.
     """
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    log_file = LOG_DIR / f"{name}_{timestamp}.log"
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    print(f"\n===== RUN STEP: {name} =====")
-    print("cmd =", " ".join(cmd))
-    print("log =", log_file)
 
-    with open(log_file, "w") as f:
+def run_step(step_name: str, cmd: list[str]) -> None:
+    """
+    Exécute une étape en streaming stdout/stderr.
+
+    Détails importants :
+    - on garde stdout/stderr fusionnés pour conserver l'ordre exact
+    - on affiche en live pour garder tqdm visible
+    - on écrit simultanément dans un log dédié
+    - on stoppe tout si une étape échoue
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    log_path = LOG_DIR / f"{step_name}_{utc_stamp()}.log"
+
+    print(f"\n===== RUN STEP: {step_name} =====", flush=True)
+    print("cmd =", " ".join(cmd), flush=True)
+    print("log =", str(log_path), flush=True)
+
+    with log_path.open("w", encoding="utf-8") as handle:
         process = subprocess.Popen(
             cmd,
+            cwd=str(PROJECT_ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            cwd=PROJECT_ROOT,
+            bufsize=1,
         )
 
-        # Stream output live AND write to file
+        assert process.stdout is not None
+
+        # Stream live + écriture log.
         for line in process.stdout:
-            print(line, end="")
-            f.write(line)
+            print(line, end="", flush=True)
+            handle.write(line)
 
-        process.wait()
+        return_code = process.wait()
 
-        if process.returncode != 0:
-            print(f"\n❌ STEP FAILED: {name}")
-            sys.exit(process.returncode)
+    if return_code != 0:
+        print(f"\n❌ STEP FAILED: {step_name} (exit={return_code})", flush=True)
+        raise SystemExit(return_code)
 
-    print(f"✅ STEP OK: {name}")
+    print(f"✅ STEP OK: {step_name}", flush=True)
 
 
 def main() -> int:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    """
+    Point d'entrée principal.
 
-    print("===== DAILY PIPELINE START =====")
-    print("db_path =", DB_PATH)
+    Remarque importante :
+    `build_prices.py` ne supporte pas `--mode daily` dans l'état actuel du repo.
+    On appelle donc le CLI avec seulement `--db-path`, afin qu'il applique
+    sa logique quotidienne interne déjà implémentée.
+    """
+    print("===== DAILY PIPELINE START =====", flush=True)
+    print("db_path =", str(DB_PATH), flush=True)
 
-    # =========================
-    # 1. PRICES (yfinance)
-    # =========================
+    # 1) Prix quotidiens.
     run_step(
         "build_prices",
         [
             "python3",
             "cli/core/build_prices.py",
-            "--db-path", str(DB_PATH),
-            "--mode", "daily",
+            "--db-path",
+            str(DB_PATH),
         ],
     )
 
-    # =========================
-    # 2. FINRA SHORT VOLUME
-    # =========================
+    # 2) FINRA daily short volume canonique.
     run_step(
-        "build_finra_short_volume",
+        "build_finra_daily_short_volume",
         [
             "python3",
-            "cli/core/build_finra_short_volume.py",
-            "--db-path", str(DB_PATH),
+            "cli/core/build_finra_daily_short_volume.py",
+            "--db-path",
+            str(DB_PATH),
         ],
     )
 
-    # =========================
-    # 3. FINRA SHORT INTEREST
-    # =========================
+    # 3) FINRA short interest canonique.
     run_step(
         "build_finra_short_interest",
         [
             "python3",
             "cli/core/build_finra_short_interest.py",
-            "--db-path", str(DB_PATH),
+            "--db-path",
+            str(DB_PATH),
         ],
     )
 
-    # =========================
-    # 4. SHORT FEATURES
-    # =========================
+    # 4) Short features.
+    # On garde les paramètres qui ont déjà fonctionné chez toi pour éviter l'OOM.
     run_step(
         "build_short_features",
         [
             "python3",
             "cli/core/build_short_features.py",
-            "--db-path", str(DB_PATH),
-            "--duckdb-threads", "2",
-            "--duckdb-memory-limit", "36GB",
+            "--db-path",
+            str(DB_PATH),
+            "--duckdb-threads",
+            "2",
+            "--duckdb-memory-limit",
+            "36GB",
         ],
     )
 
-    # =========================
-    # 5. SEC FILINGS
-    # =========================
+    # 5) SEC filings.
     run_step(
         "build_sec_filings",
         [
             "python3",
             "cli/core/build_sec_filings.py",
-            "--db-path", str(DB_PATH),
+            "--db-path",
+            str(DB_PATH),
         ],
     )
 
-    print("\n===== DAILY PIPELINE SUCCESS =====")
+    print("\n===== DAILY PIPELINE SUCCESS =====", flush=True)
     return 0
 
 
