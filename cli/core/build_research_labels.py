@@ -9,6 +9,7 @@ IMPORTANT
 - no look-ahead bias
 - labels séparés des features
 - schema assuré avant écriture
+- robuste si le nom de la colonne date diffère dans price_history
 """
 
 import argparse
@@ -20,6 +21,48 @@ import duckdb
 from stock_quant.infrastructure.db.research_labels_schema import (
     ResearchLabelsSchemaManager,
 )
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE lower(table_name) = lower(?)
+        """,
+        [table_name],
+    ).fetchone()
+    return bool(row and int(row[0]) > 0)
+
+
+def _choose_price_date_column(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str = "price_history",
+) -> str:
+    if not _table_exists(con, table_name):
+        raise RuntimeError(f"{table_name} does not exist")
+
+    rows = con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    cols = {str(row[1]).strip().lower() for row in rows}
+
+    preferred_order = [
+        "price_date",
+        "date",
+        "trade_date",
+        "as_of_date",
+        "business_date",
+    ]
+    for col in preferred_order:
+        if col in cols:
+            return col
+
+    for col in cols:
+        if "date" in col or "time" in col:
+            return col
+
+    raise RuntimeError(
+        f"unable to detect price date column in {table_name}; available columns={sorted(cols)}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,10 +81,8 @@ def main() -> int:
 
     con = duckdb.connect(str(db_path))
     try:
-        # Assure le schéma avant toute lecture/écriture.
         ResearchLabelsSchemaManager(con).ensure_tables()
 
-        # Validation snapshot
         snap = con.execute(
             """
             SELECT status
@@ -57,7 +98,8 @@ def main() -> int:
         if snap[0] != "completed":
             raise RuntimeError("snapshot not completed")
 
-        # Idempotence simple pour ce dataset_id.
+        price_date_col = _choose_price_date_column(con, "price_history")
+
         con.execute(
             """
             DELETE FROM research_labels
@@ -66,8 +108,6 @@ def main() -> int:
             [args.dataset_id],
         )
 
-        # SQL labels PIT-safe:
-        # les labels utilisent le futur seulement ici, jamais dans les features.
         con.execute(
             f"""
             INSERT INTO research_labels (
@@ -80,10 +120,10 @@ def main() -> int:
                 fwd_return_20d
             )
             SELECT
-                '{args.dataset_id}' AS dataset_id,
-                '{args.snapshot_id}' AS snapshot_id,
+                ? AS dataset_id,
+                ? AS snapshot_id,
                 p.symbol,
-                p.date AS as_of_date,
+                p.{price_date_col} AS as_of_date,
 
                 CASE
                     WHEN p.close IS NOT NULL
@@ -110,15 +150,16 @@ def main() -> int:
                 END AS fwd_return_20d
 
             FROM price_history p
-            WHERE p.date IS NOT NULL
+            WHERE p.{price_date_col} IS NOT NULL
               AND p.symbol IS NOT NULL
               AND TRIM(p.symbol) <> ''
 
             WINDOW w AS (
                 PARTITION BY p.symbol
-                ORDER BY p.date
+                ORDER BY p.{price_date_col}
             )
-            """
+            """,
+            [args.dataset_id, args.snapshot_id],
         )
 
         count = con.execute(
@@ -136,6 +177,7 @@ def main() -> int:
                     "dataset_id": args.dataset_id,
                     "snapshot_id": args.snapshot_id,
                     "rows": int(count),
+                    "price_date_column": price_date_col,
                 },
                 indent=2,
             ),
