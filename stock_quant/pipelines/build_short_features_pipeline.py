@@ -12,21 +12,19 @@ class BuildShortFeaturesPipeline:
     """
     Canonical SQL-first builder for short_features_daily.
 
-    Objectif
-    --------
-    Construire une table dérivée de recherche à partir de :
-    - daily_short_volume_history
-    - finra_short_interest_history
-
-    Contraintes de conception
-    -------------------------
-    - SQL-first : la logique métier principale vit dans DuckDB SQL.
-    - PIT-safe : on n'utilise jamais une date métier comme substitut au moment
-      de disponibilité.
-    - Idempotent : le rebuild complet doit donner le même résultat si les
-      tables sources n'ont pas changé.
-    - Serving/latest non utilisés : on travaille uniquement à partir des tables
-      historiques canoniques.
+    Design goals
+    ------------
+    - SQL-first: toute la logique lourde reste dans DuckDB SQL.
+    - PIT-safe:
+      * daily short volume utilise daily_short_volume_history.available_at
+      * short interest utilise finra_short_interest_history.ingested_at
+      * aucun fallback dangereux de date métier vers disponibilité
+    - idempotent:
+      * rebuild complet déterministe si les sources ne changent pas
+    - survivor-bias safe:
+      * aucun filtre par univers courant dans la reconstruction historique
+    - memory-aware:
+      * on casse le rebuild en batchs mensuels au lieu d'un seul gros INSERT
     """
 
     pipeline_name = "build_short_features"
@@ -45,9 +43,6 @@ class BuildShortFeaturesPipeline:
         )
 
     def _safe_scalar(self, sql: str, default: int = 0) -> int:
-        """
-        Lecture robuste d'un scalaire numérique depuis DuckDB.
-        """
         try:
             row = self.con.execute(sql).fetchone()
             if not row:
@@ -60,9 +55,6 @@ class BuildShortFeaturesPipeline:
             return default
 
     def _safe_optional_scalar(self, sql: str) -> Any:
-        """
-        Lecture robuste d'un scalaire potentiellement non numérique.
-        """
         try:
             row = self.con.execute(sql).fetchone()
             if not row:
@@ -82,9 +74,6 @@ class BuildShortFeaturesPipeline:
         error_message: str | None,
         metrics: dict[str, Any],
     ) -> PipelineResult:
-        """
-        Compatibilité avec plusieurs variantes de PipelineResult.
-        """
         try:
             return PipelineResult(
                 pipeline_name=self.pipeline_name,
@@ -110,17 +99,7 @@ class BuildShortFeaturesPipeline:
                 metrics=metrics,
             )
 
-    def _table_columns(self, table_name: str) -> set[str]:
-        """
-        Retourne l'ensemble des colonnes présentes dans une table.
-        """
-        rows = self.con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
-        return {str(row[1]).strip().lower() for row in rows}
-
     def _ensure_required_tables(self) -> None:
-        """
-        Vérifie que les tables minimales existent.
-        """
         required = {
             "daily_short_volume_history",
             "finra_short_interest_history",
@@ -134,40 +113,93 @@ class BuildShortFeaturesPipeline:
         if missing:
             raise RuntimeError(f"missing required tables: {', '.join(sorted(missing))}")
 
-    def _rebuild_short_features_daily(self) -> dict[str, int]:
+    def _table_columns(self, table_name: str) -> set[str]:
+        rows = self.con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+        return {str(row[1]).strip().lower() for row in rows}
+
+    def _prepare_daily_enriched_temp(self) -> dict[str, int]:
         """
-        Rebuild complet de short_features_daily.
+        Prépare une table temp déjà agrégée au grain (symbol, as_of_date).
+
+        Pourquoi
+        --------
+        Le raw canonical `daily_short_volume_history` contient plusieurs lignes par
+        symbole / date / source / marché. On réduit d'abord cette cardinalité avant
+        le join PIT avec short interest.
+
+        Cette étape reste SQL-first et diminue fortement la mémoire du join suivant.
+        """
+        self.con.execute("DROP TABLE IF EXISTS tmp_short_features_daily_enriched")
+
+        self.con.execute(
+            """
+            CREATE TEMP TABLE tmp_short_features_daily_enriched AS
+            WITH daily_agg AS (
+                SELECT
+                    d.symbol,
+                    d.trade_date AS as_of_date,
+                    SUM(COALESCE(d.short_volume, 0.0)) AS short_volume,
+                    SUM(COALESCE(d.short_exempt_volume, 0.0)) AS short_exempt_volume,
+                    SUM(COALESCE(d.total_volume, 0.0)) AS total_volume,
+                    CASE
+                        WHEN SUM(COALESCE(d.total_volume, 0.0)) > 0
+                        THEN SUM(COALESCE(d.short_volume, 0.0)) / SUM(COALESCE(d.total_volume, 0.0))
+                        ELSE NULL
+                    END AS short_volume_ratio,
+                    MAX(d.available_at) AS max_source_available_at
+                FROM daily_short_volume_history AS d
+                WHERE d.symbol IS NOT NULL
+                  AND TRIM(d.symbol) <> ''
+                  AND d.trade_date IS NOT NULL
+                GROUP BY
+                    d.symbol,
+                    d.trade_date
+            )
+            SELECT
+                a.symbol,
+                a.as_of_date,
+                a.short_volume,
+                a.short_exempt_volume,
+                a.total_volume,
+                a.short_volume_ratio,
+                AVG(a.short_volume_ratio) OVER (
+                    PARTITION BY a.symbol
+                    ORDER BY a.as_of_date
+                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                ) AS short_volume_ratio_20d_avg,
+                a.max_source_available_at
+            FROM daily_agg AS a
+            """
+        )
+
+        temp_rows = self._safe_scalar(
+            "SELECT COUNT(*) FROM tmp_short_features_daily_enriched",
+            0,
+        )
+        return {"temp_daily_enriched_rows": temp_rows}
+
+    def _list_month_starts(self) -> list[str]:
+        rows = self.con.execute(
+            """
+            SELECT DISTINCT CAST(date_trunc('month', as_of_date) AS DATE) AS month_start
+            FROM tmp_short_features_daily_enriched
+            ORDER BY month_start
+            """
+        ).fetchall()
+        return [str(row[0]) for row in rows if row and row[0] is not None]
+
+    def _insert_month_batch(self, month_start: str) -> int:
+        """
+        Insère un batch mensuel PIT-safe dans short_features_daily.
 
         Important
         ---------
-        Le schéma réel actuel de short_features_daily ne contient pas `source_file`.
-        On ne tente donc pas de l'écrire.
-
-        Grain cible
-        -----------
-        1 ligne par :
-        - symbol
-        - as_of_date
-
-        S'il existe plusieurs lignes daily_short_volume_history pour un symbole
-        et une date (plusieurs marchés / sources), on agrège avant insertion.
-
-        PIT logic
-        ---------
-        - daily short volume : disponible à `daily_short_volume_history.available_at`
-        - short interest : disponible à `finra_short_interest_history.ingested_at`
-          dans l'état actuel du repo
-
-        Pour chaque (symbol, as_of_date), on choisit le short interest le plus
-        récent tel que :
-        - settlement_date <= as_of_date
-        - ingested_at <= max_source_available_at
+        - le join short interest est borné au mois courant
+        - la sélection PIT choisit le short interest le plus récent disponible
+          au moment `max_source_available_at`
+        - aucune colonne non présente dans le schéma réel n'est écrite
         """
-
         before_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
-
-        # Rebuild complet et idempotent.
-        self.con.execute("DELETE FROM short_features_daily")
 
         self.con.execute(
             """
@@ -190,45 +222,21 @@ class BuildShortFeaturesPipeline:
                 short_interest_pct_float,
                 max_source_available_at
             )
-            WITH daily_agg AS (
-                SELECT
-                    d.symbol,
-                    d.trade_date AS as_of_date,
-
-                    -- Agrégation conservative du volume short quotidien.
-                    SUM(COALESCE(d.short_volume, 0.0)) AS short_volume,
-                    SUM(COALESCE(d.short_exempt_volume, 0.0)) AS short_exempt_volume,
-                    SUM(COALESCE(d.total_volume, 0.0)) AS total_volume,
-
-                    CASE
-                        WHEN SUM(COALESCE(d.total_volume, 0.0)) > 0
-                        THEN SUM(COALESCE(d.short_volume, 0.0)) / SUM(COALESCE(d.total_volume, 0.0))
-                        ELSE NULL
-                    END AS short_volume_ratio,
-
-                    MAX(d.available_at) AS max_source_available_at
-                FROM daily_short_volume_history AS d
-                WHERE d.symbol IS NOT NULL
-                  AND TRIM(d.symbol) <> ''
-                  AND d.trade_date IS NOT NULL
-                GROUP BY
-                    d.symbol,
-                    d.trade_date
+            WITH month_daily AS (
+                SELECT *
+                FROM tmp_short_features_daily_enriched
+                WHERE as_of_date >= CAST(? AS DATE)
+                  AND as_of_date < CAST(? AS DATE) + INTERVAL '1 month'
             ),
-            daily_enriched AS (
-                SELECT
-                    a.*,
-                    AVG(a.short_volume_ratio) OVER (
-                        PARTITION BY a.symbol
-                        ORDER BY a.as_of_date
-                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS short_volume_ratio_20d_avg
-                FROM daily_agg AS a
-            ),
-            short_interest_asof AS (
+            short_interest_ranked AS (
                 SELECT
                     d.symbol,
                     d.as_of_date,
+                    d.short_volume,
+                    d.short_exempt_volume,
+                    d.total_volume,
+                    d.short_volume_ratio,
+                    d.short_volume_ratio_20d_avg,
                     d.max_source_available_at,
                     s.short_interest,
                     s.previous_short_interest,
@@ -238,79 +246,43 @@ class BuildShortFeaturesPipeline:
                     s.short_interest_pct_float,
                     ROW_NUMBER() OVER (
                         PARTITION BY d.symbol, d.as_of_date
-                        ORDER BY s.settlement_date DESC, s.ingested_at DESC
+                        ORDER BY
+                            s.settlement_date DESC NULLS LAST,
+                            s.ingested_at DESC NULLS LAST
                     ) AS rn
-                FROM daily_enriched AS d
+                FROM month_daily AS d
                 LEFT JOIN finra_short_interest_history AS s
                     ON s.symbol = d.symbol
                    AND s.settlement_date <= d.as_of_date
                    AND s.ingested_at <= d.max_source_available_at
             ),
-            joined AS (
+            base AS (
                 SELECT
-                    d.symbol,
-                    d.as_of_date,
-                    d.short_volume,
-                    d.short_exempt_volume,
-                    d.total_volume,
-                    d.short_volume_ratio,
-                    d.short_volume_ratio_20d_avg,
-                    s.short_interest,
-                    s.previous_short_interest,
-                    s.avg_daily_volume,
-                    s.days_to_cover,
-                    s.shares_float,
-                    s.short_interest_pct_float,
-                    d.max_source_available_at
-                FROM daily_enriched AS d
-                LEFT JOIN short_interest_asof AS s
-                    ON s.symbol = d.symbol
-                   AND s.as_of_date = d.as_of_date
-                   AND s.rn = 1
-            ),
-            scored AS (
-                SELECT
-                    j.*,
-
+                    symbol,
+                    as_of_date,
+                    short_volume,
+                    short_exempt_volume,
+                    total_volume,
+                    short_volume_ratio,
+                    short_volume_ratio_20d_avg,
+                    short_interest,
+                    previous_short_interest,
                     CASE
-                        WHEN j.previous_short_interest IS NOT NULL
-                         AND j.previous_short_interest <> 0
-                         AND j.short_interest IS NOT NULL
-                        THEN (j.short_interest - j.previous_short_interest) / j.previous_short_interest
+                        WHEN previous_short_interest IS NOT NULL
+                         AND previous_short_interest <> 0
+                         AND short_interest IS NOT NULL
+                        THEN (short_interest - previous_short_interest) / previous_short_interest
                         ELSE NULL
                     END AS short_interest_change_pct,
-
-                    CASE
-                        WHEN j.days_to_cover IS NOT NULL
-                         AND j.short_volume_ratio IS NOT NULL
-                        THEN j.days_to_cover * j.short_volume_ratio
-                        ELSE NULL
-                    END AS short_squeeze_score,
-
-                    AVG(j.short_volume_ratio) OVER (
-                        PARTITION BY j.symbol
-                        ORDER BY j.as_of_date
-                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS short_volume_ratio_avg_20d,
-
-                    STDDEV_SAMP(j.short_volume_ratio) OVER (
-                        PARTITION BY j.symbol
-                        ORDER BY j.as_of_date
-                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS short_volume_ratio_std_20d,
-
-                    AVG(j.days_to_cover) OVER (
-                        PARTITION BY j.symbol
-                        ORDER BY j.as_of_date
-                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS days_to_cover_avg_20d,
-
-                    STDDEV_SAMP(j.days_to_cover) OVER (
-                        PARTITION BY j.symbol
-                        ORDER BY j.as_of_date
-                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS days_to_cover_std_20d
-                FROM joined AS j
+                    CAST(NULL AS DOUBLE) AS short_squeeze_score,
+                    CAST(NULL AS DOUBLE) AS short_pressure_zscore,
+                    days_to_cover,
+                    CAST(NULL AS DOUBLE) AS days_to_cover_zscore,
+                    shares_float,
+                    short_interest_pct_float,
+                    max_source_available_at
+                FROM short_interest_ranked
+                WHERE rn = 1
             )
             SELECT
                 symbol,
@@ -324,41 +296,153 @@ class BuildShortFeaturesPipeline:
                 previous_short_interest,
                 short_interest_change_pct,
                 short_squeeze_score,
+                short_pressure_zscore,
+                days_to_cover,
+                days_to_cover_zscore,
+                shares_float,
+                short_interest_pct_float,
+                max_source_available_at
+            FROM base
+            """,
+            [month_start, month_start],
+        )
 
+        after_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        return max(0, after_count - before_count)
+
+    def _apply_global_scores(self) -> dict[str, int]:
+        """
+        Deuxième passe SQL-first.
+
+        Pourquoi une deuxième passe
+        ---------------------------
+        Les z-scores doivent voir toute la série temporelle du symbole.
+        Les calculer dans chaque batch mensuel casserait la continuité.
+
+        Ici on calcule les fenêtres sur `short_features_daily` déjà reconstruit,
+        puis on met à jour les colonnes de score.
+        """
+        self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_scores")
+
+        self.con.execute(
+            """
+            CREATE TEMP TABLE tmp_short_feature_scores AS
+            WITH scored AS (
+                SELECT
+                    f.symbol,
+                    f.as_of_date,
+                    f.short_volume_ratio,
+                    f.days_to_cover,
+
+                    AVG(f.short_volume_ratio) OVER (
+                        PARTITION BY f.symbol
+                        ORDER BY f.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS short_volume_ratio_avg_20d,
+
+                    STDDEV_POP(f.short_volume_ratio) OVER (
+                        PARTITION BY f.symbol
+                        ORDER BY f.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS short_volume_ratio_std_20d,
+
+                    AVG(f.days_to_cover) OVER (
+                        PARTITION BY f.symbol
+                        ORDER BY f.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS days_to_cover_avg_20d,
+
+                    STDDEV_POP(f.days_to_cover) OVER (
+                        PARTITION BY f.symbol
+                        ORDER BY f.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS days_to_cover_std_20d
+                FROM short_features_daily AS f
+            )
+            SELECT
+                symbol,
+                as_of_date,
                 CASE
                     WHEN short_volume_ratio_std_20d IS NOT NULL
-                     AND short_volume_ratio_std_20d <> 0
+                     AND short_volume_ratio_std_20d > 0
                      AND short_volume_ratio IS NOT NULL
                      AND short_volume_ratio_avg_20d IS NOT NULL
                     THEN (short_volume_ratio - short_volume_ratio_avg_20d) / short_volume_ratio_std_20d
                     ELSE NULL
                 END AS short_pressure_zscore,
-
-                days_to_cover,
-
                 CASE
                     WHEN days_to_cover_std_20d IS NOT NULL
-                     AND days_to_cover_std_20d <> 0
+                     AND days_to_cover_std_20d > 0
                      AND days_to_cover IS NOT NULL
                      AND days_to_cover_avg_20d IS NOT NULL
                     THEN (days_to_cover - days_to_cover_avg_20d) / days_to_cover_std_20d
                     ELSE NULL
-                END AS days_to_cover_zscore,
-
-                shares_float,
-                short_interest_pct_float,
-                max_source_available_at
+                END AS days_to_cover_zscore
             FROM scored
             """
         )
 
-        after_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        self.con.execute(
+            """
+            UPDATE short_features_daily AS f
+            SET
+                short_pressure_zscore = s.short_pressure_zscore,
+                days_to_cover_zscore = s.days_to_cover_zscore,
+                short_squeeze_score = CASE
+                    WHEN s.short_pressure_zscore IS NOT NULL
+                     AND s.days_to_cover_zscore IS NOT NULL
+                    THEN (s.short_pressure_zscore + s.days_to_cover_zscore) / 2.0
+                    WHEN s.short_pressure_zscore IS NOT NULL
+                    THEN s.short_pressure_zscore
+                    WHEN s.days_to_cover_zscore IS NOT NULL
+                    THEN s.days_to_cover_zscore
+                    ELSE NULL
+                END
+            FROM tmp_short_feature_scores AS s
+            WHERE f.symbol = s.symbol
+              AND f.as_of_date = s.as_of_date
+            """
+        )
 
-        return {
-            "short_features_rows_before": before_count,
-            "short_features_rows_inserted": after_count,
-            "short_features_rows_after": after_count,
-        }
+        scored_rows = self._safe_scalar(
+            "SELECT COUNT(*) FROM tmp_short_feature_scores",
+            0,
+        )
+        return {"scored_short_feature_rows": scored_rows}
+
+    def _rebuild_short_features_daily(self) -> dict[str, int]:
+        before_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+
+        # Rebuild complet, idempotent.
+        self.con.execute("DELETE FROM short_features_daily")
+
+        metrics: dict[str, int] = {}
+        metrics.update(self._prepare_daily_enriched_temp())
+
+        month_starts = self._list_month_starts()
+        metrics["month_batch_count"] = len(month_starts)
+
+        inserted_total = 0
+        for idx, month_start in enumerate(month_starts, start=1):
+            if idx == 1 or idx % 12 == 0 or idx == len(month_starts):
+                print(
+                    f"[build_short_features] month_batch {idx}/{len(month_starts)}: {month_start}",
+                    flush=True,
+                )
+            inserted_total += self._insert_month_batch(month_start)
+
+        metrics["short_features_rows_inserted"] = inserted_total
+
+        metrics.update(self._apply_global_scores())
+
+        after_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        metrics["short_features_rows_before"] = before_count
+        metrics["short_features_rows_after"] = after_count
+
+        self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_scores")
+        self.con.execute("DROP TABLE IF EXISTS tmp_short_features_daily_enriched")
+
+        return metrics
 
     def run(self) -> PipelineResult:
         started_at = self._now()
@@ -370,8 +454,14 @@ class BuildShortFeaturesPipeline:
             self._log_step(1, "inspect short-data source tables")
             self._ensure_required_tables()
 
-            daily_count = self._safe_scalar("SELECT COUNT(*) FROM daily_short_volume_history", 0)
-            short_interest_count = self._safe_scalar("SELECT COUNT(*) FROM finra_short_interest_history", 0)
+            daily_count = self._safe_scalar(
+                "SELECT COUNT(*) FROM daily_short_volume_history",
+                0,
+            )
+            short_interest_count = self._safe_scalar(
+                "SELECT COUNT(*) FROM finra_short_interest_history",
+                0,
+            )
 
             metrics["daily_short_volume_history_count"] = daily_count
             metrics["finra_short_interest_history_count"] = short_interest_count
@@ -395,7 +485,8 @@ class BuildShortFeaturesPipeline:
             self._log_step(2, "rebuild short_features_daily from canonical sources")
             rebuild_result = self._rebuild_short_features_daily()
             metrics.update(rebuild_result)
-            rows_written = int(rebuild_result.get("short_features_rows_inserted", 0))
+
+            rows_written = int(metrics.get("short_features_rows_after", 0) or 0)
 
             self._log_step(3, "collect final short feature state")
             metrics["max_short_features_as_of_date"] = self._safe_optional_scalar(
