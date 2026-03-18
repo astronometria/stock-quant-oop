@@ -24,10 +24,6 @@ def _now() -> datetime:
 
 
 def _extract_last_json_object(stdout: str) -> dict[str, Any]:
-    """
-    Certains builders écrivent des logs avant le JSON final.
-    On récupère donc le dernier bloc JSON trouvé dans stdout.
-    """
     lines = stdout.strip().splitlines()
     start_index = None
 
@@ -55,11 +51,23 @@ def _run(cmd: list[str]) -> dict[str, Any]:
     return _extract_last_json_object(result.stdout)
 
 
+def _normalize_json(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    parsed = json.loads(value)
+    return json.dumps(parsed, sort_keys=True)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
     p.add_argument("--experiment-name", default="exp_v2")
+    p.add_argument("--parameters-json", default=None)
+    p.add_argument("--notes", default=None)
     return p.parse_args()
 
 
@@ -69,8 +77,7 @@ def main() -> int:
 
     print(f"[run_research_experiment] db_path={db}", flush=True)
 
-    # Phase 1:
-    # Ouvrir brièvement la DB pour assurer le schéma manifest, puis fermer.
+    # 1) ensure experiment schema, then close before subprocesses
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -78,8 +85,7 @@ def main() -> int:
     finally:
         con.close()
 
-    # Phase 2:
-    # Aucun lock DuckDB ouvert pendant les sous-processus.
+    # 2) build dataset without holding DB lock
     ds = _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_training_dataset.py"),
@@ -88,6 +94,7 @@ def main() -> int:
     ])
     dataset_id = ds["dataset_id"]
 
+    # 3) build labels without holding DB lock
     _run([
         sys.executable,
         str(PROJECT_ROOT / "cli/core/build_research_labels.py"),
@@ -96,8 +103,7 @@ def main() -> int:
         "--dataset-id", dataset_id,
     ])
 
-    # Phase 3:
-    # Réouvrir la DB pour calculer les métriques et persister le manifest.
+    # 4) reopen DB for metrics + manifest persistence
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -134,10 +140,10 @@ def main() -> int:
                 dataset_id=dataset_id,
                 experiment_name=args.experiment_name,
                 git_commit=None,
-                parameters_json=None,
+                parameters_json=_normalize_json(args.parameters_json),
                 metrics_json=metrics_json,
                 status="completed",
-                notes=None,
+                notes=args.notes,
                 created_by_pipeline="run_research_experiment_v2",
             )
         )
