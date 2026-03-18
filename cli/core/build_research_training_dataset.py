@@ -23,7 +23,7 @@ from stock_quant.infrastructure.db.research_training_dataset_schema import (
 )
 
 
-def _now_utc():
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -32,27 +32,31 @@ def _dataset_id(snapshot_id: str) -> str:
     return f"{snapshot_id}_dataset_{stamp}"
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
     return p.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
+
+    print(f"[build_research_training_dataset] db_path={db_path}", flush=True)
 
     con = duckdb.connect(str(db_path))
     try:
         ResearchTrainingDatasetSchemaManager(con).ensure_tables()
 
-        # --- vérifier snapshot ---
-        snapshot = con.execute("""
+        snapshot = con.execute(
+            """
             SELECT snapshot_id, status
             FROM research_dataset_manifest
             WHERE snapshot_id = ?
-        """, [args.snapshot_id]).fetchone()
+            """,
+            [args.snapshot_id],
+        ).fetchone()
 
         if snapshot is None:
             raise RuntimeError("snapshot_id not found")
@@ -62,32 +66,42 @@ def main():
 
         dataset_id = _dataset_id(args.snapshot_id)
 
-        # --- SQL principal (PIT safe) ---
-        con.execute(f"""
-            INSERT INTO research_training_dataset
+        # Important:
+        # On cible explicitement les colonnes d'insertion pour laisser
+        # DuckDB appliquer le DEFAULT CURRENT_TIMESTAMP sur created_at.
+        con.execute(
+            f"""
+            INSERT INTO research_training_dataset (
+                dataset_id,
+                snapshot_id,
+                symbol,
+                as_of_date,
+                close,
+                short_volume_ratio
+            )
             SELECT
                 '{dataset_id}' AS dataset_id,
                 '{args.snapshot_id}' AS snapshot_id,
                 p.symbol,
                 p.date AS as_of_date,
-
                 p.close,
-
                 sf.short_volume_ratio
-
             FROM price_history p
-
             LEFT JOIN short_features_daily sf
               ON sf.symbol = p.symbol
              AND sf.as_of_date = p.date
-
             WHERE p.date IS NOT NULL
-        """)
+            """
+        )
 
-        row_count = con.execute("""
-            SELECT COUNT(*) FROM research_training_dataset
+        row_count = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM research_training_dataset
             WHERE dataset_id = ?
-        """, [dataset_id]).fetchone()[0]
+            """,
+            [dataset_id],
+        ).fetchone()[0]
 
         output = {
             "dataset_id": dataset_id,
@@ -95,11 +109,12 @@ def main():
             "row_count": int(row_count),
         }
 
-        print(json.dumps(output, indent=2))
+        print(json.dumps(output, indent=2), flush=True)
+        return 0
 
     finally:
         con.close()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
