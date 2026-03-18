@@ -10,6 +10,10 @@ Signal simple:
 
 Retour:
 - utilise fwd_return_1d
+
+Important:
+- les features viennent de research_training_dataset
+- les labels viennent de research_labels
 """
 
 import argparse
@@ -24,7 +28,7 @@ from stock_quant.infrastructure.db.research_backtest_schema import (
 )
 
 
-def _now():
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -32,16 +36,18 @@ def _backtest_id(dataset_id: str) -> str:
     return f"{dataset_id}_bt_{_now().strftime('%Y%m%dT%H%M%SZ')}"
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--dataset-id", required=True)
     return p.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    db = Path(args.db_path).resolve()
+    db = Path(args.db_path).expanduser().resolve()
+
+    print(f"[build_research_backtest] db_path={db}", flush=True)
 
     con = duckdb.connect(str(db))
     try:
@@ -49,59 +55,88 @@ def main():
 
         backtest_id = _backtest_id(args.dataset_id)
 
-        # Signal + returns (SQL pur)
-        stats = con.execute("""
+        # Idempotence simple
+        con.execute(
+            """
+            DELETE FROM research_backtest
+            WHERE dataset_id = ?
+            """,
+            [args.dataset_id],
+        )
+
+        stats = con.execute(
+            """
             WITH base AS (
                 SELECT
-                    dataset_id,
-                    symbol,
-                    as_of_date,
-                    fwd_return_1d,
-                    short_volume_ratio,
+                    d.dataset_id,
+                    d.symbol,
+                    d.as_of_date,
+                    d.short_volume_ratio,
+                    l.fwd_return_1d,
 
                     CASE
-                        WHEN short_volume_ratio > 0.5 THEN 1.0
+                        WHEN d.short_volume_ratio > 0.5 THEN 1.0
                         ELSE 0.0
                     END AS signal
-                FROM research_labels
-                WHERE dataset_id = ?
+                FROM research_training_dataset d
+                INNER JOIN research_labels l
+                    ON l.dataset_id = d.dataset_id
+                   AND l.symbol = d.symbol
+                   AND l.as_of_date = d.as_of_date
+                WHERE d.dataset_id = ?
             ),
-
             pnl AS (
                 SELECT
                     *,
-                    signal * fwd_return_1d AS strategy_return
+                    CASE
+                        WHEN fwd_return_1d IS NOT NULL
+                        THEN signal * fwd_return_1d
+                        ELSE NULL
+                    END AS strategy_return
                 FROM base
             )
-
             SELECT
                 AVG(strategy_return) AS avg_return,
-                STDDEV(strategy_return) AS volatility,
+                STDDEV_SAMP(strategy_return) AS volatility,
                 SUM(strategy_return) AS total_return,
-                COUNT(*) AS n
+                COUNT(strategy_return) AS n
             FROM pnl
-        """, [args.dataset_id]).fetchone()
+            """,
+            [args.dataset_id],
+        ).fetchone()
 
-        avg_return = float(stats[0]) if stats[0] is not None else 0.0
-        vol = float(stats[1]) if stats[1] is not None else 0.0
-        total = float(stats[2]) if stats[2] is not None else 0.0
-        n = int(stats[3])
+        avg_return = float(stats[0]) if stats and stats[0] is not None else 0.0
+        vol = float(stats[1]) if stats and stats[1] is not None else 0.0
+        total = float(stats[2]) if stats and stats[2] is not None else 0.0
+        n = int(stats[3]) if stats and stats[3] is not None else 0
 
         sharpe = avg_return / vol if vol > 0 else None
 
-        con.execute("""
-            INSERT INTO research_backtest
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, [
-            backtest_id,
-            args.dataset_id,
-            "short_volume_ratio_long",
-            avg_return,
-            vol,
-            sharpe,
-            total,
-            n,
-        ])
+        con.execute(
+            """
+            INSERT INTO research_backtest (
+                backtest_id,
+                dataset_id,
+                signal_name,
+                avg_return,
+                volatility,
+                sharpe,
+                total_return,
+                n_obs
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                backtest_id,
+                args.dataset_id,
+                "short_volume_ratio_long",
+                avg_return,
+                vol,
+                sharpe,
+                total,
+                n,
+            ],
+        )
 
         output = {
             "backtest_id": backtest_id,
@@ -113,7 +148,7 @@ def main():
             "n": n,
         }
 
-        print(json.dumps(output, indent=2))
+        print(json.dumps(output, indent=2), flush=True)
         return 0
 
     finally:
