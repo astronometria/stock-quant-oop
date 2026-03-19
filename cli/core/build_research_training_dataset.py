@@ -122,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--memory-limit", default="24GB")
     p.add_argument("--threads", type=int, default=6)
     p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
+    p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
 
@@ -214,6 +215,8 @@ def main() -> int:
         print(f"[builder] threads={args.threads}", flush=True)
         print(f"[builder] temp_dir={temp_dir_sql}", flush=True)
         print(f"[builder] embargo_days={embargo_days}", flush=True)
+        if args.verbose:
+            print("[builder] verbose=True", flush=True)
 
         con.execute(
             """
