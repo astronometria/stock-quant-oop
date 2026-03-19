@@ -1,6 +1,36 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Scientific research experiment runner.
+
+Objectif
+--------
+Orchestrer, dans l'ordre:
+1) build_research_training_dataset.py
+2) build_research_labels.py
+3) build_research_backtest.py
+4) persister le manifest d'expérience
+
+Améliorations de cette version
+------------------------------
+- streaming temps réel du stdout/stderr des sous-scripts
+- passthrough runtime:
+  --verbose
+  --memory-limit
+  --threads
+  --temp-dir
+- conservation d'un parse robuste du JSON final produit par chaque sous-script
+- logs explicites pour mieux observer les runs lourds
+
+Important
+---------
+On garde une architecture simple:
+- Python mince pour l'orchestration
+- sous-scripts responsables du SQL
+- manifest final écrit seulement si toutes les étapes ont réussi
+"""
+
 import argparse
 import json
 import subprocess
@@ -20,6 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _now() -> datetime:
+    """Timestamp UTC pour ids reproductibles."""
     return datetime.now(timezone.utc)
 
 
@@ -29,8 +60,8 @@ def _extract_last_json_object(stdout: str) -> dict[str, Any]:
 
     Pourquoi cette version:
     - les sous-scripts peuvent écrire des logs avant le JSON final
-    - un JSON final peut contenir des sous-objets imbriqués
-    - prendre simplement "la dernière ligne commençant par {" n'est pas robuste
+    - le JSON final peut contenir des objets imbriqués
+    - on ne veut pas parser naïvement "la dernière ligne qui commence par {"
     """
     text = stdout.strip()
     if not text:
@@ -38,12 +69,14 @@ def _extract_last_json_object(stdout: str) -> dict[str, Any]:
 
     end = text.rfind("}")
     if end == -1:
-        raise RuntimeError(f"no JSON object found in stdout:\n{stdout}")
+        raise RuntimeError(f"no JSON object found in stdout:\n{text}")
 
     depth = 0
     in_string = False
     escape = False
 
+    # On remonte depuis la dernière accolade fermante afin de retrouver
+    # l'accolade ouvrante correspondante du dernier objet JSON complet.
     for i in range(end, -1, -1):
         ch = text[i]
 
@@ -67,43 +100,125 @@ def _extract_last_json_object(stdout: str) -> dict[str, Any]:
         if ch == "{":
             depth -= 1
             if depth == 0:
-                candidate = text[i:end + 1]
+                candidate = text[i : end + 1]
                 try:
                     return json.loads(candidate)
                 except json.JSONDecodeError as exc:
                     raise RuntimeError(
-                        f"failed to parse trailing JSON object from stdout:\n{stdout}"
+                        f"failed to parse trailing JSON object from stdout:\n{text}"
                     ) from exc
 
-    raise RuntimeError(f"no complete trailing JSON object found in stdout:\n{stdout}")
-
-
-def _run(cmd: list[str]) -> dict[str, Any]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr or result.stdout)
-    return _extract_last_json_object(result.stdout)
+    raise RuntimeError(f"no complete trailing JSON object found in stdout:\n{text}")
 
 
 def _normalize_json(raw: str | None) -> str | None:
+    """
+    Normalise un payload JSON optionnel pour le manifest.
+
+    Pourquoi:
+    - éviter des variations d'espaces dans la DB
+    - valider immédiatement que le JSON fourni est bien valide
+    """
     if raw is None:
         return None
+
     value = raw.strip()
     if not value:
         return None
+
     return json.dumps(json.loads(value), sort_keys=True)
+
+
+def _build_base_child_cmd(script_rel_path: str, args: argparse.Namespace, db: Path) -> list[str]:
+    """
+    Construit la base commune d'une commande enfant.
+
+    On passe ici tous les paramètres runtime communs afin que les gros jobs
+    DuckDB utilisent les mêmes limites/mêmes répertoires temporaires.
+    """
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / script_rel_path),
+        "--db-path",
+        str(db),
+        "--memory-limit",
+        args.memory_limit,
+        "--threads",
+        str(args.threads),
+        "--temp-dir",
+        args.temp_dir,
+    ]
+
+    if args.verbose:
+        cmd.append("--verbose")
+
+    return cmd
+
+
+def _run(cmd: list[str], step_name: str) -> dict[str, Any]:
+    """
+    Exécute un sous-script en streaming.
+
+    Différence clé vs ancienne version:
+    - on n'utilise plus capture_output=True
+    - on streame la sortie ligne par ligne pour voir la progression
+    - on conserve quand même stdout complet pour parser le JSON final
+    """
+    print(f"[run_research_experiment] START step={step_name}", flush=True)
+    print(
+        f"[run_research_experiment] CMD step={step_name} cmd={json.dumps(cmd)}",
+        flush=True,
+    )
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    if process.stdout is None:
+        raise RuntimeError(f"{step_name}: failed to capture child stdout")
+
+    collected_lines: list[str] = []
+
+    # Streaming temps réel vers le terminal + stockage pour parse JSON final.
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        collected_lines.append(line)
+
+    returncode = process.wait()
+    stdout = "".join(collected_lines)
+
+    if returncode != 0:
+        raise RuntimeError(f"{step_name} failed:\n{stdout}")
+
+    payload = _extract_last_json_object(stdout)
+    print(f"[run_research_experiment] END step={step_name}", flush=True)
+    return payload
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
     p.add_argument("--split-id", required=True)
+
     p.add_argument("--experiment-name", default="exp_v_scientific")
     p.add_argument("--parameters-json", default=None)
     p.add_argument("--notes", default=None)
+
     p.add_argument("--transaction-cost-bps", type=float, default=10.0)
     p.add_argument("--signal-threshold", type=float, default=0.5)
+
+    # Runtime passthrough pour les gros jobs.
+    p.add_argument("--memory-limit", default="24GB")
+    p.add_argument("--threads", type=int, default=6)
+    p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
+    p.add_argument("--verbose", action="store_true")
+
     return p.parse_args()
 
 
@@ -112,7 +227,14 @@ def main() -> int:
     db = Path(args.db_path).expanduser().resolve()
 
     print(f"[run_research_experiment] db_path={db}", flush=True)
+    print(f"[run_research_experiment] snapshot_id={args.snapshot_id}", flush=True)
+    print(f"[run_research_experiment] split_id={args.split_id}", flush=True)
+    print(f"[run_research_experiment] memory_limit={args.memory_limit}", flush=True)
+    print(f"[run_research_experiment] threads={args.threads}", flush=True)
+    print(f"[run_research_experiment] temp_dir={args.temp_dir}", flush=True)
+    print(f"[run_research_experiment] verbose={args.verbose}", flush=True)
 
+    # On s'assure que la table manifest existe avant le run.
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -120,40 +242,75 @@ def main() -> int:
     finally:
         con.close()
 
-    dataset_result = _run([
-        sys.executable,
-        str(PROJECT_ROOT / "cli/core/build_research_training_dataset.py"),
-        "--db-path", str(db),
-        "--snapshot-id", args.snapshot_id,
-        "--split-id", args.split_id,
-    ])
+    # ------------------------------------------------------------------
+    # Step 1: dataset build
+    # ------------------------------------------------------------------
+    dataset_cmd = _build_base_child_cmd(
+        "cli/core/build_research_training_dataset.py",
+        args,
+        db,
+    ) + [
+        "--snapshot-id",
+        args.snapshot_id,
+        "--split-id",
+        args.split_id,
+    ]
+
+    dataset_result = _run(dataset_cmd, "dataset_build")
     dataset_id = dataset_result["dataset_id"]
 
-    labels_result = _run([
-        sys.executable,
-        str(PROJECT_ROOT / "cli/core/build_research_labels.py"),
-        "--db-path", str(db),
-        "--snapshot-id", args.snapshot_id,
-        "--dataset-id", dataset_id,
-        "--split-id", args.split_id,
-    ])
+    # ------------------------------------------------------------------
+    # Step 2: labels build
+    # ------------------------------------------------------------------
+    labels_cmd = _build_base_child_cmd(
+        "cli/core/build_research_labels.py",
+        args,
+        db,
+    ) + [
+        "--snapshot-id",
+        args.snapshot_id,
+        "--dataset-id",
+        dataset_id,
+        "--split-id",
+        args.split_id,
+    ]
 
-    backtest_result = _run([
-        sys.executable,
-        str(PROJECT_ROOT / "cli/core/build_research_backtest.py"),
-        "--db-path", str(db),
-        "--dataset-id", dataset_id,
-        "--split-id", args.split_id,
-        "--transaction-cost-bps", str(args.transaction_cost_bps),
-        "--signal-threshold", str(args.signal_threshold),
-    ])
+    labels_result = _run(labels_cmd, "labels_build")
 
+    # ------------------------------------------------------------------
+    # Step 3: backtest build
+    #
+    # On propage aussi les paramètres runtime par cohérence, même si le
+    # backtest actuel n'en a pas strictement besoin. Cela évite une dérive
+    # d'interface entre sous-scripts.
+    # ------------------------------------------------------------------
+    backtest_cmd = _build_base_child_cmd(
+        "cli/core/build_research_backtest.py",
+        args,
+        db,
+    ) + [
+        "--dataset-id",
+        dataset_id,
+        "--split-id",
+        args.split_id,
+        "--transaction-cost-bps",
+        str(args.transaction_cost_bps),
+        "--signal-threshold",
+        str(args.signal_threshold),
+    ]
+
+    backtest_result = _run(backtest_cmd, "backtest_build")
+
+    # ------------------------------------------------------------------
+    # Step 4: manifest final
+    # ------------------------------------------------------------------
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
         repo.ensure_tables()
 
         exp_id = f"{args.experiment_name}_{_now().strftime('%Y%m%dT%H%M%SZ')}"
+
         metrics_payload = {
             "split_id": args.split_id,
             "dataset_build": dataset_result,
@@ -176,12 +333,18 @@ def main() -> int:
             )
         )
 
-        print(json.dumps({
-            "experiment_id": exp_id,
-            "dataset_id": dataset_id,
-            "split_id": args.split_id,
-            "metrics": metrics_payload,
-        }, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "experiment_id": exp_id,
+                    "dataset_id": dataset_id,
+                    "split_id": args.split_id,
+                    "metrics": metrics_payload,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         return 0
 
     finally:
