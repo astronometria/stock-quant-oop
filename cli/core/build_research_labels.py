@@ -1,15 +1,41 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Research labels builder (aligned runtime version).
+
+Objectif
+--------
+Construire les labels forward-looking à partir de price_history.
+
+Améliorations:
+--------------
+- support --verbose
+- support memory_limit / threads / temp_directory
+- logs propres et flush immédiat
+- prêt pour future version chunked si nécessaire
+
+Important:
+----------
+- forward-looking ONLY (normal)
+- jamais utilisé comme feature
+"""
+
 import argparse
 import json
 from pathlib import Path
 
 import duckdb
 
-from stock_quant.infrastructure.db.research_labels_schema import (
-    ResearchLabelsSchemaManager,
-)
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+
+def _log(msg: str, verbose: bool) -> None:
+    """Log conditionnel pour garder un terminal propre."""
+    if verbose:
+        print(msg, flush=True)
 
 
 def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
@@ -41,6 +67,7 @@ def _choose_price_date_column(
         "as_of_date",
         "business_date",
     ]
+
     for col in preferred_order:
         if col in cols:
             return col
@@ -54,14 +81,30 @@ def _choose_price_date_column(
     )
 
 
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
     p.add_argument("--dataset-id", required=True)
     p.add_argument("--split-id", required=True)
+
+    # 🔥 Alignement avec dataset builder
+    p.add_argument("--memory-limit", default="24GB")
+    p.add_argument("--threads", type=int, default=6)
+    p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
+    p.add_argument("--verbose", action="store_true")
+
     return p.parse_args()
 
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 
 def main() -> int:
     args = parse_args()
@@ -71,8 +114,23 @@ def main() -> int:
 
     con = duckdb.connect(str(db_path))
     try:
-        ResearchLabelsSchemaManager(con).ensure_tables()
+        # ------------------------------------------------------------------
+        # DuckDB runtime tuning (IMPORTANT pour gros volume)
+        # ------------------------------------------------------------------
+        con.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
+        con.execute(f"PRAGMA threads={args.threads}")
+        con.execute("PRAGMA preserve_insertion_order=false")
 
+        temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
+        con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
+
+        _log(f"[labels] memory_limit={args.memory_limit}", args.verbose)
+        _log(f"[labels] threads={args.threads}", args.verbose)
+        _log(f"[labels] temp_dir={temp_dir_sql}", args.verbose)
+
+        # ------------------------------------------------------------------
+        # Validation snapshot
+        # ------------------------------------------------------------------
         snap = con.execute(
             """
             SELECT status
@@ -88,6 +146,9 @@ def main() -> int:
         if snap[0] != "completed":
             raise RuntimeError("snapshot not completed")
 
+        # ------------------------------------------------------------------
+        # Split
+        # ------------------------------------------------------------------
         split = con.execute(
             """
             SELECT
@@ -108,9 +169,25 @@ def main() -> int:
         if split is None:
             raise RuntimeError("split_id not found")
 
-        split_id, train_start, train_end, valid_start, valid_end, test_start, test_end, embargo_days = split
+        (
+            split_id,
+            train_start,
+            train_end,
+            valid_start,
+            valid_end,
+            test_start,
+            test_end,
+            embargo_days,
+        ) = split
+
         price_date_col = _choose_price_date_column(con, "price_history")
 
+        _log(f"[labels] price_date_column={price_date_col}", args.verbose)
+        _log(f"[labels] date_range={train_start} -> {test_end}", args.verbose)
+
+        # ------------------------------------------------------------------
+        # Reset dataset
+        # ------------------------------------------------------------------
         con.execute(
             """
             DELETE FROM research_labels
@@ -119,6 +196,11 @@ def main() -> int:
             [args.dataset_id],
         )
 
+        _log("[labels] previous dataset cleared", args.verbose)
+
+        # ------------------------------------------------------------------
+        # Main insert (SQL-first)
+        # ------------------------------------------------------------------
         con.execute(
             f"""
             INSERT INTO research_labels (
@@ -142,7 +224,7 @@ def main() -> int:
                      AND LEAD(p.close, 1) OVER w IS NOT NULL
                     THEN LEAD(p.close, 1) OVER w / p.close - 1
                     ELSE NULL
-                END AS fwd_return_1d,
+                END,
 
                 CASE
                     WHEN p.close IS NOT NULL
@@ -150,7 +232,7 @@ def main() -> int:
                      AND LEAD(p.close, 5) OVER w IS NOT NULL
                     THEN LEAD(p.close, 5) OVER w / p.close - 1
                     ELSE NULL
-                END AS fwd_return_5d,
+                END,
 
                 CASE
                     WHEN p.close IS NOT NULL
@@ -158,13 +240,12 @@ def main() -> int:
                      AND LEAD(p.close, 20) OVER w IS NOT NULL
                     THEN LEAD(p.close, 20) OVER w / p.close - 1
                     ELSE NULL
-                END AS fwd_return_20d
+                END
 
             FROM price_history p
-            WHERE p.{price_date_col} IS NOT NULL
+            WHERE p.{price_date_col} BETWEEN ? AND ?
               AND p.symbol IS NOT NULL
               AND TRIM(p.symbol) <> ''
-              AND p.{price_date_col} BETWEEN ? AND ?
 
             WINDOW w AS (
                 PARTITION BY p.symbol
@@ -174,6 +255,9 @@ def main() -> int:
             [args.dataset_id, args.snapshot_id, train_start, test_end],
         )
 
+        # ------------------------------------------------------------------
+        # Stats
+        # ------------------------------------------------------------------
         count = con.execute(
             """
             SELECT COUNT(*)
@@ -200,6 +284,7 @@ def main() -> int:
             ),
             flush=True,
         )
+
         return 0
 
     finally:
