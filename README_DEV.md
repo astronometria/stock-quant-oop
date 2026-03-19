@@ -2,156 +2,191 @@
 
 Developer-oriented documentation for `stock-quant-oop`.
 
-## Purpose
+## What is current in the codebase
 
-This repository is a quantitative research pipeline built around an OOP codebase with SQL-first canonical data transforms. The design goal is to keep historical research correct, rebuildable, and maintainable while still supporting practical day-to-day refreshes.
+The codebase is no longer just a generic market-data pipeline. It now has a working research branch with:
+
+- chunked Stooq historical loading
+- daily Yahoo price refresh
+- SEC filing normalization
+- fundamentals build entrypoint
+- FINRA short-data history and derived short features
+- chunked research dataset building
+- dataset-scoped label generation with outlier filtering
+- split-aware, cost-aware backtests
+- experiment manifests with streamed child-process logging
 
 ## Design rules
 
-### Canonical over serving
-Research and backtests should use canonical historical tables first:
+### 1. Canonical over serving
+Research must read canonical historical tables first:
+
 - `price_history`
-- `sec_filing`
-- `finra_short_interest_history`
-- `daily_short_volume_history`
+- normalized SEC tables
+- normalized FINRA history tables
 - `short_features_daily`
 
-Serving tables are convenience outputs:
+Serving tables are operational conveniences:
+
 - `price_latest`
-- `finra_short_interest_latest`
+- any latest/snapshot helper table
 
-### Point-in-time safety
-Feature generation and joins must use the time a record became available, not just the business date printed by the source. In the short-data domain that means:
-- daily short volume uses `available_at`
-- short interest uses `ingested_at`
+### 2. Point-in-time safety
+The dataset builder and feature joins must stay PIT-safe.
+Current research flow does this by:
+- anchoring rows on `research_training_dataset.as_of_date`
+- using backward-looking joins for features
+- keeping forward-looking logic confined to `research_labels`
 
-### Survivor-bias resistance
-Historical rows must remain available even if a symbol later delists, renames, merges, or falls out of the current universe.
-
-### SQL-first implementation
-Business-heavy transforms belong in DuckDB SQL:
+### 3. SQL-first, Python-thin
+DuckDB SQL should keep the heavy lifting for:
 - canonical rebuilds
-- deduplication
 - date alignment
-- historical feature derivation
-- skip / alignment probes where practical
+- feature joins
+- label derivation
+- backtest aggregation
 
-Python should stay thin around:
-- CLI entrypoints
-- orchestration
-- provider calls
-- filesystem discovery
-- logging and progress display
+Python should stay focused on:
+- CLI surfaces
+- runtime parameter plumbing
+- progress bars
+- temp-dir / thread / memory settings
+- lightweight orchestration
 
-## Current implemented pipelines
+### 4. Reproducibility
+The research path is dataset-id based, not ad hoc.
+Core identities:
+- `snapshot_id`
+- `split_id`
+- `dataset_id`
+- `backtest_id`
+- `experiment_id`
 
-### Prices
-Entry point:
-`python3 cli/core/build_prices.py --db-path /path/to/market.duckdb`
+## Current research pipeline
 
-Behavior:
-- daily incremental refresh
-- canonical write into `price_history`
-- latest refresh into `price_latest`
+### Dataset build
+Entrypoint:
 
-### SEC filings
-Entry point:
-`python3 cli/core/build_sec_filings.py --db-path /path/to/market.duckdb`
-
-Behavior:
-- normalizes SEC filing inputs into `sec_filing`
-- currently still runs every orchestrated pass because runtime is acceptable
-
-### FINRA short interest
-Entry point:
-`python3 cli/core/build_finra_short_interest.py --db-path /path/to/market.duckdb`
-
-Behavior:
-- builds canonical history from raw staged data
-- refreshes serving latest table
-- cleanly noops when already aligned
-
-### FINRA daily short volume raw loader
-Entry point:
-`python3 cli/raw/load_finra_daily_short_volume_raw.py --db-path /path/to/market.duckdb --source /path/to/daily_short_sale_volume`
+```bash
+python3 cli/core/build_research_training_dataset.py \
+  --db-path /path/to/market.duckdb \
+  --snapshot-id <snapshot_id> \
+  --split-id <split_id> \
+  --dataset-id <optional_dataset_id> \
+  --memory-limit 24GB \
+  --threads 6 \
+  --temp-dir /path/to/tmp \
+  --verbose
+```
 
 Behavior:
-- reads FINRA historical files with multiple layout variants
-- stages raw rows into `finra_daily_short_volume_source_raw`
-- writes per-source inventory into `finra_daily_short_volume_sources`
+- monthly chunking by partition window
+- SQL-first temp tables
+- backward-looking join from prices to `short_features_daily`
+- optional symbol filtering mode in current code (`common_only` path)
 
-### FINRA daily short volume canonical builder
-Entry point:
-`python3 cli/core/build_finra_daily_short_volume.py --db-path /path/to/market.duckdb`
+### Labels build
+Entrypoint:
+
+```bash
+python3 cli/core/build_research_labels.py \
+  --db-path /path/to/market.duckdb \
+  --snapshot-id <snapshot_id> \
+  --dataset-id <dataset_id> \
+  --split-id <split_id> \
+  --memory-limit 24GB \
+  --threads 6 \
+  --temp-dir /path/to/tmp \
+  --max-abs-return 1.0 \
+  --verbose
+```
 
 Behavior:
-- canonicalizes staged short-volume rows
-- maintains `daily_short_volume_history`
+- dataset-scoped label build
+- forward returns: 1d / 5d / 20d
+- invalid close checks
+- extreme-return filtering via `--max-abs-return`
+- quality summary emitted as JSON/log lines
 
-### Short features
-Entry point:
-`python3 cli/core/build_short_features.py --db-path /path/to/market.duckdb --duckdb-threads 2 --duckdb-memory-limit 36GB`
+### Backtest build
+Entrypoint:
+
+```bash
+python3 cli/core/build_research_backtest.py \
+  --db-path /path/to/market.duckdb \
+  --dataset-id <dataset_id> \
+  --split-id <split_id> \
+  --transaction-cost-bps 10 \
+  --signal-threshold 0.5 \
+  --memory-limit 24GB \
+  --threads 6 \
+  --temp-dir /path/to/tmp \
+  --verbose
+```
 
 Behavior:
-- derives `short_features_daily`
-- uses monthly batching to avoid DuckDB OOM
-- joins short interest history onto daily short volume with PIT-safe logic
+- split-aware partitioning (`train`, `valid`, `test`)
+- long-only threshold rule on `short_volume_ratio`
+- turnover and cost accounting
+- JSON output stable enough for the runner
 
-## Daily orchestrator
+### Full experiment runner
+Entrypoint:
 
-Entry point:
-`python3 cli/run_daily_pipeline.py`
+```bash
+python3 cli/core/run_research_experiment.py \
+  --db-path /path/to/market.duckdb \
+  --snapshot-id <snapshot_id> \
+  --split-id <split_id> \
+  --experiment-name research_scientific_v3 \
+  --transaction-cost-bps 10 \
+  --signal-threshold 0.5 \
+  --memory-limit 24GB \
+  --threads 6 \
+  --temp-dir /path/to/tmp \
+  --verbose
+```
 
-Current order:
-1. prices
-2. FINRA daily short volume
-3. FINRA short interest
-4. short features
-5. SEC filings
+Behavior:
+- streams child stdout/stderr live
+- passes runtime settings to children
+- parses trailing JSON payloads robustly
+- writes experiment manifest only if all steps succeed
 
-Current incremental behavior:
-- prices still run each pass
-- FINRA daily short volume is skipped when raw and canonical max dates are already aligned
-- FINRA short interest noops when aligned
-- short features are skipped when the source signature is unchanged
-- SEC filings still run each pass by design for now
+## Operational notes
 
-## Known-good operational settings
+### Memory-heavy jobs
+For the large research path, current operational defaults in code are:
 
-### Heavy short feature build
-Use:
-- `--duckdb-threads 2`
-- `--duckdb-memory-limit 36GB`
+- `--memory-limit 24GB`
+- `--threads 6`
+- explicit `--temp-dir`
 
-This configuration successfully rebuilt roughly 33M+ short feature rows without exhausting memory.
+### Long-running price backfills
+Use the chunked Stooq loader for historical rebuilds; it is materially better than a one-big-glob approach for visibility and stability.
 
 ### Logging
-Write logs under `logs/`.
+The repository already uses `logs/` heavily. Keep heavy runs streamed and tee'd to log files.
 
-### Locking
-Do not keep a DuckDB writer connection open while launching another writer process against the same database.
+### DuckDB locking
+Do not open a second writer against the same `.duckdb` file while a heavy writer is already running.
 
-## Rebuild guidance
+## What is still not generalized
 
-Recommended order:
-1. schema foundations
-2. symbol normalization
-3. prices
-4. SEC filings
-5. FINRA short interest
-6. FINRA daily short volume
-7. short features
+The current research backtest is **not** yet a signal framework.
+It is still effectively:
 
-## What still matters most
+```text
+short_volume_ratio > threshold -> long, else flat
+```
 
-The repository is now in a good state for:
-- downstream research joins
-- short-interest / short-volume feature experimentation
-- signal generation
-- backtesting
+That means:
+- the runner is reusable
+- the dataset/labels/backtest plumbing is reusable
+- the signal logic is still strategy-specific
 
-The next layer of work is mostly around:
-- further incremental improvements
-- richer derived features
-- downstream research datasets
-- portfolio / strategy workflows
+A next step would be to decouple:
+1. features
+2. signal definition
+3. portfolio construction
+4. evaluation

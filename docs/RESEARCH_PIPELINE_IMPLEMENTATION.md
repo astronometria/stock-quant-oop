@@ -1,37 +1,79 @@
-# Research Pipeline Implementation Plan
+# Research Pipeline Implementation
 
-## Objectif immédiat
+## What is in production code today
 
-Transformer le moteur de recherche quant actuel en pipeline de test cross-sectional propre.
+The current scientific research path is:
 
-## Ordre cible
+1. `build_research_training_dataset.py`
+2. `build_research_labels.py`
+3. `build_research_backtest.py`
+4. `run_research_experiment.py`
 
-1. build_feature_engine
-2. build_label_engine
-3. build_dataset_builder
-4. build_backtest
+## Step 1: Dataset build
 
-## Objectif du backtest v1
+Source tables:
+- `price_history`
+- `short_features_daily`
+- split manifest metadata
+- snapshot metadata
 
-- ranking quotidien cross-sectional
-- top N long-only
-- equal weight
-- holding 1 jour
-- rebalance daily
+Output:
+- `research_training_dataset`
 
-## Contraintes
+Characteristics:
+- month-by-month chunking
+- backward as-of feature join
+- memory-limit / threads / temp-dir runtime controls
+- operator-visible progress logs
 
-- utiliser price_history uniquement
-- ne jamais utiliser price_latest
-- labels séparés des features
-- dataset point-in-time
-- une seule ligne par (symbol, as_of_date)
+## Step 2: Labels build
 
-## Livrables v1
+Source tables:
+- `research_training_dataset`
+- `price_history`
 
-- diagnostic du pipeline recherche actuel
-- inventaire des colonnes du dataset builder
-- inventaire des colonnes du feature engine
-- inventaire des labels disponibles
-- plan de refactor du backtester
+Output:
+- `research_labels`
 
+Characteristics:
+- dataset-scoped label generation
+- 1d, 5d, 20d forward returns
+- bad-close checks
+- optional extreme-return sanitization through `--max-abs-return`
+
+## Step 3: Backtest build
+
+Source tables:
+- `research_training_dataset`
+- `research_labels`
+- split manifest
+
+Output:
+- `research_backtest`
+
+Characteristics:
+- threshold-based long-only signal on `short_volume_ratio`
+- split-aware reporting
+- transaction-cost aware metrics
+
+## Step 4: Experiment orchestration
+
+`run_research_experiment.py` now:
+- streams child logs live
+- passes runtime settings consistently
+- parses final child JSON robustly
+- writes experiment metadata only after full success
+
+## Known limitations
+
+- signal logic is still tied to short-interest/short-volume feature usage
+- there is no generalized factor registry yet
+- portfolio construction is still very simple
+- labels are cleaner after sanitization, but the research path is not yet a multi-signal framework
+
+## Recommended near-term roadmap
+
+1. keep dataset build generic
+2. add more feature columns
+3. externalize signal definitions from backtest code
+4. support multiple strategy families without rewriting the backtest step

@@ -1,50 +1,61 @@
 # Dataset Versioning
 
-Objectif :
+## Current versioning model in the codebase
 
-Versionner les datasets PIT pour garantir la reproductibilité exacte des backtests
-et des entraînements.
+The repository now versions research artifacts primarily through explicit ids rather than the older `dataset_versions` wording.
 
-Pattern :
+Key identities in current research flow:
 
-normalized / PIT dataset
-↓
-dataset version
-↓
-frozen training artifact
+- `snapshot_id`
+- `split_id`
+- `dataset_id`
+- `backtest_id`
+- `experiment_id`
 
-## Tables logiques
+## Practical meaning
 
-- training_dataset_daily
-- dataset_versions
+### `snapshot_id`
+Identifies the research snapshot or source selection used to build a dataset.
 
-## Règles
+### `split_id`
+Defines the train/valid/test windows.
 
-1. Une version de dataset doit être immutable après publication.
-2. Une version doit contenir au minimum :
-   - dataset_name
-   - dataset_version
-   - built_at
-   - row_count
-   - start_date
-   - end_date
-   - source_tables_json
-3. Les backtests doivent référencer une version explicite.
-4. Les modèles doivent référencer une version explicite.
+### `dataset_id`
+Identifies a concrete built dataset in `research_training_dataset`.
 
-## Flux cible
+### `backtest_id`
+Identifies one concrete evaluation run in `research_backtest`.
 
-price_history
-fundamental_features_daily
-short_features_daily
-market_universe
-↓
-training_dataset_daily
-↓
-dataset_versions
+### `experiment_id`
+Identifies the orchestrated run persisted by `run_research_experiment.py`.
 
-## Anti-biais
+## Reproducibility rule
 
-- Le dataset versionné doit être construit à partir du dataset PIT
-- jamais à partir de tables latest
-- jamais à partir de raw
+A backtest is only truly reproducible if it keeps all of the following stable:
+
+- source canonical tables
+- snapshot
+- split
+- dataset id
+- label sanitization settings
+- backtest transaction costs and thresholds
+
+## Current manifest flow
+
+```text
+snapshot_id + split_id
+-> dataset_id
+-> backtest_id
+-> experiment_id
+```
+
+## Why older wording is stale
+
+Earlier docs referred to:
+- `training_dataset_daily`
+- `dataset_versions`
+
+The current implementation is more explicit and operational:
+- frozen rows live in `research_training_dataset`
+- experiment metadata is persisted by the research experiment repository
+- ids are carried explicitly through the pipeline rather than inferred from a generic dataset-version object

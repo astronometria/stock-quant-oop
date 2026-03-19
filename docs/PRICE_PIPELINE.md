@@ -1,89 +1,110 @@
 # Price Pipeline
 
-## Objectif
+## Goal
 
-Le domaine PRICES suit le pattern officiel :
+Build and maintain price history that is usable for research and backtesting without relying on serving-only snapshots.
 
-raw
-↓
-normalized
-↓
-derived
-
-## Couches
+## Current layers
 
 ### Raw
+Representative raw tables include:
+- `price_source_daily_raw_all`
+- `price_source_daily_raw_yahoo`
+- other raw price staging tables maintained by the repository
 
-Tables raw actuelles :
+Raw tables are:
+- auditable
+- staging-oriented
+- not the final research interface
 
-- price_source_daily_raw
-- price_source_daily_raw_all
-- price_source_daily_raw_yahoo
+### Canonical
+Canonical research-facing table:
+- `price_history`
 
-Règles :
+This is the table that research builders should prefer.
 
-- append-only
-- auditables
-- ne jamais servir directement aux backtests
+### Serving
+Serving-only convenience table:
+- `price_latest`
 
-### Normalized
+`price_latest` is useful for:
+- latest-state inspection
+- operational sanity checks
+- quick UI/debug queries
 
-Table canonique :
+It should not be the source for:
+- feature generation
+- label generation
+- research datasets
+- backtests
 
-- price_history
+## Current entrypoints
 
-Règles :
+### Build prices
 
-- déterministe
-- idempotente
-- utilisée par les pipelines de recherche
-- point d’entrée unique pour features / labels / backtests
+```bash
+python3 cli/core/build_prices.py --db-path /path/to/market.duckdb --mode daily --verbose
+```
 
-### Derived
+Modes supported by current code:
+- `daily`
+- `backfill`
 
-Table derived :
+### Build research-grade price tables
 
-- price_latest
+```bash
+python3 cli/core/build_prices_research.py --db-path /path/to/market.duckdb --verbose
+```
 
-Règles :
+### Load full Stooq directory
 
-- serving only
-- snapshot opérationnel
-- debug / inspection / monitoring
-- ne jamais être utilisée pour features / labels / datasets / backtests
+```bash
+python3 cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py \
+  --db-path /path/to/market.duckdb \
+  --root-dir /path/to/data/raw/stooq/daily/us \
+  --truncate \
+  --memory-limit 24GB \
+  --threads 8 \
+  --temp-dir /path/to/tmp \
+  --verbose
+```
 
-## Sources
+## Provider model visible in current code
 
-### Rebuild from scratch
+### Daily path
+- Yahoo Finance through `YfinancePriceProvider`
 
-- Stooq historical backfill obligatoire
+### Historical path
+- local historical sources through `HistoricalPriceProvider`
+- extracted Stooq directories can be loaded in large chunked SQL-first batches
 
-### Daily refresh
+## Current operational pattern
 
-- Yahoo Finance via yfinance
+A practical rebuild sequence is:
 
-## Règles anti-biais
+1. load historical raw prices from Stooq/local sources
+2. rebuild or refresh canonical prices
+3. run daily Yahoo refresh for the latest window
+4. rebuild `price_latest`
+5. only then run research builders
 
-1. Les pipelines de recherche lisent uniquement `price_history`.
-2. `price_latest` est interdit pour :
-   - features
-   - labels
-   - datasets
-   - backtests
-3. Le rebuild complet doit faire :
-   - backfill Stooq
-   - puis daily Yahoo
-4. Les raw prices multi-sources doivent converger vers une seule normalized canonique :
-   - `price_history`
+## Why the chunked Stooq loader matters
 
-## Flux cible
+The repository now contains a chunked loader for extracted Stooq trees because the one-big-glob approach was prone to:
+- long silent waits
+- high memory pressure
+- poor operator visibility
 
-Stooq / Yahoo
-↓
-price_source_daily_raw_*
-↓
-price_source_daily_raw_all
-↓
-price_history
-↓
-price_latest
+The chunked version keeps:
+- SQL-first CSV parsing inside DuckDB
+- thin Python orchestration
+- per-chunk progress and table stats
+
+## Bias control
+
+Research should consume `price_history`, not raw tables and not `price_latest`.
+
+That keeps:
+- point-in-time discipline
+- cleaner rebuild semantics
+- easier reproducibility across datasets and experiments
