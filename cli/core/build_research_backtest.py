@@ -1,6 +1,33 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Research backtest builder.
+
+Objectif
+--------
+Construire un backtest long-only, split-aware et transaction-cost aware
+à partir de:
+- research_training_dataset
+- research_labels
+- research_split_manifest
+
+Améliorations
+-------------
+- support --verbose
+- support --memory-limit
+- support --threads
+- support --temp-dir
+- conserve une logique SQL-first
+- sortie JSON finale stable pour le runner
+
+Important
+---------
+- signal simple: long si short_volume_ratio > threshold, sinon flat
+- retour utilisé: fwd_return_1d
+- coûts de transaction en bps appliqués sur le turnover unitaire
+"""
+
 import argparse
 import json
 from datetime import datetime, timezone
@@ -21,6 +48,11 @@ def _backtest_id(dataset_id: str, split_id: str) -> str:
     return f"{dataset_id}_{split_id}_bt_{_now().strftime('%Y%m%dT%H%M%SZ')}"
 
 
+def _log(message: str, verbose: bool) -> None:
+    if verbose:
+        print(message, flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
@@ -28,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split-id", required=True)
     p.add_argument("--transaction-cost-bps", type=float, default=10.0)
     p.add_argument("--signal-threshold", type=float, default=0.5)
+
+    # Alignement runtime avec les autres scripts research.
+    p.add_argument("--memory-limit", default="24GB")
+    p.add_argument("--threads", type=int, default=6)
+    p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
+    p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
 
@@ -39,6 +77,22 @@ def main() -> int:
 
     con = duckdb.connect(str(db))
     try:
+        # Réglages DuckDB homogènes avec le reste de la pipeline.
+        con.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
+        con.execute(f"PRAGMA threads={args.threads}")
+        con.execute("PRAGMA preserve_insertion_order=false")
+
+        temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
+        con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
+
+        _log(f"[backtest] memory_limit={args.memory_limit}", args.verbose)
+        _log(f"[backtest] threads={args.threads}", args.verbose)
+        _log(f"[backtest] temp_dir={temp_dir_sql}", args.verbose)
+        _log(f"[backtest] dataset_id={args.dataset_id}", args.verbose)
+        _log(f"[backtest] split_id={args.split_id}", args.verbose)
+        _log(f"[backtest] transaction_cost_bps={args.transaction_cost_bps}", args.verbose)
+        _log(f"[backtest] signal_threshold={args.signal_threshold}", args.verbose)
+
         ResearchBacktestSchemaManager(con).ensure_tables()
 
         split = con.execute(
@@ -64,6 +118,7 @@ def main() -> int:
 
         backtest_id = _backtest_id(args.dataset_id, args.split_id)
 
+        # Idempotence simple pour ce dataset/split.
         con.execute(
             """
             DELETE FROM research_backtest
@@ -132,7 +187,8 @@ def main() -> int:
                 AVG(net_strategy_return) AS avg_net,
                 STDDEV_SAMP(net_strategy_return) AS volatility,
                 CASE
-                    WHEN STDDEV_SAMP(net_strategy_return) IS NULL OR STDDEV_SAMP(net_strategy_return) = 0
+                    WHEN STDDEV_SAMP(net_strategy_return) IS NULL
+                      OR STDDEV_SAMP(net_strategy_return) = 0
                     THEN NULL
                     ELSE AVG(net_strategy_return) / STDDEV_SAMP(net_strategy_return)
                 END AS sharpe,
@@ -148,9 +204,12 @@ def main() -> int:
             END
             """,
             [
-                train_start, train_end,
-                valid_start, valid_end,
-                test_start, test_end,
+                train_start,
+                train_end,
+                valid_start,
+                valid_end,
+                test_start,
+                test_end,
                 args.signal_threshold,
                 args.dataset_id,
                 args.transaction_cost_bps,
@@ -158,9 +217,21 @@ def main() -> int:
             ],
         ).fetchall()
 
-        results = []
+        results: list[dict[str, object]] = []
+
         for row in rows:
-            partition_name, avg_gross, gross_return, total_cost, net_return, avg_net, volatility, sharpe, turnover, n_obs = row
+            (
+                partition_name,
+                avg_gross,
+                gross_return,
+                total_cost,
+                net_return,
+                avg_net,
+                volatility,
+                sharpe,
+                turnover,
+                n_obs,
+            ) = row
 
             con.execute(
                 """
@@ -215,14 +286,20 @@ def main() -> int:
                 }
             )
 
-        print(json.dumps({
-            "backtest_id": backtest_id,
-            "dataset_id": args.dataset_id,
-            "split_id": args.split_id,
-            "transaction_cost_bps": args.transaction_cost_bps,
-            "signal_threshold": args.signal_threshold,
-            "partitions": results,
-        }, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "backtest_id": backtest_id,
+                    "dataset_id": args.dataset_id,
+                    "split_id": args.split_id,
+                    "transaction_cost_bps": args.transaction_cost_bps,
+                    "signal_threshold": args.signal_threshold,
+                    "partitions": results,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         return 0
 
     finally:
