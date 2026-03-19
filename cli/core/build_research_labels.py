@@ -2,30 +2,42 @@
 from __future__ import annotations
 
 """
-Scientific-grade, SQL-first label builder for research_labels.
+Dataset-scoped, SQL-first, memory-safe builder for research_labels.
 
 Objectif
 --------
-Construire des labels forward returns robustes à partir de price_history, avec:
-- garde-fous contre les prix nuls / négatifs
-- filtre anti-outliers extrêmes
-- paramètres runtime alignés avec les autres builders
-- logs visibles en mode verbose
-- sortie JSON finale compatible avec run_research_experiment.py
+Construire research_labels de façon reproductible et propre à partir
+du dataset de recherche déjà figé dans research_training_dataset.
+
+Pourquoi cette version
+----------------------
+L'ancienne version calculait les labels directement depuis tout price_history
+dans une grande fenêtre de dates. Cela avait plusieurs défauts:
+- les métriques "rows" pouvaient être trompeuses par rapport au dataset ciblé
+- le travail était plus large que nécessaire
+- les résultats étaient moins propres quand on compare plusieurs variantes
+  de dataset (all symbols, common_only, etc.)
+- les outliers extrêmes de prix pouvaient contaminer la distribution des labels
+
+Cette version:
+- est strictement dataset-scoped
+- calcule les labels uniquement pour les lignes du dataset demandé
+- garde une logique SQL-first
+- ajoute des réglages runtime cohérents avec les autres scripts:
+  --verbose
+  --memory-limit
+  --threads
+  --temp-dir
+- permet de filtrer les rendements extrêmes avec --max-abs-return
+- produit un résumé qualité utile pour le diagnostic
 
 Principes
 ---------
-- SQL-first: DuckDB fait le gros du travail
-- PIT-safe: uniquement des LEAD() sur la série de prix
-- Python mince: orchestration + logs + configuration
-- Robustesse: on neutralise les labels absurdes plutôt que de laisser le backtest exploser
-
-Important
----------
-On garde volontairement les lignes du dataset, mais les labels extrêmes deviennent NULL.
-Cela permet:
-- de conserver la reproductibilité du dataset
-- d'éviter que quelques séries corrompues dominent les résultats
+- point-in-time safe côté features: les labels restent forward-looking ici,
+  mais ne sont jamais utilisés pour construire les features
+- SQL-first pour les transformations
+- Python mince pour l'orchestration, les validations et le reporting
+- beaucoup de commentaires pour aider les autres développeurs
 """
 
 import argparse
@@ -34,14 +46,22 @@ from pathlib import Path
 
 import duckdb
 
+from stock_quant.infrastructure.db.research_labels_schema import (
+    ResearchLabelsSchemaManager,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers généraux
+# ---------------------------------------------------------------------------
 
 def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     """
-    Vérifie l'existence d'une table dans la base courante.
+    Vérifie l'existence d'une table.
 
     Pourquoi:
-    - certains environnements de test peuvent avoir un schéma partiel
-    - on veut une erreur explicite si price_history ou le schéma research manque
+    - éviter des erreurs moins lisibles plus loin
+    - garder un message clair si un prérequis manque
     """
     row = con.execute(
         """
@@ -59,11 +79,12 @@ def _choose_price_date_column(
     table_name: str = "price_history",
 ) -> str:
     """
-    Détecte la colonne date effective de la table de prix.
+    Détecte dynamiquement la colonne de date du prix.
 
     Pourquoi:
-    - le projet a déjà vécu plusieurs itérations de schéma
-    - on veut rester compatible si le nom exact a changé
+    - certaines bases existantes peuvent avoir "date"
+    - d'autres peuvent avoir "price_date", "trade_date", etc.
+    - on veut rester compatible avec la DB actuelle sans casser
     """
     if not _table_exists(con, table_name):
         raise RuntimeError(f"{table_name} does not exist")
@@ -91,76 +112,86 @@ def _choose_price_date_column(
     )
 
 
+def _normalize_temp_dir(path_str: str) -> tuple[Path, str]:
+    """
+    Normalise le chemin temp_dir pour l'affichage et le PRAGMA DuckDB.
+    """
+    path = Path(path_str).expanduser().resolve()
+    sql_value = str(path).replace("'", "''")
+    return path, sql_value
+
+
 def parse_args() -> argparse.Namespace:
     """
     Parse les arguments CLI.
 
-    On aligne volontairement cette interface sur les autres builders research pour
-    simplifier l'orchestration depuis run_research_experiment.py.
+    Important:
+    - on aligne l'interface avec les autres scripts lourds du pipeline
+    - cela permet au runner parent de propager la config runtime sans surprise
     """
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--snapshot-id", required=True)
     p.add_argument("--dataset-id", required=True)
     p.add_argument("--split-id", required=True)
-
-    # Réglages DuckDB / runtime alignés avec les autres scripts.
     p.add_argument("--memory-limit", default="24GB")
     p.add_argument("--threads", type=int, default=6)
     p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
-    p.add_argument("--verbose", action="store_true")
-
-    # Garde-fou sanitaire configurable.
     p.add_argument(
         "--max-abs-return",
         type=float,
         default=1.0,
         help=(
-            "Maximum absolute forward return allowed before the label is nulled. "
-            "Default=1.0 means any move beyond +/-100%% is discarded."
+            "Set returns with absolute value greater than this threshold to NULL. "
+            "Example: 1.0 means filter anything beyond +/-100%%."
         ),
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose diagnostic output.",
     )
     return p.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
+    temp_dir_path, temp_dir_sql = _normalize_temp_dir(args.temp_dir)
 
     print(f"[build_research_labels] db_path={db_path}", flush=True)
 
     con = duckdb.connect(str(db_path))
     try:
-        # ------------------------------------------------------------------
-        # Réglages DuckDB.
-        # ------------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # Réglages DuckDB pour gros workloads.
+        # -------------------------------------------------------------------
         con.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
         con.execute(f"PRAGMA threads={args.threads}")
         con.execute("PRAGMA preserve_insertion_order=false")
-
-        temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
         con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
 
-        # ------------------------------------------------------------------
-        # Validation schéma minimal requis.
-        # ------------------------------------------------------------------
-        if not _table_exists(con, "research_labels"):
-            raise RuntimeError("research_labels table not found; initialize research foundation first")
+        ResearchLabelsSchemaManager(con).ensure_tables()
+
+        # -------------------------------------------------------------------
+        # Vérification des prérequis.
+        # -------------------------------------------------------------------
+        if not _table_exists(con, "research_training_dataset"):
+            raise RuntimeError("research_training_dataset does not exist")
 
         if not _table_exists(con, "research_dataset_manifest"):
-            raise RuntimeError("research_dataset_manifest table not found")
+            raise RuntimeError("research_dataset_manifest does not exist")
 
         if not _table_exists(con, "research_split_manifest"):
-            raise RuntimeError("research_split_manifest table not found")
+            raise RuntimeError("research_split_manifest does not exist")
 
         if not _table_exists(con, "price_history"):
-            raise RuntimeError("price_history table not found")
+            raise RuntimeError("price_history does not exist")
 
-        price_date_col = _choose_price_date_column(con, "price_history")
-
-        # ------------------------------------------------------------------
-        # Validation snapshot + split.
-        # ------------------------------------------------------------------
         snap = con.execute(
             """
             SELECT status
@@ -173,7 +204,7 @@ def main() -> int:
         if snap is None:
             raise RuntimeError("snapshot not found")
 
-        if snap[0] != "completed":
+        if str(snap[0]).strip().lower() != "completed":
             raise RuntimeError("snapshot not completed")
 
         split = con.execute(
@@ -207,21 +238,54 @@ def main() -> int:
             embargo_days,
         ) = split
 
-        if args.max_abs_return <= 0:
-            raise RuntimeError("--max-abs-return must be > 0")
+        price_date_col = _choose_price_date_column(con, "price_history")
+
+        # -------------------------------------------------------------------
+        # Vérifie que le dataset ciblé existe réellement dans
+        # research_training_dataset.
+        # -------------------------------------------------------------------
+        dataset_probe = con.execute(
+            """
+            SELECT
+                COUNT(*) AS rows,
+                COUNT(DISTINCT symbol) AS symbols,
+                MIN(as_of_date) AS min_as_of_date,
+                MAX(as_of_date) AS max_as_of_date
+            FROM research_training_dataset
+            WHERE dataset_id = ?
+            """,
+            [args.dataset_id],
+        ).fetchone()
+
+        dataset_rows = int(dataset_probe[0] or 0)
+        dataset_symbols = int(dataset_probe[1] or 0)
+        dataset_min_date = dataset_probe[2]
+        dataset_max_date = dataset_probe[3]
+
+        if dataset_rows == 0:
+            raise RuntimeError(
+                f"dataset_id not found or empty in research_training_dataset: {args.dataset_id}"
+            )
+
+        print(f"[labels] memory_limit={args.memory_limit}", flush=True)
+        print(f"[labels] threads={args.threads}", flush=True)
+        print(f"[labels] temp_dir={temp_dir_path}", flush=True)
+        print(f"[labels] price_date_column={price_date_col}", flush=True)
+        print(f"[labels] date_range={train_start} -> {test_end}", flush=True)
+        print(f"[labels] embargo_days={embargo_days}", flush=True)
+        print(f"[labels] max_abs_return={args.max_abs_return}", flush=True)
 
         if args.verbose:
-            print(f"[labels] memory_limit={args.memory_limit}", flush=True)
-            print(f"[labels] threads={args.threads}", flush=True)
-            print(f"[labels] temp_dir={temp_dir_sql}", flush=True)
-            print(f"[labels] price_date_column={price_date_col}", flush=True)
-            print(f"[labels] date_range={train_start} -> {test_end}", flush=True)
-            print(f"[labels] embargo_days={embargo_days}", flush=True)
-            print(f"[labels] max_abs_return={args.max_abs_return}", flush=True)
+            print(
+                f"[labels] dataset_probe="
+                f'{{"rows": {dataset_rows}, "symbols": {dataset_symbols}, '
+                f'"min_as_of_date": "{dataset_min_date}", "max_as_of_date": "{dataset_max_date}"}}',
+                flush=True,
+            )
 
-        # ------------------------------------------------------------------
-        # Suppression de l'ancien dataset labels.
-        # ------------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # Nettoyage du dataset cible dans research_labels.
+        # -------------------------------------------------------------------
         con.execute(
             """
             DELETE FROM research_labels
@@ -229,24 +293,269 @@ def main() -> int:
             """,
             [args.dataset_id],
         )
+        print("[labels] previous dataset cleared", flush=True)
 
-        if args.verbose:
-            print("[labels] previous dataset cleared", flush=True)
+        # -------------------------------------------------------------------
+        # Étape 1: scope minimal du dataset.
+        #
+        # On ne garde que les colonnes nécessaires pour le calcul du label.
+        # Le DISTINCT protège contre d'éventuels doublons accidentels.
+        # -------------------------------------------------------------------
+        con.execute("DROP TABLE IF EXISTS tmp_dataset_scope")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_dataset_scope AS
+            SELECT DISTINCT
+                dataset_id,
+                snapshot_id,
+                symbol,
+                as_of_date,
+                close AS dataset_close
+            FROM research_training_dataset
+            WHERE dataset_id = ?
+              AND symbol IS NOT NULL
+              AND TRIM(symbol) <> ''
+              AND as_of_date IS NOT NULL
+            """,
+            [args.dataset_id],
+        )
 
-        # ------------------------------------------------------------------
-        # Construction des labels.
+        # -------------------------------------------------------------------
+        # Étape 2: on limite price_history aux seuls symbols du dataset.
         #
-        # Stratégie:
-        # 1) on calcule les close forward avec LEAD()
-        # 2) on calcule les rendements bruts
-        # 3) on NULL les labels invalides / extrêmes
+        # Pourquoi:
+        # - évite de calculer LEAD() pour des milliers de symbols inutiles
+        # - réduit fortement la pression mémoire
+        # - garde une exécution plus déterministe
         #
-        # Pourquoi ne pas supprimer la ligne ?
-        # - on préfère garder le dataset aligné par (symbol, as_of_date)
-        # - le backtest ne prendra que les labels non nuls
-        # ------------------------------------------------------------------
+        # Important:
+        # - on prend tout l'historique disponible de ces symbols jusqu'à la
+        #   date max du dataset + prix futurs présents dans la table
+        # - on ne coupe PAS au split_end avant les LEAD(), sinon on perdrait
+        #   artificiellement certaines forward returns de fin de période
+        # -------------------------------------------------------------------
+        con.execute("DROP TABLE IF EXISTS tmp_price_symbol_scope")
         con.execute(
             f"""
+            CREATE TEMP TABLE tmp_price_symbol_scope AS
+            SELECT
+                p.symbol,
+                p.{price_date_col} AS as_of_date,
+                p.close
+            FROM price_history p
+            INNER JOIN (
+                SELECT DISTINCT symbol
+                FROM tmp_dataset_scope
+            ) ds
+                ON ds.symbol = p.symbol
+            WHERE p.{price_date_col} IS NOT NULL
+              AND p.symbol IS NOT NULL
+              AND TRIM(p.symbol) <> ''
+            """,
+        )
+
+        if args.verbose:
+            price_scope_probe = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS rows,
+                    COUNT(DISTINCT symbol) AS symbols,
+                    MIN(as_of_date) AS min_as_of_date,
+                    MAX(as_of_date) AS max_as_of_date
+                FROM tmp_price_symbol_scope
+                """
+            ).fetchone()
+            print(
+                f"[labels] price_scope="
+                f'{{"rows": {int(price_scope_probe[0] or 0)}, '
+                f'"symbols": {int(price_scope_probe[1] or 0)}, '
+                f'"min_as_of_date": "{price_scope_probe[2]}", '
+                f'"max_as_of_date": "{price_scope_probe[3]}"}}',
+                flush=True,
+            )
+
+        # -------------------------------------------------------------------
+        # Étape 3: enrichissement des prix avec les closes futurs.
+        #
+        # LEAD() calcule les prix futurs sur la série réelle par symbole.
+        # Ensuite, on fera un LEFT JOIN sur les lignes exactes du dataset.
+        # -------------------------------------------------------------------
+        con.execute("DROP TABLE IF EXISTS tmp_price_enriched")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_price_enriched AS
+            SELECT
+                symbol,
+                as_of_date,
+                close AS close_t,
+                LEAD(close, 1) OVER (
+                    PARTITION BY symbol
+                    ORDER BY as_of_date
+                ) AS close_t1,
+                LEAD(close, 5) OVER (
+                    PARTITION BY symbol
+                    ORDER BY as_of_date
+                ) AS close_t5,
+                LEAD(close, 20) OVER (
+                    PARTITION BY symbol
+                    ORDER BY as_of_date
+                ) AS close_t20
+            FROM tmp_price_symbol_scope
+            """
+        )
+
+        # -------------------------------------------------------------------
+        # Étape 4: staging complet avec diagnostics qualité.
+        #
+        # On calcule d'abord les rendements bruts.
+        # Puis on applique le filtre max_abs_return.
+        # On garde des flags pour compter précisément ce qui a été filtré.
+        # -------------------------------------------------------------------
+        con.execute("DROP TABLE IF EXISTS tmp_label_stage")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_label_stage AS
+            WITH base AS (
+                SELECT
+                    ds.dataset_id,
+                    ds.snapshot_id,
+                    ds.symbol,
+                    ds.as_of_date,
+                    ds.dataset_close,
+                    pe.close_t,
+                    pe.close_t1,
+                    pe.close_t5,
+                    pe.close_t20
+                FROM tmp_dataset_scope ds
+                LEFT JOIN tmp_price_enriched pe
+                    ON pe.symbol = ds.symbol
+                   AND pe.as_of_date = ds.as_of_date
+            ),
+            raw_returns AS (
+                SELECT
+                    dataset_id,
+                    snapshot_id,
+                    symbol,
+                    as_of_date,
+
+                    dataset_close,
+                    close_t,
+                    close_t1,
+                    close_t5,
+                    close_t20,
+
+                    CASE
+                        WHEN COALESCE(close_t, dataset_close) IS NOT NULL
+                         AND COALESCE(close_t, dataset_close) > 0
+                         AND close_t1 IS NOT NULL
+                         AND close_t1 > 0
+                        THEN close_t1 / COALESCE(close_t, dataset_close) - 1
+                        ELSE NULL
+                    END AS raw_fwd_return_1d,
+
+                    CASE
+                        WHEN COALESCE(close_t, dataset_close) IS NOT NULL
+                         AND COALESCE(close_t, dataset_close) > 0
+                         AND close_t5 IS NOT NULL
+                         AND close_t5 > 0
+                        THEN close_t5 / COALESCE(close_t, dataset_close) - 1
+                        ELSE NULL
+                    END AS raw_fwd_return_5d,
+
+                    CASE
+                        WHEN COALESCE(close_t, dataset_close) IS NOT NULL
+                         AND COALESCE(close_t, dataset_close) > 0
+                         AND close_t20 IS NOT NULL
+                         AND close_t20 > 0
+                        THEN close_t20 / COALESCE(close_t, dataset_close) - 1
+                        ELSE NULL
+                    END AS raw_fwd_return_20d
+                FROM base
+            )
+            SELECT
+                dataset_id,
+                snapshot_id,
+                symbol,
+                as_of_date,
+
+                CASE
+                    WHEN raw_fwd_return_1d IS NOT NULL
+                     AND ABS(raw_fwd_return_1d) <= ?
+                    THEN raw_fwd_return_1d
+                    ELSE NULL
+                END AS fwd_return_1d,
+
+                CASE
+                    WHEN raw_fwd_return_5d IS NOT NULL
+                     AND ABS(raw_fwd_return_5d) <= ?
+                    THEN raw_fwd_return_5d
+                    ELSE NULL
+                END AS fwd_return_5d,
+
+                CASE
+                    WHEN raw_fwd_return_20d IS NOT NULL
+                     AND ABS(raw_fwd_return_20d) <= ?
+                    THEN raw_fwd_return_20d
+                    ELSE NULL
+                END AS fwd_return_20d,
+
+                CASE
+                    WHEN COALESCE(close_t, dataset_close) IS NULL
+                      OR COALESCE(close_t, dataset_close) <= 0
+                    THEN 1 ELSE 0
+                END AS bad_close_t,
+
+                CASE
+                    WHEN close_t1 IS NULL OR close_t1 <= 0
+                    THEN 1 ELSE 0
+                END AS bad_close_t1,
+
+                CASE
+                    WHEN close_t5 IS NULL OR close_t5 <= 0
+                    THEN 1 ELSE 0
+                END AS bad_close_t5,
+
+                CASE
+                    WHEN close_t20 IS NULL OR close_t20 <= 0
+                    THEN 1 ELSE 0
+                END AS bad_close_t20,
+
+                CASE
+                    WHEN raw_fwd_return_1d IS NOT NULL
+                     AND ABS(raw_fwd_return_1d) > ?
+                    THEN 1 ELSE 0
+                END AS extreme_1d_filtered,
+
+                CASE
+                    WHEN raw_fwd_return_5d IS NOT NULL
+                     AND ABS(raw_fwd_return_5d) > ?
+                    THEN 1 ELSE 0
+                END AS extreme_5d_filtered,
+
+                CASE
+                    WHEN raw_fwd_return_20d IS NOT NULL
+                     AND ABS(raw_fwd_return_20d) > ?
+                    THEN 1 ELSE 0
+                END AS extreme_20d_filtered
+            FROM raw_returns
+            """,
+            [
+                args.max_abs_return,
+                args.max_abs_return,
+                args.max_abs_return,
+                args.max_abs_return,
+                args.max_abs_return,
+                args.max_abs_return,
+            ],
+        )
+
+        # -------------------------------------------------------------------
+        # Étape 5: insertion finale dans research_labels.
+        #
+        # On n'insère que les colonnes métiers du schéma cible.
+        # -------------------------------------------------------------------
+        con.execute(
+            """
             INSERT INTO research_labels (
                 dataset_id,
                 snapshot_id,
@@ -256,226 +565,103 @@ def main() -> int:
                 fwd_return_5d,
                 fwd_return_20d
             )
-            WITH base AS (
-                SELECT
-                    p.symbol,
-                    p.{price_date_col} AS as_of_date,
-                    p.close AS close_t,
-
-                    LEAD(p.close, 1) OVER w AS close_t1,
-                    LEAD(p.close, 5) OVER w AS close_t5,
-                    LEAD(p.close, 20) OVER w AS close_t20
-
-                FROM price_history p
-                WHERE p.{price_date_col} IS NOT NULL
-                  AND p.symbol IS NOT NULL
-                  AND TRIM(p.symbol) <> ''
-                  AND p.{price_date_col} BETWEEN ? AND ?
-                WINDOW w AS (
-                    PARTITION BY p.symbol
-                    ORDER BY p.{price_date_col}
-                )
-            ),
-            raw_returns AS (
-                SELECT
-                    symbol,
-                    as_of_date,
-                    close_t,
-                    close_t1,
-                    close_t5,
-                    close_t20,
-
-                    CASE
-                        WHEN close_t IS NULL OR close_t <= 0 THEN NULL
-                        WHEN close_t1 IS NULL OR close_t1 <= 0 THEN NULL
-                        ELSE (close_t1 / close_t) - 1
-                    END AS raw_fwd_return_1d,
-
-                    CASE
-                        WHEN close_t IS NULL OR close_t <= 0 THEN NULL
-                        WHEN close_t5 IS NULL OR close_t5 <= 0 THEN NULL
-                        ELSE (close_t5 / close_t) - 1
-                    END AS raw_fwd_return_5d,
-
-                    CASE
-                        WHEN close_t IS NULL OR close_t <= 0 THEN NULL
-                        WHEN close_t20 IS NULL OR close_t20 <= 0 THEN NULL
-                        ELSE (close_t20 / close_t) - 1
-                    END AS raw_fwd_return_20d
-
-                FROM base
-            )
             SELECT
-                ? AS dataset_id,
-                ? AS snapshot_id,
+                dataset_id,
+                snapshot_id,
                 symbol,
                 as_of_date,
-
-                CASE
-                    WHEN raw_fwd_return_1d IS NULL THEN NULL
-                    WHEN ABS(raw_fwd_return_1d) > ? THEN NULL
-                    ELSE raw_fwd_return_1d
-                END AS fwd_return_1d,
-
-                CASE
-                    WHEN raw_fwd_return_5d IS NULL THEN NULL
-                    WHEN ABS(raw_fwd_return_5d) > ? THEN NULL
-                    ELSE raw_fwd_return_5d
-                END AS fwd_return_5d,
-
-                CASE
-                    WHEN raw_fwd_return_20d IS NULL THEN NULL
-                    WHEN ABS(raw_fwd_return_20d) > ? THEN NULL
-                    ELSE raw_fwd_return_20d
-                END AS fwd_return_20d
-
-            FROM raw_returns
-            """,
-            [
-                train_start,
-                test_end,
-                args.dataset_id,
-                args.snapshot_id,
-                args.max_abs_return,
-                args.max_abs_return,
-                args.max_abs_return,
-            ],
+                fwd_return_1d,
+                fwd_return_5d,
+                fwd_return_20d
+            FROM tmp_label_stage
+            """
         )
 
-        # ------------------------------------------------------------------
-        # Statistiques de qualité.
-        #
-        # On recalcule les stats depuis la table cible pour:
-        # - exposer des métriques utiles au log final
-        # - faciliter les probes en prod
-        # ------------------------------------------------------------------
-        stats = con.execute(
+        # -------------------------------------------------------------------
+        # Étape 6: résumé qualité.
+        # -------------------------------------------------------------------
+        quality_row = con.execute(
             """
             SELECT
-                COUNT(*) AS total_rows,
-
+                COUNT(*) AS rows,
                 COUNT(fwd_return_1d) AS labeled_rows_1d,
                 COUNT(fwd_return_5d) AS labeled_rows_5d,
                 COUNT(fwd_return_20d) AS labeled_rows_20d,
 
-                MIN(as_of_date) AS min_as_of_date,
-                MAX(as_of_date) AS max_as_of_date,
+                SUM(bad_close_t) AS bad_close_t_rows,
+                SUM(bad_close_t1) AS bad_close_t1_rows,
+                SUM(bad_close_t5) AS bad_close_t5_rows,
+                SUM(bad_close_t20) AS bad_close_t20_rows,
 
-                MIN(fwd_return_1d) AS min_ret_1d,
-                MAX(fwd_return_1d) AS max_ret_1d,
-                AVG(fwd_return_1d) AS avg_ret_1d,
-                STDDEV_SAMP(fwd_return_1d) AS std_ret_1d
+                SUM(extreme_1d_filtered) AS extreme_1d_rows_filtered,
+                SUM(extreme_5d_filtered) AS extreme_5d_rows_filtered,
+                SUM(extreme_20d_filtered) AS extreme_20d_rows_filtered,
+
+                MIN(fwd_return_1d) AS retained_1d_min,
+                MAX(fwd_return_1d) AS retained_1d_max,
+                AVG(fwd_return_1d) AS retained_1d_avg,
+                STDDEV_SAMP(fwd_return_1d) AS retained_1d_std,
+
+                MIN(as_of_date) AS min_as_of_date,
+                MAX(as_of_date) AS max_as_of_date
+            FROM tmp_label_stage
+            """
+        ).fetchone()
+
+        quality = {
+            "max_abs_return": float(args.max_abs_return),
+            "labeled_rows_1d": int(quality_row[1] or 0),
+            "labeled_rows_5d": int(quality_row[2] or 0),
+            "labeled_rows_20d": int(quality_row[3] or 0),
+            "bad_close_t_rows": int(quality_row[4] or 0),
+            "bad_close_t1_rows": int(quality_row[5] or 0),
+            "bad_close_t5_rows": int(quality_row[6] or 0),
+            "bad_close_t20_rows": int(quality_row[7] or 0),
+            "extreme_1d_rows_filtered": int(quality_row[8] or 0),
+            "extreme_5d_rows_filtered": int(quality_row[9] or 0),
+            "extreme_20d_rows_filtered": int(quality_row[10] or 0),
+            "retained_1d_min": float(quality_row[11]) if quality_row[11] is not None else None,
+            "retained_1d_max": float(quality_row[12]) if quality_row[12] is not None else None,
+            "retained_1d_avg": float(quality_row[13]) if quality_row[13] is not None else None,
+            "retained_1d_std": float(quality_row[14]) if quality_row[14] is not None else None,
+            "min_as_of_date": str(quality_row[15]) if quality_row[15] is not None else None,
+            "max_as_of_date": str(quality_row[16]) if quality_row[16] is not None else None,
+        }
+
+        print(
+            f"[labels] quality_summary={json.dumps(quality, sort_keys=True)}",
+            flush=True,
+        )
+
+        # -------------------------------------------------------------------
+        # Étape 7: payload final.
+        # Important:
+        # - "rows" doit refléter exactement le dataset_id courant
+        # - plus de confusion avec un calcul hors scope
+        # -------------------------------------------------------------------
+        final_count = con.execute(
+            """
+            SELECT COUNT(*)
             FROM research_labels
             WHERE dataset_id = ?
             """,
             [args.dataset_id],
-        ).fetchone()
+        ).fetchone()[0]
 
-        # Comptes d'anomalies calculés directement sur price_history sur la même fenêtre.
-        anomaly_stats = con.execute(
-            f"""
-            WITH base AS (
-                SELECT
-                    p.symbol,
-                    p.{price_date_col} AS as_of_date,
-                    p.close AS close_t,
-                    LEAD(p.close, 1) OVER (
-                        PARTITION BY p.symbol
-                        ORDER BY p.{price_date_col}
-                    ) AS close_t1,
-                    LEAD(p.close, 5) OVER (
-                        PARTITION BY p.symbol
-                        ORDER BY p.{price_date_col}
-                    ) AS close_t5,
-                    LEAD(p.close, 20) OVER (
-                        PARTITION BY p.symbol
-                        ORDER BY p.{price_date_col}
-                    ) AS close_t20
-                FROM price_history p
-                WHERE p.{price_date_col} IS NOT NULL
-                  AND p.symbol IS NOT NULL
-                  AND TRIM(p.symbol) <> ''
-                  AND p.{price_date_col} BETWEEN ? AND ?
-            ),
-            raw_returns AS (
-                SELECT
-                    *,
-                    CASE
-                        WHEN close_t IS NULL OR close_t <= 0 THEN NULL
-                        WHEN close_t1 IS NULL OR close_t1 <= 0 THEN NULL
-                        ELSE (close_t1 / close_t) - 1
-                    END AS raw_fwd_return_1d,
-                    CASE
-                        WHEN close_t IS NULL OR close_t <= 0 THEN NULL
-                        WHEN close_t5 IS NULL OR close_t5 <= 0 THEN NULL
-                        ELSE (close_t5 / close_t) - 1
-                    END AS raw_fwd_return_5d,
-                    CASE
-                        WHEN close_t IS NULL OR close_t <= 0 THEN NULL
-                        WHEN close_t20 IS NULL OR close_t20 <= 0 THEN NULL
-                        ELSE (close_t20 / close_t) - 1
-                    END AS raw_fwd_return_20d
-                FROM base
-            )
-            SELECT
-                SUM(CASE WHEN close_t IS NULL OR close_t <= 0 THEN 1 ELSE 0 END) AS bad_close_t_rows,
-                SUM(CASE WHEN close_t1 IS NOT NULL AND close_t1 <= 0 THEN 1 ELSE 0 END) AS bad_close_t1_rows,
-                SUM(CASE WHEN close_t5 IS NOT NULL AND close_t5 <= 0 THEN 1 ELSE 0 END) AS bad_close_t5_rows,
-                SUM(CASE WHEN close_t20 IS NOT NULL AND close_t20 <= 0 THEN 1 ELSE 0 END) AS bad_close_t20_rows,
-
-                SUM(CASE WHEN raw_fwd_return_1d IS NOT NULL AND ABS(raw_fwd_return_1d) > ? THEN 1 ELSE 0 END) AS extreme_1d_rows,
-                SUM(CASE WHEN raw_fwd_return_5d IS NOT NULL AND ABS(raw_fwd_return_5d) > ? THEN 1 ELSE 0 END) AS extreme_5d_rows,
-                SUM(CASE WHEN raw_fwd_return_20d IS NOT NULL AND ABS(raw_fwd_return_20d) > ? THEN 1 ELSE 0 END) AS extreme_20d_rows
-            FROM raw_returns
-            """,
-            [
-                train_start,
-                test_end,
-                args.max_abs_return,
-                args.max_abs_return,
-                args.max_abs_return,
-            ],
-        ).fetchone()
-
-        result = {
+        output = {
             "dataset_id": args.dataset_id,
             "snapshot_id": args.snapshot_id,
-            "split_id": split_id,
-            "rows": int(stats[0] or 0),
+            "split_id": args.split_id,
+            "rows": int(final_count),
             "price_date_column": price_date_col,
             "date_window": {
                 "start": str(train_start),
                 "end": str(test_end),
             },
-            "quality": {
-                "max_abs_return": float(args.max_abs_return),
-                "labeled_rows_1d": int(stats[1] or 0),
-                "labeled_rows_5d": int(stats[2] or 0),
-                "labeled_rows_20d": int(stats[3] or 0),
-                "bad_close_t_rows": int(anomaly_stats[0] or 0),
-                "bad_close_t1_rows": int(anomaly_stats[1] or 0),
-                "bad_close_t5_rows": int(anomaly_stats[2] or 0),
-                "bad_close_t20_rows": int(anomaly_stats[3] or 0),
-                "extreme_1d_rows_filtered": int(anomaly_stats[4] or 0),
-                "extreme_5d_rows_filtered": int(anomaly_stats[5] or 0),
-                "extreme_20d_rows_filtered": int(anomaly_stats[6] or 0),
-                "retained_1d_min": float(stats[6]) if stats[6] is not None else None,
-                "retained_1d_max": float(stats[7]) if stats[7] is not None else None,
-                "retained_1d_avg": float(stats[8]) if stats[8] is not None else None,
-                "retained_1d_std": float(stats[9]) if stats[9] is not None else None,
-                "min_as_of_date": str(stats[4]) if stats[4] is not None else None,
-                "max_as_of_date": str(stats[5]) if stats[5] is not None else None,
-            },
+            "quality": quality,
         }
 
-        if args.verbose:
-            print(
-                "[labels] quality_summary="
-                + json.dumps(result["quality"], sort_keys=True),
-                flush=True,
-            )
-
-        print(json.dumps(result, indent=2), flush=True)
+        print(json.dumps(output, indent=2), flush=True)
         return 0
 
     finally:
