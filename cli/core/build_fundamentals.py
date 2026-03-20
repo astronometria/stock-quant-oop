@@ -531,7 +531,7 @@ def main() -> int:
         con.execute(
             f"""
             CREATE TEMP TABLE tmp_fundamental_ttm AS
-            WITH trailing AS (
+            WITH trailing_window AS (
                 SELECT
                     b.company_id,
                     b.cik,
@@ -582,7 +582,7 @@ def main() -> int:
 
                 MAX(base_source_name) AS source_name,
                 CURRENT_TIMESTAMP AS created_at
-            FROM trailing
+            FROM trailing_window
             GROUP BY
                 company_id,
                 cik,
