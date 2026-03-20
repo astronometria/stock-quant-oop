@@ -6,37 +6,58 @@ SQL-first builder for sec_fact_normalized.
 
 Objectif
 --------
-Construire la couche normalized SEC à partir de sec_xbrl_fact_raw, sans charger
-des millions de lignes en mémoire Python.
+Construire la couche normalized SEC à partir de sec_xbrl_fact_raw,
+sans charger des millions de lignes en mémoire Python.
 
 Pourquoi cette réécriture
 -------------------------
-La version précédente passait par une pipeline Python très mince qui:
-- chargeait tout sec_xbrl_fact_raw en liste Python
-- transformait les lignes avec un mapping incomplet
-- n'était pas alignée avec le schéma réel de sec_fact_normalized
+La version précédente du flux SEC avait plusieurs fragilités :
 
-Cette version:
+1) elle traitait trop le join filings <-> facts comme une dépendance dure
+2) elle pouvait perdre des facts valides quand un accession_number issu de
+   companyfacts ne retrouvait pas un filing dans sec_filing
+3) elle n'était pas assez homogène avec les autres scripts lourds du repo
+   concernant :
+   - PRAGMA DuckDB
+   - logs de probes
+   - contrôle SQL-first
+   - structure de sortie JSON
+
+Cette version :
 - reste SQL-first
 - applique les PRAGMA runtime comme les autres scripts lourds
 - produit des métriques de qualité utiles
 - enrichit les facts avec filing_id / company_id / available_at
-- reste PIT-safe: on n'utilise jamais period_end_date comme substitut de visibilité
+- n'élimine PAS les facts simplement parce que le join filing échoue
+- garde une logique PIT explicite :
+  - available_at prioritaire depuis sec_filing.available_at
+  - sinon accepted_at
+  - sinon filing_date cast timestamp
+  - sinon fallback technique sur ingested_at du raw
 
-Notes PIT
+Important
 ---------
-La visibilité marché doit passer par:
-1) sec_filing.available_at si disponible
-2) fallback accepté: sec_filing.accepted_at
-3) fallback accepté: filing_date cast timestamp
-4) dernier fallback technique: ingested_at du raw SEC
+On n'utilise PAS period_end_date comme substitut de visibilité marché.
+period_end_date décrit la période comptable, pas la date de publication.
 
-On n'utilise PAS period_end_date comme date de disponibilité.
+Contexte important du SEC
+-------------------------
+Les companyfacts SEC peuvent référencer des accession numbers déposés par des
+filing agents. Donc :
+- le fact peut être valide
+- l'accession peut être présent dans companyfacts
+- mais ne pas se retrouver dans notre sec_filing si le raw filings n'est pas
+  chargé au même niveau d'historique
+
+Conclusion :
+- sec_xbrl_fact_raw = vérité source des facts
+- sec_filing = enrichissement quand disponible
 """
 
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from stock_quant.infrastructure.config.settings_loader import build_app_config
 from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
@@ -44,8 +65,15 @@ from stock_quant.infrastructure.db.sec_schema import SecSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 
 
+# =============================================================================
+# Helpers simples
+# =============================================================================
+
+
 def _quote_sql_string(value: str) -> str:
-    """Escape simple pour injecter une string dans un PRAGMA SQL."""
+    """
+    Escape minimal pour injecter une string dans un PRAGMA SQL.
+    """
     return str(value).replace("'", "''")
 
 
@@ -83,13 +111,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--truncate",
         action="store_true",
-        help="Explicit flag kept for interface clarity. The build is a full refresh either way.",
+        help="Flag conservé pour clarté d'interface. Le build fait un full refresh de toute façon.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     return parser.parse_args()
 
 
-def _table_exists(con, table_name: str) -> bool:
+def _table_exists(con: Any, table_name: str) -> bool:
     row = con.execute(
         """
         SELECT COUNT(*)
@@ -101,7 +129,7 @@ def _table_exists(con, table_name: str) -> bool:
     return bool(row and int(row[0]) > 0)
 
 
-def _column_exists(con, table_name: str, column_name: str) -> bool:
+def _column_exists(con: Any, table_name: str, column_name: str) -> bool:
     row = con.execute(
         """
         SELECT COUNT(*)
@@ -114,14 +142,23 @@ def _column_exists(con, table_name: str, column_name: str) -> bool:
     return bool(row and int(row[0]) > 0)
 
 
-def _fetch_one_dict(con, sql: str, params: list | None = None) -> dict[str, object]:
-    """Retourne une seule ligne sous forme dict, pratique pour les probes."""
+def _fetch_one_dict(con: Any, sql: str, params: list[Any] | None = None) -> dict[str, object]:
+    """
+    Retourne une seule ligne sous forme dict, pratique pour les probes.
+    """
     cursor = con.execute(sql, params or [])
     columns = [str(desc[0]) for desc in cursor.description]
     row = cursor.fetchone()
+
     if row is None:
         return {col: None for col in columns}
+
     return {columns[i]: row[i] for i in range(len(columns))}
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def main() -> int:
@@ -155,17 +192,17 @@ def main() -> int:
 
         con = uow.connection
 
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Runtime PRAGMA
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         con.execute(f"PRAGMA memory_limit='{_quote_sql_string(args.memory_limit)}'")
         con.execute(f"PRAGMA threads={int(args.threads)}")
         con.execute("PRAGMA preserve_insertion_order=false")
         con.execute(f"PRAGMA temp_directory='{_quote_sql_string(str(temp_dir_path))}'")
 
-        # ------------------------------------------------------------------
-        # Préflight: tables minimales requises
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Préflight minimal
+        # ---------------------------------------------------------------------
         if not _table_exists(con, "sec_xbrl_fact_raw"):
             raise RuntimeError("required table sec_xbrl_fact_raw does not exist")
 
@@ -175,9 +212,9 @@ def main() -> int:
         if not _table_exists(con, "sec_filing"):
             raise RuntimeError("required table sec_filing does not exist")
 
-        # ------------------------------------------------------------------
-        # Probes de base
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Probes raw
+        # ---------------------------------------------------------------------
         raw_probe = _fetch_one_dict(
             con,
             """
@@ -200,8 +237,10 @@ def main() -> int:
                 SUM(CASE WHEN period_end_date > CAST(? AS DATE) THEN 1 ELSE 0 END) AS too_future_period_end_date_rows,
                 SUM(
                     CASE
-                        WHEN (value_numeric IS NULL) AND (value_text IS NULL OR TRIM(value_text) = '')
-                        THEN 1 ELSE 0
+                        WHEN value_numeric IS NULL
+                         AND (value_text IS NULL OR TRIM(CAST(value_text AS VARCHAR)) = '')
+                        THEN 1
+                        ELSE 0
                     END
                 ) AS no_value_rows
             FROM sec_xbrl_fact_raw
@@ -219,18 +258,26 @@ def main() -> int:
                 flush=True,
             )
 
-        # ------------------------------------------------------------------
-        # Rebuild déterministe de sec_fact_normalized
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Full refresh déterministe
+        # ---------------------------------------------------------------------
         con.execute("DELETE FROM sec_fact_normalized")
 
         if args.verbose:
             print("[build_sec_fact_normalized] cleared sec_fact_normalized", flush=True)
 
-        # ------------------------------------------------------------------
-        # Temp mapping CIK -> company_id depuis symbol_reference si dispo.
-        # Fallback robuste: company_id = cik normalisé.
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Map CIK -> company_id
+        #
+        # Objectif:
+        # - si symbol_reference expose company_id, on l'utilise
+        # - sinon fallback robuste company_id = cik normalisé
+        #
+        # Pourquoi:
+        # - certaines versions du schéma n'ont pas company_id
+        # - certaines chaînes historiques SEC doivent quand même produire
+        #   un identifiant stable
+        # ---------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_company_map")
 
         if _table_exists(con, "symbol_reference") and _column_exists(con, "symbol_reference", "cik"):
@@ -285,10 +332,14 @@ def main() -> int:
                 """
             )
 
-        # ------------------------------------------------------------------
-        # Filing le plus pertinent par accession_number.
-        # On garde une seule ligne filing par accession pour le join normalized.
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Meilleur filing par accession_number
+        #
+        # Important:
+        # - on ne suppose pas un mapping parfait accession -> filing historique
+        # - cette table sert d'enrichissement uniquement
+        # - si le filing n'existe pas, le fact doit survivre
+        # ---------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_filing_best")
         con.execute(
             """
@@ -328,9 +379,14 @@ def main() -> int:
             """
         )
 
-        # ------------------------------------------------------------------
-        # Scope brut filtré et nettoyé.
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Scope filtré / nettoyé
+        #
+        # On enlève ici:
+        # - période hors bornes
+        # - identité incomplète
+        # - rows sans valeur numérique ni texte
+        # ---------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_fact_scope")
         con.execute(
             """
@@ -368,16 +424,18 @@ def main() -> int:
               AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
               AND (
                     value_numeric IS NOT NULL
-                    OR (value_text IS NOT NULL AND TRIM(CAST(value_text AS VARCHAR)) <> '')
-                  )
+                 OR (value_text IS NOT NULL AND TRIM(CAST(value_text AS VARCHAR)) <> '')
+              )
             """,
             [args.min_period_end_date, args.max_period_end_date],
         )
 
-        # ------------------------------------------------------------------
-        # Déduplication des facts raw.
-        # Clé logique = identité du fact + période + unité + valeur.
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Dédup logique
+        #
+        # On déduplique à granularité du fact.
+        # On garde la version la plus récente selon ingested_at/source_file/source_name.
+        # ---------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_fact_dedup")
         con.execute(
             """
@@ -422,12 +480,22 @@ def main() -> int:
             """
         )
 
-        # ------------------------------------------------------------------
-        # Insert normalized.
-        # On enrichit via sec_filing puis fallback company map.
-        # available_at ne doit jamais fallback sur period_end_date.
-        # ------------------------------------------------------------------
-        inserted_rows = con.execute(
+        # ---------------------------------------------------------------------
+        # Insert normalized
+        #
+        # Règle clé:
+        # - le filing enrichit si trouvé
+        # - sinon on garde quand même le fact
+        #
+        # available_at:
+        # - priorité à sec_filing.available_at
+        # - puis accepted_at
+        # - puis filing_date
+        # - puis ingested_at du raw
+        #
+        # On n'utilise jamais period_end_date comme date de publication.
+        # ---------------------------------------------------------------------
+        con.execute(
             """
             INSERT INTO sec_fact_normalized (
                 filing_id,
@@ -467,15 +535,15 @@ def main() -> int:
                 CURRENT_TIMESTAMP AS created_at
             FROM tmp_sec_fact_dedup d
             LEFT JOIN tmp_sec_filing_best f
-                ON f.accession_number = d.accession_number
+              ON f.accession_number = d.accession_number
             LEFT JOIN tmp_sec_company_map m
-                ON m.cik = d.cik
+              ON m.cik = d.cik
             """
-        ).rowcount
+        )
 
-        # ------------------------------------------------------------------
-        # Quality / coverage summary
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Probes qualité finales
+        # ---------------------------------------------------------------------
         scope_probe = _fetch_one_dict(
             con,
             """
@@ -519,7 +587,9 @@ def main() -> int:
 
         top_taxonomy = con.execute(
             """
-            SELECT taxonomy, COUNT(*) AS rows
+            SELECT
+                taxonomy,
+                COUNT(*) AS rows
             FROM sec_fact_normalized
             GROUP BY taxonomy
             ORDER BY rows DESC, taxonomy
@@ -529,7 +599,10 @@ def main() -> int:
 
         top_concepts = con.execute(
             """
-            SELECT taxonomy, concept, COUNT(*) AS rows
+            SELECT
+                taxonomy,
+                concept,
+                COUNT(*) AS rows
             FROM sec_fact_normalized
             GROUP BY taxonomy, concept
             ORDER BY rows DESC, taxonomy, concept
@@ -544,11 +617,18 @@ def main() -> int:
             "normalized_probe": normalized_probe,
             "join_probe": join_probe,
             "top_taxonomy": [
-                {"taxonomy": row[0], "rows": int(row[1])}
+                {
+                    "taxonomy": row[0],
+                    "rows": int(row[1]),
+                }
                 for row in top_taxonomy
             ],
             "top_concepts": [
-                {"taxonomy": row[0], "concept": row[1], "rows": int(row[2])}
+                {
+                    "taxonomy": row[0],
+                    "concept": row[1],
+                    "rows": int(row[2]),
+                }
                 for row in top_concepts
             ],
         }
@@ -562,20 +642,23 @@ def main() -> int:
 
         output = {
             "status": "SUCCESS",
-            "rows_written": int(inserted_rows if inserted_rows is not None else 0),
+            "rows_written": int(normalized_probe["rows"] or 0),
             "metrics": {
                 "raw_rows": int(raw_probe["rows"] or 0),
                 "scoped_rows": int(scope_probe["scoped_rows"] or 0),
                 "normalized_rows": int(normalized_probe["rows"] or 0),
                 "rows_joined_to_filing": int(join_probe["rows_joined_to_filing"] or 0),
                 "rows_without_filing_join": int(join_probe["rows_without_filing_join"] or 0),
-                "rows_using_cik_fallback_company_id": int(join_probe["rows_using_cik_fallback_company_id"] or 0),
+                "rows_using_cik_fallback_company_id": int(
+                    join_probe["rows_using_cik_fallback_company_id"] or 0
+                ),
             },
             "quality": quality,
         }
 
         print(json.dumps(output, indent=2, sort_keys=True, default=str), flush=True)
-        return 0
+
+    return 0
 
 
 if __name__ == "__main__":
