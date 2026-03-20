@@ -12,6 +12,7 @@ dans les pipelines ou dans le moteur de backtest.
 from typing import Any
 
 from stock_quant.domain.signals.base import BaseSignal
+from stock_quant.domain.signals.price import RsiThresholdSignal
 from stock_quant.domain.signals.short.short_volume_ratio_threshold_signal import (
     ShortVolumeRatioThresholdSignal,
 )
@@ -77,10 +78,8 @@ class SignalRegistry:
 def build_default_signal_registry() -> SignalRegistry:
     """
     Construit le registry par défaut du projet.
-
-    On commence volontairement avec un seul signal encapsulé pour
-    préserver la compatibilité métier et préparer l'extension future.
     """
     registry = SignalRegistry()
     registry.register(ShortVolumeRatioThresholdSignal)
+    registry.register(RsiThresholdSignal)
     return registry

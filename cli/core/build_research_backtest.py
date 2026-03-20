@@ -155,20 +155,48 @@ def main() -> int:
     # Pour cette phase, on garde une implémentation SQL-first ciblée.
     # On n'autorise explicitement que le signal actuellement câblé.
     # ------------------------------------------------------------------
-    if signal.signal_name != "short_volume_ratio_threshold":
-        raise RuntimeError(
-            "build_research_backtest.py currently supports only "
-            "'short_volume_ratio_threshold' in SQL-first mode"
+    if signal.signal_name == "short_volume_ratio_threshold":
+        feature_name = str(signal.params["feature_name"])
+        threshold = float(signal.params["threshold"])
+        zero_below_threshold = bool(signal.params["zero_below_threshold"])
+
+        if feature_name != "short_volume_ratio":
+            raise RuntimeError(
+                "short_volume_ratio_threshold SQL-first implementation currently requires "
+                "feature_name='short_volume_ratio'"
+            )
+
+        signal_sql_expr = (
+            "CASE "
+            "WHEN d.short_volume_ratio IS NULL THEN NULL "
+            f"WHEN d.short_volume_ratio >= {threshold} THEN CAST(d.short_volume_ratio AS DOUBLE) "
+            + ("ELSE 0.0 " if zero_below_threshold else "ELSE CAST(d.short_volume_ratio AS DOUBLE) ")
+            + "END"
         )
 
-    feature_name = str(signal.params["feature_name"])
-    threshold = float(signal.params["threshold"])
-    zero_below_threshold = bool(signal.params["zero_below_threshold"])
+    elif signal.signal_name == "rsi_threshold":
+        feature_name = str(signal.params["feature_name"])
+        oversold_threshold = float(signal.params["oversold_threshold"])
+        overbought_threshold = float(signal.params["overbought_threshold"])
 
-    if feature_name != "short_volume_ratio":
+        if feature_name != "rsi_14":
+            raise RuntimeError(
+                "rsi_threshold SQL-first implementation currently requires "
+                "feature_name='rsi_14'"
+            )
+
+        signal_sql_expr = (
+            "CASE "
+            "WHEN d.rsi_14 IS NULL THEN NULL "
+            f"WHEN d.rsi_14 <= {oversold_threshold} THEN 1.0 "
+            f"WHEN d.rsi_14 >= {overbought_threshold} THEN 0.0 "
+            "ELSE 0.0 "
+            "END"
+        )
+
+    else:
         raise RuntimeError(
-            "short_volume_ratio_threshold SQL-first implementation currently requires "
-            "feature_name='short_volume_ratio'"
+            f"build_research_backtest.py does not yet support signal_name={signal.signal_name!r} in SQL-first mode"
         )
 
     con = duckdb.connect(str(db))
@@ -238,14 +266,6 @@ def main() -> int:
         # On le valide et on le trace maintenant; l'application stricte au moteur
         # pourra être durcie lors de l'étape suivante si on étend le schéma labels.
         # ------------------------------------------------------------------
-        signal_sql_expr = (
-            "CASE "
-            "WHEN d.short_volume_ratio IS NULL THEN NULL "
-            f"WHEN d.short_volume_ratio >= {threshold} THEN CAST(d.short_volume_ratio AS DOUBLE) "
-            + ("ELSE 0.0 " if zero_below_threshold else "ELSE CAST(d.short_volume_ratio AS DOUBLE) ")
-            + "END"
-        )
-
         rows = con.execute(
             f"""
             WITH joined AS (
