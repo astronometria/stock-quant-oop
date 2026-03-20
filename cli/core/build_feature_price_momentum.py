@@ -61,7 +61,15 @@ def main() -> int:
         con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
 
         if table_exists(con, "price_bars_adjusted"):
-            price_table = "price_bars_adjusted"
+            adjusted_rows = int(con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0])
+            if adjusted_rows > 0:
+                price_table = "price_bars_adjusted"
+            elif table_exists(con, "price_history"):
+                price_table = "price_history"
+            else:
+                raise RuntimeError(
+                    "price_bars_adjusted exists but is empty, and price_history does not exist"
+                )
         elif table_exists(con, "price_history"):
             price_table = "price_history"
         else:
@@ -75,6 +83,12 @@ def main() -> int:
 
         if args.verbose:
             print(f"[momentum] price_table={price_table}", flush=True)
+            if table_exists(con, "price_bars_adjusted"):
+                adjusted_rows = int(con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0])
+                print(f"[momentum] price_bars_adjusted_rows={adjusted_rows}", flush=True)
+            if table_exists(con, "price_history"):
+                history_rows = int(con.execute("SELECT COUNT(*) FROM price_history").fetchone()[0])
+                print(f"[momentum] price_history_rows={history_rows}", flush=True)
             print(f"[momentum] symbol_col={symbol_col}", flush=True)
             print(f"[momentum] date_col={date_col}", flush=True)
             print(f"[momentum] close_col={close_col}", flush=True)
