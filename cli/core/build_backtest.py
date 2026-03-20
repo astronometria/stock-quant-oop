@@ -1,77 +1,89 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Legacy shim for the removed cross-sectional backtest entrypoint.
+
+Why this file still exists
+--------------------------
+The old backtest path was removed because it depended on the legacy
+BuildBacktestPipeline / SignalBacktester flow.
+
+This shim is intentionally kept for a short transition window so that:
+- old shell scripts fail with a clear explanation
+- developers are redirected to the research-grade backtest CLI
+- we avoid a confusing ImportError caused by a deleted module
+
+Research-grade note
+-------------------
+The active research path in this repository is now the explicit
+research snapshot / split / training dataset / labels / research backtest flow.
+This legacy entrypoint must not be used for new work.
+"""
+
 import argparse
-import json
-
-from stock_quant.infrastructure.config.settings_loader import build_app_config
-from stock_quant.infrastructure.db.backtest_schema import BacktestSchemaManager
-from stock_quant.infrastructure.db.dataset_builder_schema import DatasetBuilderSchemaManager
-from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
-from stock_quant.infrastructure.db.research_schema import ResearchSchemaManager
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.infrastructure.repositories.duckdb_backtest_repository import DuckDbBacktestRepository
-from stock_quant.pipelines.build_backtest_pipeline import BuildBacktestPipeline
+import subprocess
+import sys
+from pathlib import Path
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build experiment tracking and cross-sectional backtest results."
+        description="Legacy backtest shim. Redirects users to the research-grade backtest CLI."
     )
-    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
-    parser.add_argument("--dataset-name", default="research_dataset_v1", help="Dataset logical name.")
-    parser.add_argument("--dataset-version", default="v1", help="Dataset version.")
-    parser.add_argument("--experiment-name", default="cross_sectional_experiment_v1", help="Experiment name.")
-    parser.add_argument("--backtest-name", default="cross_sectional_backtest_v1", help="Backtest name.")
-    parser.add_argument("--signal-column", default="close_to_sma_20", help="Feature column used for ranking.")
-    parser.add_argument("--label-column", default="fwd_return_1d", help="Forward return column used for realized return.")
-    parser.add_argument("--top-n", type=int, default=20, help="Top N securities selected each day.")
-    parser.add_argument("--holding-days", type=int, default=1, help="Holding period metadata.")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
-    return parser.parse_args()
+    parser.add_argument("--db-path", required=False, help="Path to DuckDB database.")
+    parser.add_argument("--snapshot-id", required=False, help="Research snapshot identifier.")
+    parser.add_argument("--split-id", required=False, help="Research split identifier.")
+    parser.add_argument("--experiment-name", required=False, help="Experiment name.")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print the redirected command before execution.",
+    )
+    return parser
 
 
 def main() -> int:
-    args = parse_args()
+    parser = build_parser()
+    args, unknown = parser.parse_known_args()
 
-    config = build_app_config(db_path=args.db_path)
-    config.ensure_directories()
+    repo_root = Path(__file__).resolve().parents[2]
+    target = repo_root / "cli" / "core" / "build_research_backtest.py"
+
+    if not target.exists():
+        print(
+            "[build_backtest] ERROR: legacy backtest entrypoint was removed, "
+            "and cli/core/build_research_backtest.py was not found.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+
+    redirected_cmd = [sys.executable, str(target)]
+
+    # Forward only arguments that make sense for the modern research flow.
+    if args.db_path:
+        redirected_cmd.extend(["--db-path", args.db_path])
+    if args.snapshot_id:
+        redirected_cmd.extend(["--snapshot-id", args.snapshot_id])
+    if args.split_id:
+        redirected_cmd.extend(["--split-id", args.split_id])
+    if args.experiment_name:
+        redirected_cmd.extend(["--experiment-name", args.experiment_name])
+
+    # Preserve unknown flags so the modern CLI can validate them.
+    redirected_cmd.extend(unknown)
+
+    print(
+        "[build_backtest] INFO: legacy cross-sectional backtest path was removed. "
+        "Redirecting to cli/core/build_research_backtest.py",
+        flush=True,
+    )
 
     if args.verbose:
-        print(f"[build_backtest] project_root={config.project_root}")
-        print(f"[build_backtest] db_path={config.db_path}")
-        print(f"[build_backtest] dataset_name={args.dataset_name}")
-        print(f"[build_backtest] dataset_version={args.dataset_version}")
-        print(f"[build_backtest] experiment_name={args.experiment_name}")
-        print(f"[build_backtest] backtest_name={args.backtest_name}")
-        print(f"[build_backtest] signal_column={args.signal_column}")
-        print(f"[build_backtest] label_column={args.label_column}")
-        print(f"[build_backtest] top_n={args.top_n}")
-        print(f"[build_backtest] holding_days={args.holding_days}")
+        print(f"[build_backtest] REDIRECT CMD: {' '.join(redirected_cmd)}", flush=True)
 
-    session_factory = DuckDbSessionFactory(config.db_path)
-
-    with DuckDbUnitOfWork(session_factory) as uow:
-        ResearchSchemaManager(uow).initialize()
-        DatasetBuilderSchemaManager(uow).initialize()
-        BacktestSchemaManager(uow).initialize()
-
-        repository = DuckDbBacktestRepository(uow)
-        pipeline = BuildBacktestPipeline(
-            repository=repository,
-            dataset_name=args.dataset_name,
-            dataset_version=args.dataset_version,
-            experiment_name=args.experiment_name,
-            backtest_name=args.backtest_name,
-            signal_column=args.signal_column,
-            label_column=args.label_column,
-            top_n=args.top_n,
-            holding_days=args.holding_days,
-        )
-        result = pipeline.run()
-
-    print(json.dumps(result.summary_dict(), indent=2, sort_keys=True))
-    return 0 if result.status.value == "SUCCESS" else 1
+    completed = subprocess.run(redirected_cmd, check=False)
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":
