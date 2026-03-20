@@ -8,7 +8,14 @@ Objectif
 --------
 Construire research_training_dataset sans OOM, à partir de:
 - price_history
-- short_features_daily
+- research_features_daily
+
+Pourquoi ce choix
+-----------------
+Le flux research moderne doit pouvoir consommer plusieurs features PIT-safe
+déjà matérialisées dans research_features_daily (ex.: short_volume_ratio,
+rsi_14, et bientôt d'autres signaux prix). On ne doit donc pas rester câblé
+au seul short_features_daily.
 
 Principes
 ---------
@@ -42,9 +49,11 @@ Le schéma de recherche actuel attend au minimum:
 - as_of_date
 - close
 - short_volume_ratio
+- rsi_14
 - created_at (DEFAULT CURRENT_TIMESTAMP)
 
-On n'insère donc volontairement que les 6 premières colonnes métiers.
+On n'insère donc volontairement que les colonnes métiers explicitement
+supportées par le flux research moderne.
 """
 
 import argparse
@@ -215,11 +224,12 @@ def parse_args() -> argparse.Namespace:
 def _table_stats_for_dataset(
     con: duckdb.DuckDBPyConnection,
     dataset_id: str,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
     """
     Retourne:
     - rows
-    - signal_rows
+    - signal_rows (short_volume_ratio)
+    - rsi_rows
     - symbols
     """
     row = con.execute(
@@ -227,13 +237,14 @@ def _table_stats_for_dataset(
         SELECT
             COUNT(*) AS rows,
             COUNT(short_volume_ratio) AS signal_rows,
+            COUNT(rsi_14) AS rsi_rows,
             COUNT(DISTINCT symbol) AS symbols
         FROM research_training_dataset
         WHERE dataset_id = ?
         """,
         [dataset_id],
     ).fetchone()
-    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0)
 
 
 def _tmp_chunk_symbol_mix(
@@ -341,7 +352,7 @@ def main() -> int:
         # Détection schéma source.
         # ------------------------------------------------------------------
         price_date_col = _choose_price_date_column(con, "price_history")
-        has_short_features = _table_exists(con, "short_features_daily")
+        has_research_features = _table_exists(con, "research_features_daily")
 
         # ------------------------------------------------------------------
         # Identifiant dataset.
@@ -352,7 +363,7 @@ def main() -> int:
         print(f"[builder] snapshot_id={args.snapshot_id}", flush=True)
         print(f"[builder] split_id={args.split_id}", flush=True)
         print(f"[builder] price_date_column={price_date_col}", flush=True)
-        print(f"[builder] has_short_features={has_short_features}", flush=True)
+        print(f"[builder] has_research_features={has_research_features}", flush=True)
         print(f"[builder] memory_limit={args.memory_limit}", flush=True)
         print(f"[builder] threads={args.threads}", flush=True)
         print(f"[builder] temp_dir={temp_dir_sql}", flush=True)
@@ -384,7 +395,7 @@ def main() -> int:
             "symbol",
             args.symbol_filter_mode,
         )
-        allowed_symbol_predicate_short = _sql_allowed_symbol_predicate(
+        allowed_symbol_predicate_research_features = _sql_allowed_symbol_predicate(
             "symbol",
             args.symbol_filter_mode,
         )
@@ -461,7 +472,7 @@ def main() -> int:
                     )
                     continue
 
-                if has_short_features:
+                if has_research_features:
                     # ------------------------------------------------------
                     # Features bornées à ce qui est nécessaire pour ce chunk.
                     #
@@ -470,29 +481,30 @@ def main() -> int:
                     # - on applique le même filtre symbole que côté prix
                     # - SQL-first, pas de boucles Python sur les lignes
                     # ------------------------------------------------------
-                    con.execute("DROP TABLE IF EXISTS tmp_short_chunk")
+                    con.execute("DROP TABLE IF EXISTS tmp_research_feature_chunk")
                     con.execute(
                         f"""
-                        CREATE TEMP TABLE tmp_short_chunk AS
+                        CREATE TEMP TABLE tmp_research_feature_chunk AS
                         SELECT
                             UPPER(TRIM(symbol)) AS symbol,
                             as_of_date,
                             short_volume_ratio,
+                            rsi_14,
                             {_sql_symbol_type_case("symbol")} AS symbol_type
-                        FROM short_features_daily
+                        FROM research_features_daily
                         WHERE as_of_date <= ?
                           AND as_of_date IS NOT NULL
                           AND symbol IS NOT NULL
                           AND TRIM(symbol) <> ''
-                          AND {allowed_symbol_predicate_short}
+                          AND {allowed_symbol_predicate_research_features}
                         """,
                         [month_end],
                     )
 
                     if args.verbose:
-                        mix_rows = _tmp_chunk_symbol_mix(con, "tmp_short_chunk")
+                        mix_rows = _tmp_chunk_symbol_mix(con, "tmp_research_feature_chunk")
                         print(
-                            f"[short_chunk_mix] partition={partition_name} start={month_start} end={month_end} mix={mix_rows}",
+                            f"[research_feature_chunk_mix] partition={partition_name} start={month_start} end={month_end} mix={mix_rows}",
                             flush=True,
                         )
 
@@ -504,7 +516,8 @@ def main() -> int:
                             symbol,
                             as_of_date,
                             close,
-                            short_volume_ratio
+                            short_volume_ratio,
+                            rsi_14
                         )
                         SELECT
                             ? AS dataset_id,
@@ -512,12 +525,14 @@ def main() -> int:
                             p.symbol,
                             p.as_of_date,
                             p.close,
-                            f.short_volume_ratio
+                            f.short_volume_ratio,
+                            f.rsi_14
                         FROM tmp_price_chunk p
                         LEFT JOIN LATERAL (
                             SELECT
-                                short_volume_ratio
-                            FROM tmp_short_chunk f
+                                short_volume_ratio,
+                                rsi_14
+                            FROM tmp_research_feature_chunk f
                             WHERE f.symbol = p.symbol
                               AND f.as_of_date <= p.as_of_date
                             ORDER BY f.as_of_date DESC
@@ -535,7 +550,8 @@ def main() -> int:
                             symbol,
                             as_of_date,
                             close,
-                            short_volume_ratio
+                            short_volume_ratio,
+                            rsi_14
                         )
                         SELECT
                             ? AS dataset_id,
@@ -543,13 +559,14 @@ def main() -> int:
                             p.symbol,
                             p.as_of_date,
                             p.close,
-                            NULL AS short_volume_ratio
+                            NULL AS short_volume_ratio,
+                            NULL AS rsi_14
                         FROM tmp_price_chunk p
                         """,
                         [dataset_id, args.snapshot_id],
                     )
 
-                current_rows, current_signal_rows, current_symbols = _table_stats_for_dataset(
+                current_rows, current_signal_rows, current_rsi_rows, current_symbols = _table_stats_for_dataset(
                     con,
                     dataset_id,
                 )
@@ -557,7 +574,7 @@ def main() -> int:
                 print(
                     f"[chunk_done] partition={partition_name} start={month_start} end={month_end} "
                     f"chunk_price_rows={price_rows} dataset_rows={current_rows} "
-                    f"signal_rows={current_signal_rows} symbols={current_symbols}",
+                    f"signal_rows={current_signal_rows} rsi_rows={current_rsi_rows} symbols={current_symbols}",
                     flush=True,
                 )
 
@@ -566,6 +583,7 @@ def main() -> int:
                 SELECT
                     COUNT(*) AS rows,
                     COUNT(short_volume_ratio) AS signal_rows,
+                    COUNT(rsi_14) AS rsi_rows,
                     MIN(as_of_date) AS min_date,
                     MAX(as_of_date) AS max_date
                 FROM research_training_dataset
@@ -577,7 +595,8 @@ def main() -> int:
 
             print(
                 f"[partition_done] {partition_name} rows={partition_probe[0]} "
-                f"signal_rows={partition_probe[1]} min_date={partition_probe[2]} max_date={partition_probe[3]}",
+                f"signal_rows={partition_probe[1]} rsi_rows={partition_probe[2]} "
+                f"min_date={partition_probe[3]} max_date={partition_probe[4]}",
                 flush=True,
             )
 
