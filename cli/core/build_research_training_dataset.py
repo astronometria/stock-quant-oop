@@ -637,7 +637,7 @@ def main() -> int:
             "snapshot_id": args.snapshot_id,
             "split_id": args.split_id,
             "row_count": int(row_count),
-            "used_short_features_daily": has_short_features,
+            "used_research_features_daily": has_research_features,
             "price_date_column": price_date_col,
             "join_mode": "asof_backward_chunked" if has_short_features else "prices_only_chunked",
             "date_window": {
