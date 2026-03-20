@@ -9,31 +9,45 @@ Objectif
 Construire une table fundamental_ttm robuste, PIT-safe et exploitable par les
 features quotidiennes, à partir de sec_fact_normalized.
 
-Pourquoi cette réécriture
--------------------------
-La version précédente:
-- passait par une couche service/repository très mince
-- n'était pas alignée avec le schéma réel
-- n'était pas SQL-first
-- n'appliquait pas les réglages runtime lourds de DuckDB
+Pourquoi cette version
+----------------------
+Le bug validé dans les probes vient du fait que certaines lignes de bilan
+utilisaient le concept:
 
-Cette version:
-- reste SQL-first
-- applique PRAGMA memory_limit / threads / temp_directory
-- produit un rebuild complet déterministe
-- agrège les faits SEC en TTM par (company_id, cik, period_end_date, available_at)
-- reste strictement point-in-time safe grâce à available_at
+    LiabilitiesAndStockholdersEquity
 
-Important
----------
+comme s'il s'agissait de "Liabilities".
+
+Or, en comptabilité:
+    Assets = Liabilities + Equity
+
+Donc:
+    LiabilitiesAndStockholdersEquity == Assets
+
+Cette version corrige explicitement ce point:
+
+- on NE mappe PLUS jamais LiabilitiesAndStockholdersEquity vers liabilities
+- on priorise les vrais concepts de total:
+    - Assets
+    - Liabilities
+    - StockholdersEquity / StockholdersEquityIncludingPortion...
+- on applique un fallback comptable sûr:
+    liabilities = assets - equity
+  seulement si liabilities est absent et si assets/equity existent
+- on conserve une logique SQL-first
+- on garde beaucoup de commentaires pour aider les autres développeurs
+
+Notes importantes
+-----------------
 - On ne crée PAS de colonne symbol ici car le schéma réel fundamental_ttm n'en a pas.
 - On ne remplit QUE les colonnes réellement présentes dans fundamental_ttm.
-- On privilégie la robustesse et l'explicabilité sur la sophistication.
+- Les métriques / probes sont verbeuses pour faciliter l'audit.
 """
 
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from stock_quant.infrastructure.config.settings_loader import build_app_config
 from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
@@ -46,7 +60,8 @@ def _quote_sql_string(value: str) -> str:
     return str(value).replace("'", "''")
 
 
-def _table_exists(con, table_name: str) -> bool:
+def _table_exists(con: Any, table_name: str) -> bool:
+    """Vérifie la présence d'une table dans information_schema."""
     row = con.execute(
         """
         SELECT COUNT(*)
@@ -58,10 +73,11 @@ def _table_exists(con, table_name: str) -> bool:
     return bool(row and int(row[0]) > 0)
 
 
-def _fetch_one_dict(con, sql: str, params: list | None = None) -> dict[str, object]:
+def _fetch_one_dict(con: Any, sql: str, params: list[Any] | None = None) -> dict[str, object]:
     """
     Retourne une seule ligne sous forme dict.
-    Très pratique pour les probes et les résumés JSON.
+
+    Très pratique pour les probes et les résumés JSON lisibles dans les logs.
     """
     cursor = con.execute(sql, params or [])
     columns = [str(desc[0]) for desc in cursor.description]
@@ -72,6 +88,7 @@ def _fetch_one_dict(con, sql: str, params: list | None = None) -> dict[str, obje
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse les arguments du builder fundamentals."""
     parser = argparse.ArgumentParser(
         description="Build fundamental_ttm from sec_fact_normalized using SQL-first transformations."
     )
@@ -126,8 +143,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Point d'entrée principal du rebuild fundamentals."""
     args = parse_args()
-
     config = build_app_config(db_path=args.db_path)
     config.ensure_directories()
 
@@ -165,11 +182,17 @@ def main() -> int:
 
         con = uow.connection
 
+        # ------------------------------------------------------------------
+        # Réglages runtime DuckDB
+        # ------------------------------------------------------------------
         con.execute(f"PRAGMA memory_limit='{_quote_sql_string(args.memory_limit)}'")
         con.execute(f"PRAGMA threads={int(args.threads)}")
         con.execute("PRAGMA preserve_insertion_order=false")
         con.execute(f"PRAGMA temp_directory='{_quote_sql_string(str(temp_dir_path))}'")
 
+        # ------------------------------------------------------------------
+        # Gardes de surface
+        # ------------------------------------------------------------------
         if not _table_exists(con, "sec_fact_normalized"):
             raise RuntimeError("required table sec_fact_normalized does not exist")
 
@@ -188,7 +211,7 @@ def main() -> int:
                 MIN(CAST(available_at AS DATE)) AS min_available_date,
                 MAX(CAST(available_at AS DATE)) AS max_available_date
             FROM sec_fact_normalized
-            """
+            """,
         )
 
         if args.verbose:
@@ -198,11 +221,19 @@ def main() -> int:
                 flush=True,
             )
 
+        # ------------------------------------------------------------------
+        # Rebuild complet déterministe
+        # ------------------------------------------------------------------
         con.execute("DELETE FROM fundamental_ttm")
 
         if args.verbose:
             print("[build_fundamentals] cleared fundamental_ttm", flush=True)
 
+        # ------------------------------------------------------------------
+        # Scope SEC normalisé
+        #
+        # On garde seulement les faits PIT-safe et dans la fenêtre demandée.
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_fact_scope")
         con.execute(
             """
@@ -237,6 +268,14 @@ def main() -> int:
             ],
         )
 
+        # ------------------------------------------------------------------
+        # Sous-ensemble numérique utile au builder.
+        #
+        # IMPORTANT:
+        # - on garde LiabilitiesAndStockholdersEquity seulement pour diagnostic,
+        #   jamais comme mapping direct vers liabilities.
+        # - on garde aussi quelques fallbacks prudents pour certains émetteurs.
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_fact_numeric")
         con.execute(
             """
@@ -252,40 +291,59 @@ def main() -> int:
                 source_name
             FROM tmp_sec_fact_scope
             WHERE value_numeric IS NOT NULL
-              AND (
-                    concept IN (
-                        'Revenues',
-                        'RevenueFromContractWithCustomerExcludingAssessedTax',
-                        'SalesRevenueNet',
-                        'RevenueFromContractWithCustomerIncludingAssessedTax',
+              AND concept IN (
+                    'Revenues',
+                    'RevenueFromContractWithCustomerExcludingAssessedTax',
+                    'SalesRevenueNet',
+                    'RevenueFromContractWithCustomerIncludingAssessedTax',
 
-                        'NetIncomeLoss',
-                        'ProfitLoss',
+                    'NetIncomeLoss',
+                    'ProfitLoss',
 
-                        'Assets',
-                        'AssetsCurrent',
+                    'Assets',
+                    'AssetsCurrent',
 
-                        'Liabilities',
-                        'LiabilitiesCurrent',
-                        'LiabilitiesAndStockholdersEquity',
+                    'Liabilities',
+                    'LiabilitiesCurrent',
+                    'LiabilitiesAndStockholdersEquity',
 
-                        'StockholdersEquity',
-                        'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
-                        'Equity',
+                    'StockholdersEquity',
+                    'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
+                    'Equity',
 
-                        'NetCashProvidedByUsedInOperatingActivities',
-                        'NetCashFlowsProvidedByUsedInOperatingActivities',
-                        'NetCashProvidedByUsedInContinuingOperations',
+                    'NetCashProvidedByUsedInOperatingActivities',
+                    'NetCashFlowsProvidedByUsedInOperatingActivities',
+                    'NetCashProvidedByUsedInContinuingOperations',
 
-                        'EntityCommonStockSharesOutstanding',
-                        'CommonStockSharesOutstanding',
-                        'WeightedAverageNumberOfSharesOutstandingBasic',
-                        'WeightedAverageNumberOfDilutedSharesOutstanding'
-                    )
-                  )
+                    'EntityCommonStockSharesOutstanding',
+                    'CommonStockSharesOutstanding',
+                    'WeightedAverageNumberOfSharesOutstandingBasic',
+                    'WeightedAverageNumberOfDilutedSharesOutstanding'
+              )
             """
         )
 
+        # ------------------------------------------------------------------
+        # Pivot conceptuel avec priorités explicites.
+        #
+        # Idée:
+        # - on agrège par (company_id, cik, period_end_date, available_at)
+        # - on capte séparément:
+        #   * assets_total
+        #   * assets_current
+        #   * liabilities_total
+        #   * liabilities_current
+        #   * liabilities_and_equity_total  <-- diagnostic seulement
+        #   * equity_total
+        #
+        # Puis on construit:
+        #   assets      = assets_total, sinon assets_current
+        #   liabilities = liabilities_total, sinon (assets - equity) si possible,
+        #                 sinon liabilities_current
+        #
+        # On évite ainsi de reproduire le bug assets == liabilities quand
+        # LiabilitiesAndStockholdersEquity est présent.
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_fundamental_base")
         con.execute(
             """
@@ -316,23 +374,18 @@ def main() -> int:
                     END
                 ) AS net_income,
 
-                MAX(
-                    CASE
-                        WHEN concept IN ('Assets', 'AssetsCurrent')
-                        THEN value_numeric
-                    END
-                ) AS assets,
+                MAX(CASE WHEN concept = 'Assets' THEN value_numeric END) AS assets_total,
+                MAX(CASE WHEN concept = 'AssetsCurrent' THEN value_numeric END) AS assets_current,
+
+                MAX(CASE WHEN concept = 'Liabilities' THEN value_numeric END) AS liabilities_total,
+                MAX(CASE WHEN concept = 'LiabilitiesCurrent' THEN value_numeric END) AS liabilities_current,
 
                 MAX(
                     CASE
-                        WHEN concept IN (
-                            'Liabilities',
-                            'LiabilitiesCurrent',
-                            'LiabilitiesAndStockholdersEquity'
-                        )
+                        WHEN concept = 'LiabilitiesAndStockholdersEquity'
                         THEN value_numeric
                     END
-                ) AS liabilities,
+                ) AS liabilities_and_equity_total,
 
                 MAX(
                     CASE
@@ -343,7 +396,7 @@ def main() -> int:
                         )
                         THEN value_numeric
                     END
-                ) AS equity,
+                ) AS equity_total,
 
                 MAX(
                     CASE
@@ -376,6 +429,61 @@ def main() -> int:
             """
         )
 
+        # ------------------------------------------------------------------
+        # Base déduite finale.
+        #
+        # Règles comptables:
+        # - assets: priorité au vrai total Assets, fallback AssetsCurrent
+        # - equity: valeur equity_total
+        # - liabilities:
+        #     1) Liabilities
+        #     2) Assets - Equity si possible
+        #     3) LiabilitiesCurrent en dernier recours
+        #
+        # On conserve liabilities_and_equity_total seulement pour probes.
+        # ------------------------------------------------------------------
+        con.execute("DROP TABLE IF EXISTS tmp_fundamental_base_derived")
+        con.execute(
+            """
+            CREATE TEMP TABLE tmp_fundamental_base_derived AS
+            SELECT
+                company_id,
+                cik,
+                period_end_date,
+                available_at,
+                source_name,
+
+                revenue,
+                net_income,
+
+                COALESCE(assets_total, assets_current) AS assets,
+
+                CASE
+                    WHEN liabilities_total IS NOT NULL THEN liabilities_total
+                    WHEN COALESCE(assets_total, assets_current) IS NOT NULL
+                         AND equity_total IS NOT NULL
+                    THEN COALESCE(assets_total, assets_current) - equity_total
+                    ELSE liabilities_current
+                END AS liabilities,
+
+                equity_total AS equity,
+
+                operating_cash_flow,
+                shares_outstanding,
+
+                assets_total,
+                assets_current,
+                liabilities_total,
+                liabilities_current,
+                liabilities_and_equity_total,
+                equity_total
+            FROM tmp_fundamental_base
+            """
+        )
+
+        # ------------------------------------------------------------------
+        # Déduplication de surface.
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_fundamental_base_dedup")
         con.execute(
             """
@@ -392,7 +500,13 @@ def main() -> int:
                 equity,
                 operating_cash_flow,
                 shares_outstanding,
-                source_name
+                source_name,
+                assets_total,
+                assets_current,
+                liabilities_total,
+                liabilities_current,
+                liabilities_and_equity_total,
+                equity_total
             FROM (
                 SELECT
                     *,
@@ -400,17 +514,24 @@ def main() -> int:
                         PARTITION BY company_id, cik, period_end_date, available_at
                         ORDER BY source_name DESC NULLS LAST
                     ) AS rn
-                FROM tmp_fundamental_base
+                FROM tmp_fundamental_base_derived
             ) x
             WHERE rn = 1
             """
         )
 
+        # ------------------------------------------------------------------
+        # Fenêtre TTM.
+        #
+        # Les flux (revenue, net_income, cash_flow) sont agrégés sur une fenêtre
+        # trailing. Les stocks de bilan (assets/liabilities/equity/shares) sont
+        # pris sur la ligne la plus récente de la fenêtre.
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_fundamental_ttm")
         con.execute(
             f"""
             CREATE TEMP TABLE tmp_fundamental_ttm AS
-            WITH ttm_window AS (
+            WITH trailing AS (
                 SELECT
                     b.company_id,
                     b.cik,
@@ -420,6 +541,7 @@ def main() -> int:
 
                     t.period_end_date AS trailing_period_end_date,
                     t.available_at AS trailing_available_at,
+
                     t.revenue,
                     t.net_income,
                     t.assets,
@@ -430,14 +552,8 @@ def main() -> int:
                     t.source_name AS trailing_source_name,
 
                     ROW_NUMBER() OVER (
-                        PARTITION BY
-                            b.company_id,
-                            b.cik,
-                            b.period_end_date,
-                            b.available_at
-                        ORDER BY
-                            t.period_end_date DESC,
-                            t.available_at DESC
+                        PARTITION BY b.company_id, b.cik, b.period_end_date, b.available_at
+                        ORDER BY t.period_end_date DESC, t.available_at DESC
                     ) AS rn_desc
                 FROM tmp_fundamental_base_dedup b
                 JOIN tmp_fundamental_base_dedup t
@@ -466,7 +582,7 @@ def main() -> int:
 
                 MAX(base_source_name) AS source_name,
                 CURRENT_TIMESTAMP AS created_at
-            FROM ttm_window
+            FROM trailing
             GROUP BY
                 company_id,
                 cik,
@@ -512,6 +628,9 @@ def main() -> int:
             """
         ).rowcount
 
+        # ------------------------------------------------------------------
+        # Probes qualité
+        # ------------------------------------------------------------------
         base_probe = _fetch_one_dict(
             con,
             """
@@ -524,7 +643,7 @@ def main() -> int:
                 MIN(CAST(available_at AS DATE)) AS min_available_date,
                 MAX(CAST(available_at AS DATE)) AS max_available_date
             FROM tmp_fundamental_base_dedup
-            """
+            """,
         )
 
         ttm_probe = _fetch_one_dict(
@@ -539,7 +658,7 @@ def main() -> int:
                 MIN(CAST(available_at AS DATE)) AS min_available_date,
                 MAX(CAST(available_at AS DATE)) AS max_available_date
             FROM fundamental_ttm
-            """
+            """,
         )
 
         null_profile = _fetch_one_dict(
@@ -554,7 +673,36 @@ def main() -> int:
                 SUM(CASE WHEN operating_cash_flow IS NULL THEN 1 ELSE 0 END) AS operating_cash_flow_null_rows,
                 SUM(CASE WHEN shares_outstanding IS NULL THEN 1 ELSE 0 END) AS shares_outstanding_null_rows
             FROM fundamental_ttm
+            """,
+        )
+
+        # Nombre de lignes où liabilities a été dérivé par assets - equity.
+        liabilities_fallback_probe = _fetch_one_dict(
+            con,
             """
+            SELECT
+                COUNT(*) AS rows_using_assets_minus_equity_fallback
+            FROM tmp_fundamental_base_dedup
+            WHERE liabilities_total IS NULL
+              AND assets IS NOT NULL
+              AND equity IS NOT NULL
+              AND liabilities = assets - equity
+            """,
+        )
+
+        # Lignes encore suspectes: assets == liabilities alors qu'equity non nul.
+        suspicious_balance_probe = _fetch_one_dict(
+            con,
+            """
+            SELECT
+                COUNT(*) AS suspicious_assets_equal_liabilities_rows
+            FROM fundamental_ttm
+            WHERE assets IS NOT NULL
+              AND liabilities IS NOT NULL
+              AND equity IS NOT NULL
+              AND ABS(COALESCE(equity, 0)) > 0
+              AND assets = liabilities
+            """,
         )
 
         top_companies = con.execute(
@@ -574,6 +722,8 @@ def main() -> int:
             "base_probe": base_probe,
             "ttm_probe": ttm_probe,
             "null_profile": null_profile,
+            "liabilities_fallback_probe": liabilities_fallback_probe,
+            "suspicious_balance_probe": suspicious_balance_probe,
             "top_companies": [
                 {"company_id": row[0], "rows": int(row[1])}
                 for row in top_companies
@@ -600,6 +750,12 @@ def main() -> int:
                 "fundamental_ttm_rows": int(ttm_probe["rows"] or 0),
                 "companies": int(ttm_probe["companies"] or 0),
                 "ciks": int(ttm_probe["ciks"] or 0),
+                "rows_using_assets_minus_equity_fallback": int(
+                    liabilities_fallback_probe["rows_using_assets_minus_equity_fallback"] or 0
+                ),
+                "suspicious_assets_equal_liabilities_rows": int(
+                    suspicious_balance_probe["suspicious_assets_equal_liabilities_rows"] or 0
+                ),
             },
             "quality": quality,
         }
