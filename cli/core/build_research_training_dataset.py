@@ -639,7 +639,7 @@ def main() -> int:
             "row_count": int(row_count),
             "used_research_features_daily": has_research_features,
             "price_date_column": price_date_col,
-            "join_mode": "asof_backward_chunked" if has_short_features else "prices_only_chunked",
+            "join_mode": "asof_backward_chunked" if has_research_features else "prices_only_chunked",
             "date_window": {
                 "start": str(train_start),
                 "end": str(test_end),
