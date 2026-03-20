@@ -12,29 +12,34 @@ Construire un backtest long-only, split-aware et transaction-cost aware
 - research_labels
 - research_split_manifest
 
-Améliorations
--------------
-- support --verbose
-- support --memory-limit
-- support --threads
-- support --temp-dir
-- conserve une logique SQL-first
-- sortie JSON finale stable pour le runner
+Transition en cours
+-------------------
+Cette version garde une exécution SQL-first, mais ne hardcode plus
+directement la logique métier du signal au niveau CLI.
+Le signal est désormais résolu via le registry de signaux du domaine.
 
-Important
----------
-- signal simple: long si short_volume_ratio > threshold, sinon flat
-- retour utilisé: fwd_return_1d
-- coûts de transaction en bps appliqués sur le turnover unitaire
+Version de transition
+---------------------
+Pour préserver:
+- la stabilité opérationnelle
+- la reproductibilité
+- la compatibilité avec les runs déjà en place
+
+...on supporte pour l'instant en SQL-first le signal:
+- short_volume_ratio_threshold
+
+Cela prépare le terrain pour RSI / SMA / MACD sans casser le flux actuel.
 """
 
 import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
+from stock_quant.domain.signals import build_default_signal_registry
 from stock_quant.infrastructure.db.research_backtest_schema import (
     ResearchBacktestSchemaManager,
 )
@@ -53,13 +58,67 @@ def _log(message: str, verbose: bool) -> None:
         print(message, flush=True)
 
 
+def _normalize_signal_params_json(
+    raw: str | None,
+    *,
+    signal_name: str,
+    signal_threshold: float,
+) -> dict[str, Any]:
+    """
+    Normalise les paramètres du signal.
+
+    Règle de transition:
+    - si --signal-params-json est fourni, on le parse
+    - sinon, on construit un payload compatible avec le signal par défaut
+      à partir de --signal-threshold
+    """
+    if raw is None or not raw.strip():
+        if signal_name == "short_volume_ratio_threshold":
+            return {
+                "feature_name": "short_volume_ratio",
+                "threshold": float(signal_threshold),
+                "zero_below_threshold": True,
+            }
+        return {}
+
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("signal-params-json must decode to a JSON object")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
     p.add_argument("--dataset-id", required=True)
     p.add_argument("--split-id", required=True)
     p.add_argument("--transaction-cost-bps", type=float, default=10.0)
-    p.add_argument("--signal-threshold", type=float, default=0.5)
+
+    # Nouveau contrat de signal.
+    p.add_argument(
+        "--signal-name",
+        default="short_volume_ratio_threshold",
+        help="Public signal name resolved through the signal registry.",
+    )
+    p.add_argument(
+        "--signal-params-json",
+        default=None,
+        help="Optional JSON object for signal params. If omitted, a compatibility payload is built from --signal-threshold.",
+    )
+    p.add_argument(
+        "--execution-lag-bars",
+        type=int,
+        default=1,
+        help="Decision to execution lag in bars. Must be >= 1.",
+    )
+
+    # Compat temporaire.
+    p.add_argument(
+        "--signal-threshold",
+        type=float,
+        default=0.5,
+        help="Compatibility shortcut for the default short_volume_ratio_threshold signal.",
+    )
 
     # Alignement runtime avec les autres scripts research.
     p.add_argument("--memory-limit", default="24GB")
@@ -74,6 +133,43 @@ def main() -> int:
     db = Path(args.db_path).expanduser().resolve()
 
     print(f"[build_research_backtest] db_path={db}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Résolution research-grade du signal.
+    # ------------------------------------------------------------------
+    registry = build_default_signal_registry()
+    signal_params = _normalize_signal_params_json(
+        args.signal_params_json,
+        signal_name=args.signal_name,
+        signal_threshold=args.signal_threshold,
+    )
+    signal = registry.create(args.signal_name, signal_params)
+    execution_lag_bars = signal.validate_execution_lag_bars(args.execution_lag_bars)
+
+    _log(f"[backtest] signal_name={signal.signal_name}", args.verbose)
+    _log(f"[backtest] signal_version={signal.signal_version}", args.verbose)
+    _log(f"[backtest] signal_params={json.dumps(signal.params, sort_keys=True)}", args.verbose)
+    _log(f"[backtest] execution_lag_bars={execution_lag_bars}", args.verbose)
+
+    # ------------------------------------------------------------------
+    # Pour cette phase, on garde une implémentation SQL-first ciblée.
+    # On n'autorise explicitement que le signal actuellement câblé.
+    # ------------------------------------------------------------------
+    if signal.signal_name != "short_volume_ratio_threshold":
+        raise RuntimeError(
+            "build_research_backtest.py currently supports only "
+            "'short_volume_ratio_threshold' in SQL-first mode"
+        )
+
+    feature_name = str(signal.params["feature_name"])
+    threshold = float(signal.params["threshold"])
+    zero_below_threshold = bool(signal.params["zero_below_threshold"])
+
+    if feature_name != "short_volume_ratio":
+        raise RuntimeError(
+            "short_volume_ratio_threshold SQL-first implementation currently requires "
+            "feature_name='short_volume_ratio'"
+        )
 
     con = duckdb.connect(str(db))
     try:
@@ -91,7 +187,6 @@ def main() -> int:
         _log(f"[backtest] dataset_id={args.dataset_id}", args.verbose)
         _log(f"[backtest] split_id={args.split_id}", args.verbose)
         _log(f"[backtest] transaction_cost_bps={args.transaction_cost_bps}", args.verbose)
-        _log(f"[backtest] signal_threshold={args.signal_threshold}", args.verbose)
 
         ResearchBacktestSchemaManager(con).ensure_tables()
 
@@ -127,8 +222,32 @@ def main() -> int:
             [args.dataset_id, args.split_id],
         )
 
+        # ------------------------------------------------------------------
+        # SQL-first signal materialization.
+        #
+        # Important:
+        # - le signal lit uniquement des colonnes présentes dans le dataset
+        # - aucune lecture de table serving
+        # - décision au jour t
+        # - coût de turnover basé sur le changement de position observé
+        # - execution_lag_bars conservé dans le payload final pour audit
+        #
+        # Note de transition:
+        # Le lag n'est pas encore appliqué au label join lui-même, car le dataset
+        # de labels actuel est déjà construit sur l'alignement research existant.
+        # On le valide et on le trace maintenant; l'application stricte au moteur
+        # pourra être durcie lors de l'étape suivante si on étend le schéma labels.
+        # ------------------------------------------------------------------
+        signal_sql_expr = (
+            "CASE "
+            "WHEN d.short_volume_ratio IS NULL THEN NULL "
+            f"WHEN d.short_volume_ratio >= {threshold} THEN CAST(d.short_volume_ratio AS DOUBLE) "
+            + ("ELSE 0.0 " if zero_below_threshold else "ELSE CAST(d.short_volume_ratio AS DOUBLE) ")
+            + "END"
+        )
+
         rows = con.execute(
-            """
+            f"""
             WITH joined AS (
                 SELECT
                     d.dataset_id,
@@ -142,10 +261,7 @@ def main() -> int:
                         WHEN d.as_of_date BETWEEN ? AND ? THEN 'test'
                         ELSE NULL
                     END AS partition_name,
-                    CASE
-                        WHEN d.short_volume_ratio > ? THEN 1.0
-                        ELSE 0.0
-                    END AS signal
+                    {signal_sql_expr} AS signal_value
                 FROM research_training_dataset d
                 INNER JOIN research_labels l
                     ON l.dataset_id = d.dataset_id
@@ -156,10 +272,23 @@ def main() -> int:
             positioned AS (
                 SELECT
                     *,
-                    LAG(signal, 1, 0.0) OVER (
+                    CASE
+                        WHEN signal_value IS NULL THEN 0.0
+                        WHEN signal_value > 0 THEN 1.0
+                        ELSE 0.0
+                    END AS signal_active,
+                    LAG(
+                        CASE
+                            WHEN signal_value IS NULL THEN 0.0
+                            WHEN signal_value > 0 THEN 1.0
+                            ELSE 0.0
+                        END,
+                        1,
+                        0.0
+                    ) OVER (
                         PARTITION BY symbol
                         ORDER BY as_of_date
-                    ) AS prev_signal
+                    ) AS prev_signal_active
                 FROM joined
                 WHERE partition_name IS NOT NULL
             ),
@@ -168,13 +297,14 @@ def main() -> int:
                     partition_name,
                     symbol,
                     as_of_date,
-                    signal,
-                    prev_signal,
+                    signal_value,
+                    signal_active,
+                    prev_signal_active,
                     fwd_return_1d,
-                    signal * fwd_return_1d AS gross_strategy_return,
-                    ABS(signal - prev_signal) AS turnover_unit,
-                    ABS(signal - prev_signal) * (? / 10000.0) AS transaction_cost,
-                    (signal * fwd_return_1d) - (ABS(signal - prev_signal) * (? / 10000.0)) AS net_strategy_return
+                    signal_active * fwd_return_1d AS gross_strategy_return,
+                    ABS(signal_active - prev_signal_active) AS turnover_unit,
+                    ABS(signal_active - prev_signal_active) * (? / 10000.0) AS transaction_cost,
+                    (signal_active * fwd_return_1d) - (ABS(signal_active - prev_signal_active) * (? / 10000.0)) AS net_strategy_return
                 FROM positioned
                 WHERE fwd_return_1d IS NOT NULL
             )
@@ -210,7 +340,6 @@ def main() -> int:
                 valid_end,
                 test_start,
                 test_end,
-                args.signal_threshold,
                 args.dataset_id,
                 args.transaction_cost_bps,
                 args.transaction_cost_bps,
@@ -258,50 +387,51 @@ def main() -> int:
                     args.dataset_id,
                     args.split_id,
                     partition_name,
-                    "short_volume_ratio_long_only",
+                    signal.signal_name,
                     args.transaction_cost_bps,
-                    float(gross_return) if gross_return is not None else 0.0,
-                    float(total_cost) if total_cost is not None else 0.0,
-                    float(net_return) if net_return is not None else 0.0,
-                    float(avg_net) if avg_net is not None else 0.0,
-                    float(volatility) if volatility is not None else 0.0,
-                    float(sharpe) if sharpe is not None else None,
-                    float(turnover) if turnover is not None else 0.0,
-                    int(n_obs) if n_obs is not None else 0,
+                    gross_return,
+                    total_cost,
+                    net_return,
+                    avg_net,
+                    volatility,
+                    sharpe,
+                    turnover,
+                    n_obs,
                 ],
             )
 
             results.append(
                 {
                     "partition_name": partition_name,
-                    "avg_gross": float(avg_gross) if avg_gross is not None else 0.0,
-                    "gross_return": float(gross_return) if gross_return is not None else 0.0,
-                    "total_cost": float(total_cost) if total_cost is not None else 0.0,
-                    "net_return": float(net_return) if net_return is not None else 0.0,
-                    "avg_return": float(avg_net) if avg_net is not None else 0.0,
-                    "volatility": float(volatility) if volatility is not None else 0.0,
-                    "sharpe": float(sharpe) if sharpe is not None else None,
-                    "turnover": float(turnover) if turnover is not None else 0.0,
-                    "n_obs": int(n_obs) if n_obs is not None else 0,
+                    "avg_gross": avg_gross,
+                    "gross_return": gross_return,
+                    "total_cost": total_cost,
+                    "net_return": net_return,
+                    "avg_net": avg_net,
+                    "volatility": volatility,
+                    "sharpe": sharpe,
+                    "turnover": turnover,
+                    "n_obs": n_obs,
                 }
             )
 
-        print(
-            json.dumps(
-                {
-                    "backtest_id": backtest_id,
-                    "dataset_id": args.dataset_id,
-                    "split_id": args.split_id,
-                    "transaction_cost_bps": args.transaction_cost_bps,
-                    "signal_threshold": args.signal_threshold,
-                    "partitions": results,
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
-        return 0
+        payload = {
+            "backtest_id": backtest_id,
+            "dataset_id": args.dataset_id,
+            "split_id": args.split_id,
+            "signal_name": signal.signal_name,
+            "signal_version": signal.signal_version,
+            "signal_params": signal.params,
+            "required_features": list(signal.required_features()),
+            "warmup_bars": signal.warmup_bars(),
+            "execution_lag_bars": execution_lag_bars,
+            "transaction_cost_bps": args.transaction_cost_bps,
+            "results": results,
+            "created_at": _now().isoformat(),
+        }
 
+        print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+        return 0
     finally:
         con.close()
 

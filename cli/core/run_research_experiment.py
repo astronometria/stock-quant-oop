@@ -22,6 +22,10 @@ Améliorations de cette version
   --temp-dir
 - conservation d'un parse robuste du JSON final produit par chaque sous-script
 - logs explicites pour mieux observer les runs lourds
+- propagation du nouveau contrat de signal:
+  --signal-name
+  --signal-params-json
+  --execution-lag-bars
 
 Important
 ---------
@@ -57,11 +61,6 @@ def _now() -> datetime:
 def _extract_last_json_object(stdout: str) -> dict[str, Any]:
     """
     Extrait le dernier objet JSON complet présent dans stdout.
-
-    Pourquoi cette version:
-    - les sous-scripts peuvent écrire des logs avant le JSON final
-    - le JSON final peut contenir des objets imbriqués
-    - on ne veut pas parser naïvement "la dernière ligne qui commence par {"
     """
     text = stdout.strip()
     if not text:
@@ -75,8 +74,6 @@ def _extract_last_json_object(stdout: str) -> dict[str, Any]:
     in_string = False
     escape = False
 
-    # On remonte depuis la dernière accolade fermante afin de retrouver
-    # l'accolade ouvrante correspondante du dernier objet JSON complet.
     for i in range(end, -1, -1):
         ch = text[i]
 
@@ -114,10 +111,6 @@ def _extract_last_json_object(stdout: str) -> dict[str, Any]:
 def _normalize_json(raw: str | None) -> str | None:
     """
     Normalise un payload JSON optionnel pour le manifest.
-
-    Pourquoi:
-    - éviter des variations d'espaces dans la DB
-    - valider immédiatement que le JSON fourni est bien valide
     """
     if raw is None:
         return None
@@ -129,12 +122,38 @@ def _normalize_json(raw: str | None) -> str | None:
     return json.dumps(json.loads(value), sort_keys=True)
 
 
+def _normalize_signal_params_json(
+    raw: str | None,
+    *,
+    signal_name: str,
+    signal_threshold: float,
+) -> str | None:
+    """
+    Normalise les paramètres de signal.
+
+    Compatibilité:
+    - si l'utilisateur fournit --signal-params-json, on le valide et on le normalise
+    - sinon, on fabrique un JSON stable à partir de --signal-threshold
+      pour le signal par défaut short_volume_ratio_threshold
+    """
+    if raw is None or not raw.strip():
+        if signal_name == "short_volume_ratio_threshold":
+            return json.dumps(
+                {
+                    "feature_name": "short_volume_ratio",
+                    "threshold": float(signal_threshold),
+                    "zero_below_threshold": True,
+                },
+                sort_keys=True,
+            )
+        return None
+
+    return json.dumps(json.loads(raw), sort_keys=True)
+
+
 def _build_base_child_cmd(script_rel_path: str, args: argparse.Namespace, db: Path) -> list[str]:
     """
     Construit la base commune d'une commande enfant.
-
-    On passe ici tous les paramètres runtime communs afin que les gros jobs
-    DuckDB utilisent les mêmes limites/mêmes répertoires temporaires.
     """
     cmd = [
         sys.executable,
@@ -158,11 +177,6 @@ def _build_base_child_cmd(script_rel_path: str, args: argparse.Namespace, db: Pa
 def _run(cmd: list[str], step_name: str) -> dict[str, Any]:
     """
     Exécute un sous-script en streaming.
-
-    Différence clé vs ancienne version:
-    - on n'utilise plus capture_output=True
-    - on streame la sortie ligne par ligne pour voir la progression
-    - on conserve quand même stdout complet pour parser le JSON final
     """
     print(f"[run_research_experiment] START step={step_name}", flush=True)
     print(
@@ -182,15 +196,12 @@ def _run(cmd: list[str], step_name: str) -> dict[str, Any]:
         raise RuntimeError(f"{step_name}: failed to capture child stdout")
 
     collected_lines: list[str] = []
-
-    # Streaming temps réel vers le terminal + stockage pour parse JSON final.
     for line in process.stdout:
         print(line, end="", flush=True)
         collected_lines.append(line)
 
     returncode = process.wait()
     stdout = "".join(collected_lines)
-
     if returncode != 0:
         raise RuntimeError(f"{step_name} failed:\n{stdout}")
 
@@ -211,6 +222,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--notes", default=None)
 
     p.add_argument("--transaction-cost-bps", type=float, default=10.0)
+
+    # Nouveau contrat de signal.
+    p.add_argument("--signal-name", default="short_volume_ratio_threshold")
+    p.add_argument("--signal-params-json", default=None)
+    p.add_argument("--execution-lag-bars", type=int, default=1)
+
+    # Compat temporaire.
     p.add_argument("--signal-threshold", type=float, default=0.5)
 
     # Runtime passthrough pour les gros jobs.
@@ -226,15 +244,23 @@ def main() -> int:
     args = parse_args()
     db = Path(args.db_path).expanduser().resolve()
 
+    normalized_signal_params_json = _normalize_signal_params_json(
+        args.signal_params_json,
+        signal_name=args.signal_name,
+        signal_threshold=args.signal_threshold,
+    )
+
     print(f"[run_research_experiment] db_path={db}", flush=True)
     print(f"[run_research_experiment] snapshot_id={args.snapshot_id}", flush=True)
     print(f"[run_research_experiment] split_id={args.split_id}", flush=True)
+    print(f"[run_research_experiment] signal_name={args.signal_name}", flush=True)
+    print(f"[run_research_experiment] signal_params_json={normalized_signal_params_json}", flush=True)
+    print(f"[run_research_experiment] execution_lag_bars={args.execution_lag_bars}", flush=True)
     print(f"[run_research_experiment] memory_limit={args.memory_limit}", flush=True)
     print(f"[run_research_experiment] threads={args.threads}", flush=True)
     print(f"[run_research_experiment] temp_dir={args.temp_dir}", flush=True)
     print(f"[run_research_experiment] verbose={args.verbose}", flush=True)
 
-    # On s'assure que la table manifest existe avant le run.
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -242,9 +268,6 @@ def main() -> int:
     finally:
         con.close()
 
-    # ------------------------------------------------------------------
-    # Step 1: dataset build
-    # ------------------------------------------------------------------
     dataset_cmd = _build_base_child_cmd(
         "cli/core/build_research_training_dataset.py",
         args,
@@ -259,9 +282,6 @@ def main() -> int:
     dataset_result = _run(dataset_cmd, "dataset_build")
     dataset_id = dataset_result["dataset_id"]
 
-    # ------------------------------------------------------------------
-    # Step 2: labels build
-    # ------------------------------------------------------------------
     labels_cmd = _build_base_child_cmd(
         "cli/core/build_research_labels.py",
         args,
@@ -277,13 +297,6 @@ def main() -> int:
 
     labels_result = _run(labels_cmd, "labels_build")
 
-    # ------------------------------------------------------------------
-    # Step 3: backtest build
-    #
-    # On propage aussi les paramètres runtime par cohérence, même si le
-    # backtest actuel n'en a pas strictement besoin. Cela évite une dérive
-    # d'interface entre sous-scripts.
-    # ------------------------------------------------------------------
     backtest_cmd = _build_base_child_cmd(
         "cli/core/build_research_backtest.py",
         args,
@@ -295,15 +308,19 @@ def main() -> int:
         args.split_id,
         "--transaction-cost-bps",
         str(args.transaction_cost_bps),
-        "--signal-threshold",
-        str(args.signal_threshold),
+        "--signal-name",
+        args.signal_name,
+        "--execution-lag-bars",
+        str(args.execution_lag_bars),
     ]
+
+    if normalized_signal_params_json is not None:
+        backtest_cmd.extend(["--signal-params-json", normalized_signal_params_json])
+    else:
+        backtest_cmd.extend(["--signal-threshold", str(args.signal_threshold)])
 
     backtest_result = _run(backtest_cmd, "backtest_build")
 
-    # ------------------------------------------------------------------
-    # Step 4: manifest final
-    # ------------------------------------------------------------------
     con = duckdb.connect(str(db))
     try:
         repo = DuckDbResearchExperimentRepository(con)
@@ -313,6 +330,9 @@ def main() -> int:
 
         metrics_payload = {
             "split_id": args.split_id,
+            "signal_name": args.signal_name,
+            "signal_params_json": normalized_signal_params_json,
+            "execution_lag_bars": args.execution_lag_bars,
             "dataset_build": dataset_result,
             "labels_build": labels_result,
             "backtest": backtest_result,
@@ -339,6 +359,9 @@ def main() -> int:
                     "experiment_id": exp_id,
                     "dataset_id": dataset_id,
                     "split_id": args.split_id,
+                    "signal_name": args.signal_name,
+                    "signal_params_json": normalized_signal_params_json,
+                    "execution_lag_bars": args.execution_lag_bars,
                     "metrics": metrics_payload,
                 },
                 indent=2,
@@ -346,7 +369,6 @@ def main() -> int:
             flush=True,
         )
         return 0
-
     finally:
         con.close()
 
