@@ -13,18 +13,18 @@ from __future__ import annotations
 # =============================================================================
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
-from stock_quant.app.services.sec_filing_service import SecFilingService
+from stock_quant.app.services.sec_filings_service import SecFilingsService
 from stock_quant.infrastructure.repositories.duckdb_sec_repository import DuckDbSecRepository
 from stock_quant.pipelines.base_pipeline import BasePipeline
 from stock_quant.shared.exceptions import PipelineError
 
 
-class BuildSecFilingPipeline(BasePipeline):
+class BuildSecFilingsPipeline(BasePipeline):
     pipeline_name = "build_sec_filings"
 
     def __init__(self, repository: DuckDbSecRepository) -> None:
         self.repository = repository
-        self.service = SecFilingService()
+        self.service = SecFilingsService()
         self._metrics: dict[str, int] = {}
         self._rows_written = 0
 
@@ -35,7 +35,7 @@ class BuildSecFilingPipeline(BasePipeline):
         }
 
     def transform(self, data):
-        filings, metrics = self.service.build_filings(
+        filings, metrics = self.service.build_sec_filings(
             raw_index_rows=data["raw_index_rows"],
             cik_company_map=data["cik_company_map"],
         )

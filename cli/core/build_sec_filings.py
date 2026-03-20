@@ -10,7 +10,7 @@ from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaMan
 from stock_quant.infrastructure.db.sec_schema import SecSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 from stock_quant.infrastructure.repositories.duckdb_sec_repository import DuckDbSecRepository
-from stock_quant.pipelines.build_sec_filings_pipeline import BuildSecFilingPipeline
+from stock_quant.pipelines.build_sec_filings_pipeline import BuildSecFilingsPipeline
 from stock_quant.shared.exceptions import PipelineError, RepositoryError
 
 
@@ -101,7 +101,7 @@ def main() -> int:
     with DuckDbUnitOfWork(session_factory) as uow:
         con = _require_active_connection(uow)
         repository = DuckDbSecRepository(con)
-        pipeline = BuildSecFilingPipeline(repository=repository)
+        pipeline = BuildSecFilingsPipeline(repository=repository)
         result = pipeline.run()
 
     print(json.dumps(result.summary_dict(), indent=2, sort_keys=True))

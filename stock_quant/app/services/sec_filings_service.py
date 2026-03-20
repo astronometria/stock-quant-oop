@@ -7,8 +7,8 @@ from typing import Any
 from stock_quant.domain.entities.sec_filing import SecFiling
 
 
-class SecFilingService:
-    def build_filings(
+class SecFilingsService:
+    def build_sec_filings(
         self,
         raw_index_rows: list[dict[str, Any]],
         cik_company_map: dict[str, str],
