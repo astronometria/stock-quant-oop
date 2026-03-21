@@ -12,19 +12,34 @@ Construire `sec_fact_normalized` à partir de `sec_xbrl_fact_raw` en gardant:
 - une progression visible dans le terminal
 - un découpage par mois de `period_end_date`
 
-Pourquoi chunker
-----------------
-Le full refresh monolithique fonctionne, mais il est opaque:
-- gros DELETE
-- gros CREATE TEMP TABLE
-- gros INSERT INTO ... SELECT ...
-- aucune visibilité pendant plusieurs minutes
+Important
+---------
+Ce script est volontairement aligné sur le schéma réel local de
+`sec_fact_normalized`, qui contient actuellement seulement:
 
-Cette version:
-- garde les mêmes règles métiers
-- garde le fallback robuste company_id = cik si nécessaire
-- reconstruit `sec_fact_normalized` par mois de `period_end_date`
-- affiche une progression concrète + cumul de lignes insérées
+- filing_id
+- company_id
+- cik
+- taxonomy
+- concept
+- period_end_date
+- unit
+- value_text
+- value_numeric
+- available_at
+- source_name
+- created_at
+
+Donc:
+- on NE tente PAS d'insérer de `fact_id`
+- on NE tente PAS d'insérer accession_number / frame / fiscal_year / etc.
+- on garde un full refresh déterministe, mais chunké par mois pour voir la progression
+
+Notes PIT
+---------
+- `available_at` prioritaire depuis `sec_filing.available_at` si disponible
+- sinon fallback technique sur `ingested_at` du raw
+- on n'utilise jamais `period_end_date` comme date de publication
 """
 
 import argparse
@@ -224,7 +239,7 @@ def main() -> int:
             )
 
         # ------------------------------------------------------------------
-        # Full refresh déterministe, mais avec insert chunké.
+        # Full refresh déterministe, avec insert chunké.
         # ------------------------------------------------------------------
         con.execute("DELETE FROM sec_fact_normalized")
         if args.verbose:
@@ -307,6 +322,8 @@ def main() -> int:
 
         # ------------------------------------------------------------------
         # Meilleur filing par accession_number
+        # Ici il peut y avoir 0 row si sec_filing est vide.
+        # Ce n'est pas bloquant.
         # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_filing_best")
         con.execute(
@@ -410,6 +427,7 @@ def main() -> int:
                     flush=True,
                 )
 
+            # Scope mensuel nettoyé.
             con.execute("DROP TABLE IF EXISTS tmp_sec_fact_scope")
             con.execute(
                 """
@@ -421,10 +439,6 @@ def main() -> int:
                     TRIM(CAST(concept AS VARCHAR)) AS concept,
                     NULLIF(TRIM(CAST(unit AS VARCHAR)), '') AS unit,
                     period_end_date,
-                    period_start_date,
-                    fiscal_year,
-                    NULLIF(TRIM(CAST(fiscal_period AS VARCHAR)), '') AS fiscal_period,
-                    NULLIF(TRIM(CAST(frame AS VARCHAR)), '') AS frame,
                     CASE
                         WHEN value_text IS NULL THEN NULL
                         WHEN TRIM(CAST(value_text AS VARCHAR)) = '' THEN NULL
@@ -453,6 +467,7 @@ def main() -> int:
                 [month_start, month_end],
             )
 
+            # Dédup logique au grain utile pour la table cible réelle.
             con.execute("DROP TABLE IF EXISTS tmp_sec_fact_dedup")
             con.execute(
                 """
@@ -464,10 +479,6 @@ def main() -> int:
                     concept,
                     unit,
                     period_end_date,
-                    period_start_date,
-                    fiscal_year,
-                    fiscal_period,
-                    frame,
                     value_text,
                     value_numeric,
                     source_name,
@@ -511,58 +522,31 @@ def main() -> int:
             inserted_rows = con.execute(
                 """
                 INSERT INTO sec_fact_normalized (
-                    fact_id,
-                    company_id,
                     filing_id,
+                    company_id,
                     cik,
-                    accession_number,
                     taxonomy,
                     concept,
-                    unit,
                     period_end_date,
-                    period_start_date,
-                    fiscal_year,
-                    fiscal_period,
-                    frame,
+                    unit,
                     value_text,
                     value_numeric,
                     available_at,
-                    accepted_at,
-                    filing_date,
                     source_name,
-                    source_file,
                     created_at
                 )
                 SELECT
-                    sha256(
-                        CONCAT_WS(
-                            '|',
-                            COALESCE(f.accession_number, ''),
-                            COALESCE(f.cik, ''),
-                            COALESCE(f.taxonomy, ''),
-                            COALESCE(f.concept, ''),
-                            COALESCE(CAST(f.period_end_date AS VARCHAR), ''),
-                            COALESCE(f.unit, ''),
-                            COALESCE(f.value_text, ''),
-                            COALESCE(CAST(f.value_numeric AS VARCHAR), '')
-                        )
-                    ) AS fact_id,
+                    b.filing_id,
                     COALESCE(
                         NULLIF(TRIM(CAST(m.company_id AS VARCHAR)), ''),
                         NULLIF(TRIM(CAST(b.company_id AS VARCHAR)), ''),
                         f.cik
                     ) AS company_id,
-                    b.filing_id,
                     f.cik,
-                    f.accession_number,
                     f.taxonomy,
                     f.concept,
-                    f.unit,
                     f.period_end_date,
-                    f.period_start_date,
-                    f.fiscal_year,
-                    f.fiscal_period,
-                    f.frame,
+                    f.unit,
                     f.value_text,
                     f.value_numeric,
                     COALESCE(
@@ -571,10 +555,7 @@ def main() -> int:
                         CAST(b.filing_date AS TIMESTAMP),
                         f.ingested_at
                     ) AS available_at,
-                    b.accepted_at,
-                    b.filing_date,
                     COALESCE(b.source_name, f.source_name) AS source_name,
-                    f.source_file,
                     CURRENT_TIMESTAMP AS created_at
                 FROM tmp_sec_fact_dedup f
                 LEFT JOIN tmp_sec_company_map m
