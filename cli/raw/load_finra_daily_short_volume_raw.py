@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Load FINRA daily short volume raw files into DuckDB.
+
+Objectif
+--------
+- Découvrir les fichiers raw déjà présents sur disque
+- Accepter aussi des manifests CSV
+- Charger de façon incrémentale vers la table raw
+- Éviter de tout supprimer/recharger à chaque run
+
+Format FINRA supporté
+---------------------
+Header 5 colonnes:
+Date|Symbol|ShortVolume|TotalVolume|Market
+
+Header 6 colonnes:
+Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market
+"""
+
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Iterable
@@ -11,17 +31,15 @@ import duckdb
 try:
     from tqdm import tqdm
 except Exception:
-    def tqdm(iterable, **kwargs):
+    def tqdm(iterable, **kwargs):  # type: ignore
         return iterable
 
 from stock_quant.infrastructure.db.short_data_schema import ShortDataSchemaManager
 
-
 EXPECTED_HEADER_5 = "Date|Symbol|ShortVolume|TotalVolume|Market"
 EXPECTED_HEADER_6 = "Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market"
-ALLOWED_MARKET_DIRS = {"CNMS", "FNQC", "FNRA", "FNSQ", "FNYX"}
+ALLOWED_MARKET_DIRS = {"CNMS", "FNQC", "FNRA", "FNSQ", "FNYX", "FORF"}
 
-# Batch volontairement modéré pour limiter l'impact des fichiers cassés.
 BATCH_SIZE = 100
 
 
@@ -46,477 +64,294 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--source-name",
-        default="finra_daily_non_otc",
-        help="Source name written to DB.",
+        default="finra_disk_raw",
+        help="Logical source name written in the raw table.",
     )
+    parser.add_argument(
+        "--default-root",
+        default="/home/marty/stock-quant-oop/data/raw/finra/daily_short_sale_volume",
+        help="Default disk root scanned when no explicit --source is supplied.",
+    )
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
-def _sql_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+def _log(message: str, verbose: bool) -> None:
+    if verbose:
+        print(message, flush=True)
 
 
-def _sql_file_list(paths: list[str]) -> str:
-    return "[" + ", ".join(_sql_quote(p) for p in paths) + "]"
+def _table_columns(con: duckdb.DuckDBPyConnection, table_name: str) -> set[str]:
+    return {
+        str(row[1]).strip()
+        for row in con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    }
 
 
-def _chunked(items: list[str], size: int) -> Iterable[list[str]]:
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+def ensure_incremental_index(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Ajoute une clé technique minimale pour éviter de recharger les mêmes fichiers.
+    """
+    cols = _table_columns(con, "finra_daily_short_volume_source_raw")
 
+    if "source_file" not in cols:
+        raise RuntimeError("finra_daily_short_volume_source_raw.source_file is required")
 
-def _looks_like_manifest(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() == ".csv" and "manifest" in path.name.lower()
+    if "source_name" not in cols:
+        raise RuntimeError("finra_daily_short_volume_source_raw.source_name is required")
 
-
-def _iter_manifest_paths(path: Path) -> list[Path]:
-    con = duckdb.connect()
-    try:
-        rows = con.execute(
-            """
-            SELECT path
-            FROM read_csv_auto(?, header=TRUE)
-            WHERE lower(trim(status)) = 'downloaded'
-            """,
-            [str(path)],
-        ).fetchall()
-    finally:
-        con.close()
-
-    out: list[Path] = []
-    for row in rows:
-        candidate = Path(str(row[0])).expanduser().resolve()
-        if candidate.is_file():
-            out.append(candidate)
-    return out
-
-
-def _expand_source_item(item: str) -> list[Path]:
-    if any(ch in item for ch in ["*", "?", "["]):
-        return [p.resolve() for p in sorted(Path().glob(item)) if p.is_file()]
-
-    path = Path(item).expanduser().resolve()
-
-    if path.is_dir():
-        return sorted(p.resolve() for p in path.rglob("*") if p.is_file())
-
-    if _looks_like_manifest(path):
-        return _iter_manifest_paths(path)
-
-    if path.is_file():
-        return [path]
-
-    return []
-
-
-def discover_files(sources: Iterable[str], manifests: Iterable[str]) -> list[Path]:
-    discovered: list[Path] = []
-
-    for item in sources:
-        discovered.extend(_expand_source_item(item))
-
-    for item in manifests:
-        discovered.extend(_iter_manifest_paths(Path(item).expanduser().resolve()))
-
-    filtered: list[Path] = []
-    seen: set[str] = set()
-
-    for path in discovered:
-        name = path.name.lower()
-        parent = path.parent.name.upper()
-
-        if parent not in ALLOWED_MARKET_DIRS:
-            continue
-        if not (name.endswith(".txt") or name.endswith(".csv")):
-            continue
-
-        key = str(path.resolve())
-        if key in seen:
-            continue
-
-        seen.add(key)
-        filtered.append(path.resolve())
-
-    return sorted(filtered)
-
-
-def _nonempty_lines(path: Path, limit: int = 3) -> list[str]:
-    lines: list[str] = []
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                value = line.strip()
-                if value:
-                    lines.append(value)
-                    if len(lines) >= limit:
-                        break
-    except Exception:
-        return []
-    return lines
-
-
-def _looks_like_valid_payload_date(token: str) -> bool:
-    token = token.strip()
-    return len(token) == 8 and token.isdigit()
-
-
-def split_files(paths: list[Path]) -> tuple[list[str], list[str], list[str], list[str], int, int]:
-    header_5_files: list[str] = []
-    header_6_files: list[str] = []
-    no_header_5_files: list[str] = []
-    no_header_6_files: list[str] = []
-    empty_files = 0
-    skipped_bad_payload_files = 0
-
-    for path in tqdm(paths, desc="probe_finra", unit="file", dynamic_ncols=True):
-        lines = _nonempty_lines(path, limit=3)
-        if not lines:
-            empty_files += 1
-            continue
-
-        first = lines[0]
-        second = lines[1] if len(lines) > 1 else ""
-
-        if first == EXPECTED_HEADER_5:
-            if not second or not _looks_like_valid_payload_date(second.split("|")[0]):
-                skipped_bad_payload_files += 1
-                continue
-            header_5_files.append(str(path))
-            continue
-
-        if first == EXPECTED_HEADER_6:
-            if not second or not _looks_like_valid_payload_date(second.split("|")[0]):
-                skipped_bad_payload_files += 1
-                continue
-            header_6_files.append(str(path))
-            continue
-
-        first_parts = [p.strip() for p in first.split("|")]
-
-        if len(first_parts) == 5 and _looks_like_valid_payload_date(first_parts[0]):
-            no_header_5_files.append(str(path))
-            continue
-
-        if len(first_parts) == 6 and _looks_like_valid_payload_date(first_parts[0]):
-            no_header_6_files.append(str(path))
-            continue
-
-        skipped_bad_payload_files += 1
-
-    return (
-        header_5_files,
-        header_6_files,
-        no_header_5_files,
-        no_header_6_files,
-        empty_files,
-        skipped_bad_payload_files,
-    )
-
-
-def _create_stage(con: duckdb.DuckDBPyConnection, stage_name: str) -> None:
-    con.execute(f"DROP TABLE IF EXISTS {stage_name}")
+    # Index non unique supportant le skip incrémental.
     con.execute(
-        f"""
-        CREATE TEMP TABLE {stage_name} (
-            trade_date DATE,
-            symbol VARCHAR,
-            short_volume DOUBLE,
-            short_exempt_volume DOUBLE,
-            total_volume DOUBLE,
-            market_code VARCHAR,
-            source_file VARCHAR,
-            publication_date DATE,
-            available_at TIMESTAMP,
-            source_name VARCHAR
-        )
+        """
+        CREATE INDEX IF NOT EXISTS idx_finra_daily_short_raw_source_file
+        ON finra_daily_short_volume_source_raw(source_name, source_file)
         """
     )
 
 
-def _insert_from_sql(con: duckdb.DuckDBPyConnection, sql: str, stage_name: str) -> int:
-    before = con.execute(f"SELECT COUNT(*) FROM {stage_name}").fetchone()[0]
-    con.execute(sql)
-    after = con.execute(f"SELECT COUNT(*) FROM {stage_name}").fetchone()[0]
-    return int(after - before)
-
-
-def _read_csv_common_options() -> str:
-    return """
-        delim='|',
-        filename=true,
-        all_varchar=true,
-        ignore_errors=true,
-        union_by_name=true,
-        strict_mode=false,
-        null_padding=true,
-        max_line_size=10000000
+def expand_sources(raw_sources: list[str], manifests: list[str], default_root: str) -> list[Path]:
     """
-
-
-def _insert_batch_header5_sql(stage_name: str, files: list[str], source_name: str) -> str:
-    return f"""
-    INSERT INTO {stage_name}
-    SELECT
-        CAST(strptime(Date, '%Y%m%d') AS DATE) AS trade_date,
-        upper(trim(Symbol)) AS symbol,
-        CAST(ShortVolume AS DOUBLE) AS short_volume,
-        NULL::DOUBLE AS short_exempt_volume,
-        CAST(TotalVolume AS DOUBLE) AS total_volume,
-        upper(trim(Market)) AS market_code,
-        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
-        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
-        CURRENT_TIMESTAMP AS available_at,
-        {_sql_quote(source_name)} AS source_name
-    FROM read_csv(
-        {_sql_file_list(files)},
-        header=true,
-        {_read_csv_common_options()}
-    )
-    WHERE trim(coalesce(Symbol, '')) <> ''
+    Résout:
+    - fichiers
+    - répertoires
+    - globs
+    - manifests CSV (colonne local_path ou path)
+    - fallback vers le default_root si aucun source explicite
     """
+    candidates: list[Path] = []
+
+    # 1) Sources explicites.
+    for raw in raw_sources:
+        path = Path(raw).expanduser()
+        if any(ch in raw for ch in ["*", "?", "["]):
+            for matched in sorted(Path().glob(raw)):
+                if matched.is_file():
+                    candidates.append(matched.resolve())
+            continue
+
+        if path.is_file():
+            candidates.append(path.resolve())
+        elif path.is_dir():
+            for file_path in sorted(path.rglob("*")):
+                if file_path.is_file():
+                    candidates.append(file_path.resolve())
+
+    # 2) Manifests.
+    for manifest in manifests:
+        manifest_path = Path(manifest).expanduser().resolve()
+        if not manifest_path.exists():
+            continue
+
+        with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                local_path = (row.get("local_path") or row.get("path") or "").strip()
+                if not local_path:
+                    continue
+                path = Path(local_path).expanduser()
+                if path.exists() and path.is_file():
+                    candidates.append(path.resolve())
+
+    # 3) Fallback si rien n'est fourni.
+    if not candidates:
+        root = Path(default_root).expanduser().resolve()
+        if root.exists():
+            for file_path in sorted(root.rglob("*")):
+                if file_path.is_file():
+                    candidates.append(file_path.resolve())
+
+    # Déduplication stable.
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
 
 
-def _insert_batch_header6_sql(stage_name: str, files: list[str], source_name: str) -> str:
-    return f"""
-    INSERT INTO {stage_name}
-    SELECT
-        CAST(strptime(Date, '%Y%m%d') AS DATE) AS trade_date,
-        upper(trim(Symbol)) AS symbol,
-        CAST(ShortVolume AS DOUBLE) AS short_volume,
-        CAST(ShortExemptVolume AS DOUBLE) AS short_exempt_volume,
-        CAST(TotalVolume AS DOUBLE) AS total_volume,
-        upper(trim(Market)) AS market_code,
-        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
-        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
-        CURRENT_TIMESTAMP AS available_at,
-        {_sql_quote(source_name)} AS source_name
-    FROM read_csv(
-        {_sql_file_list(files)},
-        header=true,
-        {_read_csv_common_options()}
-    )
-    WHERE trim(coalesce(Symbol, '')) <> ''
+def is_supported_finra_daily_short_file(path: Path) -> bool:
+    if path.suffix.lower() not in {".txt", ".csv"}:
+        return False
+
+    # On supporte les historiques déjà rangés par market.
+    if path.parent.name.upper() in ALLOWED_MARKET_DIRS:
+        return True
+
+    # On supporte aussi les noms finra historiques si le parent n'est pas classé.
+    name = path.name.upper()
+    return name.startswith(("CNMS", "FNQC", "FNRA", "FNSQ", "FNYX", "FORF")) and "SHVOL" in name
+
+
+def read_finra_file(path: Path) -> list[tuple]:
     """
-
-
-def _insert_batch_no_header5_sql(stage_name: str, files: list[str], source_name: str) -> str:
-    return f"""
-    INSERT INTO {stage_name}
-    SELECT
-        CAST(strptime(column0, '%Y%m%d') AS DATE) AS trade_date,
-        upper(trim(column1)) AS symbol,
-        CAST(column2 AS DOUBLE) AS short_volume,
-        NULL::DOUBLE AS short_exempt_volume,
-        CAST(column3 AS DOUBLE) AS total_volume,
-        upper(trim(column4)) AS market_code,
-        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
-        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
-        CURRENT_TIMESTAMP AS available_at,
-        {_sql_quote(source_name)} AS source_name
-    FROM read_csv(
-        {_sql_file_list(files)},
-        header=false,
-        {_read_csv_common_options()}
-    )
-    WHERE trim(coalesce(column1, '')) <> ''
+    Retourne une liste de tuples compatibles avec la table raw.
+    On normalise vers:
+    trade_date, symbol, short_volume, short_exempt_volume, total_volume, market, source_file
     """
+    rows: list[tuple] = []
+
+    text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not text:
+        return rows
+
+    header = text[0].strip()
+
+    if header == EXPECTED_HEADER_5:
+        has_short_exempt = False
+    elif header == EXPECTED_HEADER_6:
+        has_short_exempt = True
+    else:
+        # Fichier non reconnu: on skip.
+        return rows
+
+    for line in text[1:]:
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split("|")
+        if has_short_exempt and len(parts) != 6:
+            continue
+        if not has_short_exempt and len(parts) != 5:
+            continue
+
+        if has_short_exempt:
+            trade_date, symbol, short_volume, short_exempt_volume, total_volume, market = parts
+        else:
+            trade_date, symbol, short_volume, total_volume, market = parts
+            short_exempt_volume = None
+
+        rows.append(
+            (
+                trade_date.strip(),
+                symbol.strip().upper(),
+                int(short_volume),
+                int(short_exempt_volume) if short_exempt_volume not in (None, "", " ") else None,
+                int(total_volume),
+                market.strip().upper(),
+                str(path.resolve()),
+            )
+        )
+
+    return rows
 
 
-def _insert_batch_no_header6_sql(stage_name: str, files: list[str], source_name: str) -> str:
-    return f"""
-    INSERT INTO {stage_name}
-    SELECT
-        CAST(strptime(column0, '%Y%m%d') AS DATE) AS trade_date,
-        upper(trim(column1)) AS symbol,
-        CAST(column2 AS DOUBLE) AS short_volume,
-        CAST(column3 AS DOUBLE) AS short_exempt_volume,
-        CAST(column4 AS DOUBLE) AS total_volume,
-        upper(trim(column5)) AS market_code,
-        regexp_extract(filename, '[^/\\\\]+$', 0) AS source_file,
-        CAST(strptime(regexp_extract(regexp_extract(filename, '[^/\\\\]+$', 0), '(\\d{{8}})', 1), '%Y%m%d') AS DATE) AS publication_date,
-        CURRENT_TIMESTAMP AS available_at,
-        {_sql_quote(source_name)} AS source_name
-    FROM read_csv(
-        {_sql_file_list(files)},
-        header=false,
-        {_read_csv_common_options()}
-    )
-    WHERE trim(coalesce(column1, '')) <> ''
-    """
-
-
-def _insert_with_fallback(
+def files_already_loaded(
     con: duckdb.DuckDBPyConnection,
-    stage_name: str,
-    batch: list[str],
-    batch_sql_builder,
+    *,
     source_name: str,
-    bad_files: list[dict],
+) -> set[str]:
+    rows = con.execute(
+        """
+        SELECT DISTINCT source_file
+        FROM finra_daily_short_volume_source_raw
+        WHERE source_name = ?
+        """,
+        [source_name],
+    ).fetchall()
+    return {str(row[0]) for row in rows if row and row[0] is not None}
+
+
+def insert_rows(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    source_name: str,
+    records: list[tuple],
 ) -> int:
-    try:
-        sql = batch_sql_builder(stage_name, batch, source_name)
-        return _insert_from_sql(con, sql, stage_name)
-    except Exception as exc:
-        inserted = 0
-        for path in batch:
-            try:
-                sql = batch_sql_builder(stage_name, [path], source_name)
-                inserted += _insert_from_sql(con, sql, stage_name)
-            except Exception as single_exc:
-                bad_files.append(
-                    {
-                        "file": path,
-                        "error": str(single_exc),
-                    }
-                )
-        return inserted
+    if not records:
+        return 0
+
+    con.executemany(
+        """
+        INSERT INTO finra_daily_short_volume_source_raw (
+            trade_date,
+            symbol,
+            short_volume,
+            short_exempt_volume,
+            total_volume,
+            market,
+            source_file,
+            source_name
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                record[0],
+                record[1],
+                record[2],
+                record[3],
+                record[4],
+                record[5],
+                record[6],
+                source_name,
+            )
+            for record in records
+        ],
+    )
+    return len(records)
 
 
 def main() -> int:
     args = parse_args()
-    db_path = str(Path(args.db_path).expanduser().resolve())
-    repo_root = Path("/home/marty/stock-quant-oop")
-    logs_dir = repo_root / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    bad_files_log = logs_dir / "finra_daily_short_volume_bad_files.json"
 
-    source_items = list(args.sources or [])
-    manifest_items = list(args.manifests or [])
-
-    if not source_items and not manifest_items:
-        raise SystemExit("At least one --source or --manifest is required.")
-
-    discovered = discover_files(source_items, manifest_items)
-    if not discovered:
-        raise SystemExit("No FINRA daily short volume files discovered.")
-
-    con = duckdb.connect(db_path)
+    con = duckdb.connect(args.db_path)
     try:
-        schema = ShortDataSchemaManager()
-        schema.ensure_all(con)
+        ShortDataSchemaManager(con).ensure_tables()
+        ensure_incremental_index(con)
 
-        rows_before = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
+        discovered = expand_sources(args.sources, args.manifests, args.default_root)
+        discovered = [path for path in discovered if is_supported_finra_daily_short_file(path)]
 
-        stage_name = "tmp_finra_daily_short_volume_stage"
-        _create_stage(con, stage_name)
-
-        h5, h6, nh5, nh6, empty_files, skipped_bad = split_files(discovered)
-        bad_files: list[dict] = []
-        inserted = 0
-
-        for batch in tqdm(list(_chunked(h5, BATCH_SIZE)), desc="load_h5", dynamic_ncols=True):
-            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_header5_sql, args.source_name, bad_files)
-
-        for batch in tqdm(list(_chunked(h6, BATCH_SIZE)), desc="load_h6", dynamic_ncols=True):
-            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_header6_sql, args.source_name, bad_files)
-
-        for batch in tqdm(list(_chunked(nh5, BATCH_SIZE)), desc="load_nh5", dynamic_ncols=True):
-            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_no_header5_sql, args.source_name, bad_files)
-
-        for batch in tqdm(list(_chunked(nh6, BATCH_SIZE)), desc="load_nh6", dynamic_ncols=True):
-            inserted += _insert_with_fallback(con, stage_name, batch, _insert_batch_no_header6_sql, args.source_name, bad_files)
-
-        con.execute("DELETE FROM finra_daily_short_volume_source_raw")
-        con.execute(
-            f"""
-            INSERT INTO finra_daily_short_volume_source_raw (
-                trade_date,
-                symbol,
-                short_volume,
-                short_exempt_volume,
-                total_volume,
-                market_code,
-                source_file,
-                publication_date,
-                available_at,
-                source_name
-            )
-            SELECT
-                trade_date,
-                symbol,
-                short_volume,
-                short_exempt_volume,
-                total_volume,
-                market_code,
-                source_file,
-                publication_date,
-                available_at,
-                source_name
-            FROM {stage_name}
-            WHERE symbol IS NOT NULL
-              AND trade_date IS NOT NULL
-            """
-        )
-
-        con.execute("DELETE FROM finra_daily_short_volume_sources")
-        con.execute(
-            """
-            INSERT INTO finra_daily_short_volume_sources (
-                source_file,
-                publication_date,
-                market_code,
-                row_count,
-                loaded_at,
-                source_name
-            )
-            SELECT
-                source_file,
-                publication_date,
-                market_code,
-                COUNT(*) AS row_count,
-                CURRENT_TIMESTAMP AS loaded_at,
-                MAX(source_name) AS source_name
-            FROM finra_daily_short_volume_source_raw
-            GROUP BY 1,2,3
-            """
-        )
-
-        rows_after = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_source_raw").fetchone()[0])
-        source_rows_after = int(con.execute("SELECT COUNT(*) FROM finra_daily_short_volume_sources").fetchone()[0])
-
-        bad_files_log.write_text(
-            json.dumps(
-                {
-                    "bad_file_count": len(bad_files),
-                    "bad_files": bad_files,
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        print(f"[load_finra_daily_short_volume_raw] db_path={db_path}", flush=True)
         print(f"[load_finra_daily_short_volume_raw] discovered_files={len(discovered)}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] empty_files={empty_files}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] skipped_bad_payload_files={skipped_bad}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] batch_parse_failures={len(bad_files)}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] rows_before={rows_before}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] rows_after={rows_after}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] source_rows_after={source_rows_after}", flush=True)
-        print(f"[load_finra_daily_short_volume_raw] bad_files_log={bad_files_log}", flush=True)
 
-        print(
-            json.dumps(
-                {
-                    "db_path": db_path,
-                    "discovered_files": len(discovered),
-                    "header5_files": len(h5),
-                    "header6_files": len(h6),
-                    "no_header5_files": len(nh5),
-                    "no_header6_files": len(nh6),
-                    "empty_files": empty_files,
-                    "skipped_bad_payload_files": skipped_bad,
-                    "bad_file_count": len(bad_files),
-                    "stage_inserted_rows": inserted,
-                    "final_raw_rows": rows_after,
-                    "final_source_rows": source_rows_after,
-                    "bad_files_log": str(bad_files_log),
-                },
-                default=str,
-            ),
-            flush=True,
-        )
+        loaded_files = files_already_loaded(con, source_name=args.source_name)
+        to_load = [path for path in discovered if str(path.resolve()) not in loaded_files]
+
+        print(f"[load_finra_daily_short_volume_raw] already_loaded_files={len(loaded_files)}", flush=True)
+        print(f"[load_finra_daily_short_volume_raw] files_to_load={len(to_load)}", flush=True)
+
+        inserted_rows_total = 0
+        loaded_files_count = 0
+        skipped_empty_or_invalid = 0
+
+        for batch_start in range(0, len(to_load), BATCH_SIZE):
+            batch_paths = to_load[batch_start: batch_start + BATCH_SIZE]
+
+            for path in tqdm(
+                batch_paths,
+                desc="finra_daily_short_raw",
+                unit="file",
+                dynamic_ncols=True,
+                mininterval=0.5,
+            ):
+                records = read_finra_file(path)
+                if not records:
+                    skipped_empty_or_invalid += 1
+                    _log(f"[skip_invalid_or_empty] path={path}", args.verbose)
+                    continue
+
+                inserted = insert_rows(con, source_name=args.source_name, records=records)
+                inserted_rows_total += inserted
+                loaded_files_count += 1
+
+                _log(
+                    f"[loaded] path={path} inserted_rows={inserted}",
+                    args.verbose,
+                )
+
+        payload = {
+            "source_name": args.source_name,
+            "discovered_files": len(discovered),
+            "already_loaded_files": len(loaded_files),
+            "files_loaded_now": loaded_files_count,
+            "files_skipped_invalid_or_empty": skipped_empty_or_invalid,
+            "inserted_rows_total": inserted_rows_total,
+        }
+        print(json.dumps(payload, indent=2), flush=True)
         return 0
     finally:
         con.close()
