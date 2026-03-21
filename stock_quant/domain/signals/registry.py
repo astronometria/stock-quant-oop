@@ -12,7 +12,7 @@ dans les pipelines ou dans le moteur de backtest.
 from typing import Any
 
 from stock_quant.domain.signals.base import BaseSignal
-from stock_quant.domain.signals.price import RsiThresholdSignal
+from stock_quant.domain.signals.price import SmaCrossRsiFilterSignal, RsiThresholdSignal, SmaCrossSignal
 from stock_quant.domain.signals.short.short_volume_ratio_threshold_signal import (
     ShortVolumeRatioThresholdSignal,
 )
@@ -82,4 +82,6 @@ def build_default_signal_registry() -> SignalRegistry:
     registry = SignalRegistry()
     registry.register(ShortVolumeRatioThresholdSignal)
     registry.register(RsiThresholdSignal)
+    registry.register(SmaCrossSignal)
+    registry.register(SmaCrossRsiFilterSignal)
     return registry

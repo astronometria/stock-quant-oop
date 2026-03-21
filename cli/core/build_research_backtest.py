@@ -194,6 +194,44 @@ def main() -> int:
             "END"
         )
 
+    
+    elif signal.signal_name == "sma_cross_rsi_filter":
+        fast = str(signal.params["fast_feature_name"])
+        slow = str(signal.params["slow_feature_name"])
+        rsi = str(signal.params["rsi_feature_name"])
+        rsi_threshold = float(signal.params["rsi_threshold"])
+
+        signal_sql_expr = (
+            "CASE "
+            f"WHEN d.{fast} IS NULL OR d.{slow} IS NULL OR d.{rsi} IS NULL THEN NULL "
+            f"WHEN d.{fast} > d.{slow} AND d.{rsi} <= {rsi_threshold} THEN 1.0 "
+            "ELSE 0.0 "
+            "END"
+        )
+
+    elif signal.signal_name == "sma_cross":
+        fast_feature_name = str(signal.params["fast_feature_name"])
+        slow_feature_name = str(signal.params["slow_feature_name"])
+
+        allowed = {"sma_20", "sma_50", "sma_200"}
+        if fast_feature_name not in allowed:
+            raise RuntimeError(
+                f"sma_cross SQL-first implementation currently does not support "
+                f"fast_feature_name={fast_feature_name!r}"
+            )
+        if slow_feature_name not in allowed:
+            raise RuntimeError(
+                f"sma_cross SQL-first implementation currently does not support "
+                f"slow_feature_name={slow_feature_name!r}"
+            )
+
+        signal_sql_expr = (
+            "CASE "
+            f"WHEN d.{fast_feature_name} IS NULL OR d.{slow_feature_name} IS NULL THEN NULL "
+            f"WHEN d.{fast_feature_name} > d.{slow_feature_name} THEN 1.0 "
+            "ELSE 0.0 "
+            "END"
+        )
     else:
         raise RuntimeError(
             f"build_research_backtest.py does not yet support signal_name={signal.signal_name!r} in SQL-first mode"
