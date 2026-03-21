@@ -1,36 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-Research backtest builder.
-
-Objectif
---------
-Construire un backtest long-only, split-aware et transaction-cost aware
-à partir de:
-- research_training_dataset
-- research_labels
-- research_split_manifest
-
-Transition en cours
--------------------
-Cette version garde une exécution SQL-first, mais ne hardcode plus
-directement la logique métier du signal au niveau CLI.
-Le signal est désormais résolu via le registry de signaux du domaine.
-
-Version de transition
----------------------
-Pour préserver:
-- la stabilité opérationnelle
-- la reproductibilité
-- la compatibilité avec les runs déjà en place
-
-...on supporte pour l'instant en SQL-first le signal:
-- short_volume_ratio_threshold
-
-Cela prépare le terrain pour RSI / SMA / MACD sans casser le flux actuel.
-"""
-
 import argparse
 import json
 from datetime import datetime, timezone
@@ -64,14 +34,6 @@ def _normalize_signal_params_json(
     signal_name: str,
     signal_threshold: float,
 ) -> dict[str, Any]:
-    """
-    Normalise les paramètres du signal.
-
-    Règle de transition:
-    - si --signal-params-json est fourni, on le parse
-    - sinon, on construit un payload compatible avec le signal par défaut
-      à partir de --signal-threshold
-    """
     if raw is None or not raw.strip():
         if signal_name == "short_volume_ratio_threshold":
             return {
@@ -94,7 +56,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split-id", required=True)
     p.add_argument("--transaction-cost-bps", type=float, default=10.0)
 
-    # Nouveau contrat de signal.
     p.add_argument(
         "--signal-name",
         default="short_volume_ratio_threshold",
@@ -112,7 +73,6 @@ def parse_args() -> argparse.Namespace:
         help="Decision to execution lag in bars. Must be >= 1.",
     )
 
-    # Compat temporaire.
     p.add_argument(
         "--signal-threshold",
         type=float,
@@ -120,12 +80,20 @@ def parse_args() -> argparse.Namespace:
         help="Compatibility shortcut for the default short_volume_ratio_threshold signal.",
     )
 
-    # Alignement runtime avec les autres scripts research.
     p.add_argument("--memory-limit", default="24GB")
     p.add_argument("--threads", type=int, default=6)
     p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
+
+
+def _ensure_signal_params_column(con: duckdb.DuckDBPyConnection) -> None:
+    cols = {
+        str(row[1]).strip()
+        for row in con.execute("PRAGMA table_info('research_backtest')").fetchall()
+    }
+    if "signal_params_json" not in cols:
+        con.execute("ALTER TABLE research_backtest ADD COLUMN signal_params_json JSON")
 
 
 def main() -> int:
@@ -134,9 +102,6 @@ def main() -> int:
 
     print(f"[build_research_backtest] db_path={db}", flush=True)
 
-    # ------------------------------------------------------------------
-    # Résolution research-grade du signal.
-    # ------------------------------------------------------------------
     registry = build_default_signal_registry()
     signal_params = _normalize_signal_params_json(
         args.signal_params_json,
@@ -151,10 +116,6 @@ def main() -> int:
     _log(f"[backtest] signal_params={json.dumps(signal.params, sort_keys=True)}", args.verbose)
     _log(f"[backtest] execution_lag_bars={execution_lag_bars}", args.verbose)
 
-    # ------------------------------------------------------------------
-    # Pour cette phase, on garde une implémentation SQL-first ciblée.
-    # On n'autorise explicitement que le signal actuellement câblé.
-    # ------------------------------------------------------------------
     if signal.signal_name == "short_volume_ratio_threshold":
         feature_name = str(signal.params["feature_name"])
         threshold = float(signal.params["threshold"])
@@ -194,21 +155,6 @@ def main() -> int:
             "END"
         )
 
-    
-    elif signal.signal_name == "sma_cross_rsi_filter":
-        fast = str(signal.params["fast_feature_name"])
-        slow = str(signal.params["slow_feature_name"])
-        rsi = str(signal.params["rsi_feature_name"])
-        rsi_threshold = float(signal.params["rsi_threshold"])
-
-        signal_sql_expr = (
-            "CASE "
-            f"WHEN d.{fast} IS NULL OR d.{slow} IS NULL OR d.{rsi} IS NULL THEN NULL "
-            f"WHEN d.{fast} > d.{slow} AND d.{rsi} <= {rsi_threshold} THEN 1.0 "
-            "ELSE 0.0 "
-            "END"
-        )
-
     elif signal.signal_name == "sma_cross":
         fast_feature_name = str(signal.params["fast_feature_name"])
         slow_feature_name = str(signal.params["slow_feature_name"])
@@ -232,6 +178,38 @@ def main() -> int:
             "ELSE 0.0 "
             "END"
         )
+
+    elif signal.signal_name == "sma_cross_rsi_filter":
+        fast_feature_name = str(signal.params["fast_feature_name"])
+        slow_feature_name = str(signal.params["slow_feature_name"])
+        rsi_feature_name = str(signal.params["rsi_feature_name"])
+        rsi_threshold = float(signal.params["rsi_threshold"])
+
+        allowed = {"sma_20", "sma_50", "sma_200"}
+        if fast_feature_name not in allowed:
+            raise RuntimeError(
+                f"sma_cross_rsi_filter SQL-first implementation currently does not support "
+                f"fast_feature_name={fast_feature_name!r}"
+            )
+        if slow_feature_name not in allowed:
+            raise RuntimeError(
+                f"sma_cross_rsi_filter SQL-first implementation currently does not support "
+                f"slow_feature_name={slow_feature_name!r}"
+            )
+        if rsi_feature_name != "rsi_14":
+            raise RuntimeError(
+                "sma_cross_rsi_filter SQL-first implementation currently requires "
+                "rsi_feature_name='rsi_14'"
+            )
+
+        signal_sql_expr = (
+            "CASE "
+            f"WHEN d.{fast_feature_name} IS NULL OR d.{slow_feature_name} IS NULL OR d.rsi_14 IS NULL THEN NULL "
+            f"WHEN d.{fast_feature_name} > d.{slow_feature_name} AND d.rsi_14 <= {rsi_threshold} THEN 1.0 "
+            "ELSE 0.0 "
+            "END"
+        )
+
     else:
         raise RuntimeError(
             f"build_research_backtest.py does not yet support signal_name={signal.signal_name!r} in SQL-first mode"
@@ -239,11 +217,9 @@ def main() -> int:
 
     con = duckdb.connect(str(db))
     try:
-        # Réglages DuckDB homogènes avec le reste de la pipeline.
         con.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
         con.execute(f"PRAGMA threads={args.threads}")
         con.execute("PRAGMA preserve_insertion_order=false")
-
         temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
         con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
 
@@ -255,6 +231,7 @@ def main() -> int:
         _log(f"[backtest] transaction_cost_bps={args.transaction_cost_bps}", args.verbose)
 
         ResearchBacktestSchemaManager(con).ensure_tables()
+        _ensure_signal_params_column(con)
 
         split = con.execute(
             """
@@ -271,39 +248,12 @@ def main() -> int:
             """,
             [args.split_id],
         ).fetchone()
-
         if split is None:
             raise RuntimeError("split_id not found")
 
         _, train_start, train_end, valid_start, valid_end, test_start, test_end = split
-
         backtest_id = _backtest_id(args.dataset_id, args.split_id)
 
-        # Idempotence simple pour ce dataset/split.
-        con.execute(
-            """
-            DELETE FROM research_backtest
-            WHERE dataset_id = ? AND split_id = ?
-            """,
-            [args.dataset_id, args.split_id],
-        )
-
-        # ------------------------------------------------------------------
-        # SQL-first signal materialization.
-        #
-        # Important:
-        # - le signal lit uniquement des colonnes présentes dans le dataset
-        # - aucune lecture de table serving
-        # - décision au jour t
-        # - coût de turnover basé sur le changement de position observé
-        # - execution_lag_bars conservé dans le payload final pour audit
-        #
-        # Note de transition:
-        # Le lag n'est pas encore appliqué au label join lui-même, car le dataset
-        # de labels actuel est déjà construit sur l'alignement research existant.
-        # On le valide et on le trace maintenant; l'application stricte au moteur
-        # pourra être durcie lors de l'étape suivante si on étend le schéma labels.
-        # ------------------------------------------------------------------
         rows = con.execute(
             f"""
             WITH joined AS (
@@ -311,7 +261,6 @@ def main() -> int:
                     d.dataset_id,
                     d.symbol,
                     d.as_of_date,
-                    d.short_volume_ratio,
                     l.fwd_return_1d,
                     CASE
                         WHEN d.as_of_date BETWEEN ? AND ? THEN 'train'
@@ -376,8 +325,7 @@ def main() -> int:
                 STDDEV_SAMP(net_strategy_return) AS volatility,
                 CASE
                     WHEN STDDEV_SAMP(net_strategy_return) IS NULL
-                      OR STDDEV_SAMP(net_strategy_return) = 0
-                    THEN NULL
+                      OR STDDEV_SAMP(net_strategy_return) = 0 THEN NULL
                     ELSE AVG(net_strategy_return) / STDDEV_SAMP(net_strategy_return)
                 END AS sharpe,
                 AVG(turnover_unit) AS turnover,
@@ -405,6 +353,7 @@ def main() -> int:
         ).fetchall()
 
         results: list[dict[str, object]] = []
+        signal_params_json = json.dumps(signal.params, sort_keys=True)
 
         for row in rows:
             (
@@ -428,6 +377,7 @@ def main() -> int:
                     split_id,
                     partition_name,
                     signal_name,
+                    signal_params_json,
                     transaction_cost_bps,
                     gross_return,
                     total_cost,
@@ -438,7 +388,7 @@ def main() -> int:
                     turnover,
                     n_obs
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     backtest_id,
@@ -446,6 +396,7 @@ def main() -> int:
                     args.split_id,
                     partition_name,
                     signal.signal_name,
+                    signal_params_json,
                     args.transaction_cost_bps,
                     gross_return,
                     total_cost,
@@ -487,7 +438,6 @@ def main() -> int:
             "results": results,
             "created_at": _now().isoformat(),
         }
-
         print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
         return 0
     finally:
