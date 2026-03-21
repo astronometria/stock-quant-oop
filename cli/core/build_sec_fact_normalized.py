@@ -2,20 +2,19 @@
 from __future__ import annotations
 
 """
-SQL-first builder for sec_fact_normalized with visible chunk progress.
+Incremental + chunked builder for sec_fact_normalized with visible progress.
 
 Objectif
 --------
-Construire `sec_fact_normalized` à partir de `sec_xbrl_fact_raw` en gardant:
-- une logique SQL-first
-- un full refresh déterministe
-- une progression visible dans le terminal
-- un découpage par mois de `period_end_date`
+Construire `sec_fact_normalized` de façon:
+- incrémentale
+- chunkée
+- compatible avec le schéma local réel
+- visible dans le terminal
 
-Important
----------
-Ce script est volontairement aligné sur le schéma réel local de
-`sec_fact_normalized`, qui contient actuellement seulement:
+Schéma cible réel
+-----------------
+Cette version s'aligne sur la table locale actuelle:
 
 - filing_id
 - company_id
@@ -30,16 +29,34 @@ Ce script est volontairement aligné sur le schéma réel local de
 - source_name
 - created_at
 
-Donc:
-- on NE tente PAS d'insérer de `fact_id`
-- on NE tente PAS d'insérer accession_number / frame / fiscal_year / etc.
-- on garde un full refresh déterministe, mais chunké par mois pour voir la progression
-
-Notes PIT
+IMPORTANT
 ---------
-- `available_at` prioritaire depuis `sec_filing.available_at` si disponible
-- sinon fallback technique sur `ingested_at` du raw
-- on n'utilise jamais `period_end_date` comme date de publication
+Le signal incrémental NE DOIT PAS dépendre de `sec_filing.created_at`,
+car l'upsert des filings peut recréer massivement les lignes et faire croire
+à un "full refresh" alors qu'aucun nouveau raw fact n'est arrivé.
+
+Stratégie incrémentale retenue
+------------------------------
+1) Maintenir un watermark dans `sec_pipeline_state`
+2) Détecter les mois impactés uniquement via:
+   - nouveaux raw facts (`sec_xbrl_fact_raw.ingested_at > watermark`)
+   - overlap récent configurable
+3) Pour chaque mois impacté:
+   - DELETE les rows de ce mois dans sec_fact_normalized
+   - rebuild complet de ce mois depuis le raw
+4) Enrichir au passage avec le meilleur `sec_filing` disponible par accession_number
+5) Mettre à jour le watermark à la fin si succès complet
+
+Pourquoi month-level rebuild
+----------------------------
+Le schéma cible ne stocke pas accession_number ni source_file.
+Donc un delete/upsert au grain accession n'est pas fiable directement
+dans la table cible.
+Le rebuild par mois de `period_end_date` reste:
+- simple
+- déterministe
+- robuste
+- compatible avec l'historique actuel
 """
 
 import argparse
@@ -59,16 +76,16 @@ from stock_quant.infrastructure.db.sec_schema import SecSchemaManager
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
+PIPELINE_NAME = "build_sec_fact_normalized_incremental"
+
+
 def _quote_sql_string(value: str) -> str:
     return str(value).replace("'", "''")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build sec_fact_normalized from sec_xbrl_fact_raw with chunked monthly progress."
+        description="Build sec_fact_normalized incrementally from sec_xbrl_fact_raw with chunked monthly progress."
     )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
     parser.add_argument("--memory-limit", default="24GB", help="DuckDB memory_limit pragma, e.g. 8GB, 24GB.")
@@ -89,9 +106,10 @@ def parse_args() -> argparse.Namespace:
         help="Upper bound for accepted period_end_date values.",
     )
     parser.add_argument(
-        "--truncate",
-        action="store_true",
-        help="Conservé pour compatibilité. Le build reste un full refresh déterministe.",
+        "--reprocess-recent-months",
+        type=int,
+        default=3,
+        help="Small overlap window to reprocess recent months on every run.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     return parser.parse_args()
@@ -131,23 +149,139 @@ def _fetch_one_dict(con: Any, sql: str, params: list[Any] | None = None) -> dict
     return {columns[i]: row[i] for i in range(len(columns))}
 
 
-def _fetch_month_starts(con: Any, min_date: str, max_date: str) -> list[Any]:
-    rows = con.execute(
+def _ensure_pipeline_state_table(con: Any) -> None:
+    con.execute(
         """
-        SELECT DISTINCT date_trunc('month', period_end_date)::DATE AS month_start
+        CREATE TABLE IF NOT EXISTS sec_pipeline_state (
+            pipeline_name VARCHAR,
+            last_raw_ingested_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            notes VARCHAR
+        )
+        """
+    )
+
+
+def _get_watermark(con: Any, pipeline_name: str) -> Any:
+    row = con.execute(
+        """
+        SELECT last_raw_ingested_at
+        FROM sec_pipeline_state
+        WHERE pipeline_name = ?
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        [pipeline_name],
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _set_watermark(con: Any, pipeline_name: str, watermark: Any, notes: str) -> None:
+    con.execute(
+        """
+        DELETE FROM sec_pipeline_state
+        WHERE pipeline_name = ?
+        """,
+        [pipeline_name],
+    )
+    con.execute(
+        """
+        INSERT INTO sec_pipeline_state (
+            pipeline_name,
+            last_raw_ingested_at,
+            updated_at,
+            notes
+        )
+        VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+        """,
+        [pipeline_name, watermark, notes],
+    )
+
+
+def _get_global_raw_max_ingested_at(con: Any) -> Any:
+    return con.execute(
+        """
+        SELECT MAX(ingested_at)
         FROM sec_xbrl_fact_raw
-        WHERE period_end_date IS NOT NULL
-          AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+        """
+    ).fetchone()[0]
+
+
+def _fetch_impacted_months(
+    con: Any,
+    watermark: Any,
+    min_period_end_date: str,
+    max_period_end_date: str,
+    reprocess_recent_months: int,
+) -> list[str]:
+    """
+    Mois impactés uniquement par:
+    - nouveaux raw facts
+    - overlap récent
+
+    IMPORTANT:
+    On n'utilise PAS sec_filing.created_at ici.
+    """
+    if watermark is None:
+        rows = con.execute(
+            """
+            SELECT DISTINCT date_trunc('month', period_end_date)::DATE AS month_start
+            FROM sec_xbrl_fact_raw
+            WHERE period_end_date IS NOT NULL
+              AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+            ORDER BY month_start
+            """,
+            [min_period_end_date, max_period_end_date],
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    rows = con.execute(
+        f"""
+        WITH overlap_floor AS (
+            SELECT
+                CAST(
+                    date_trunc('month', MAX(period_end_date)) - INTERVAL '{int(reprocess_recent_months)} month'
+                    AS DATE
+                ) AS floor_date
+            FROM sec_xbrl_fact_raw
+            WHERE period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+        ),
+        new_raw_months AS (
+            SELECT DISTINCT date_trunc('month', period_end_date)::DATE AS month_start
+            FROM sec_xbrl_fact_raw
+            WHERE ingested_at > CAST(? AS TIMESTAMP)
+              AND period_end_date IS NOT NULL
+              AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+        ),
+        overlap_months AS (
+            SELECT DISTINCT date_trunc('month', period_end_date)::DATE AS month_start
+            FROM sec_xbrl_fact_raw, overlap_floor
+            WHERE period_end_date IS NOT NULL
+              AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+              AND period_end_date >= overlap_floor.floor_date
+        )
+        SELECT DISTINCT month_start
+        FROM (
+            SELECT month_start FROM new_raw_months
+            UNION ALL
+            SELECT month_start FROM overlap_months
+        ) x
+        WHERE month_start IS NOT NULL
         ORDER BY month_start
         """,
-        [min_date, max_date],
+        [
+            min_period_end_date,
+            max_period_end_date,
+            watermark,
+            min_period_end_date,
+            max_period_end_date,
+            min_period_end_date,
+            max_period_end_date,
+        ],
     ).fetchall()
-    return [row[0] for row in rows]
+    return [str(row[0]) for row in rows]
 
 
-# =============================================================================
-# Main
-# =============================================================================
 def main() -> int:
     args = parse_args()
 
@@ -168,6 +302,10 @@ def main() -> int:
             f"{args.min_period_end_date} -> {args.max_period_end_date}",
             flush=True,
         )
+        print(
+            f"[build_sec_fact_normalized] reprocess_recent_months={args.reprocess_recent_months}",
+            flush=True,
+        )
 
     session_factory = DuckDbSessionFactory(config.db_path)
 
@@ -178,23 +316,19 @@ def main() -> int:
             raise RuntimeError("missing active DB connection")
         con = uow.connection
 
-        # ------------------------------------------------------------------
-        # Runtime PRAGMA
-        # ------------------------------------------------------------------
         con.execute(f"PRAGMA memory_limit='{_quote_sql_string(args.memory_limit)}'")
         con.execute(f"PRAGMA threads={int(args.threads)}")
         con.execute("PRAGMA preserve_insertion_order=false")
         con.execute(f"PRAGMA temp_directory='{_quote_sql_string(str(temp_dir_path))}'")
 
-        # ------------------------------------------------------------------
-        # Préflight
-        # ------------------------------------------------------------------
         if not _table_exists(con, "sec_xbrl_fact_raw"):
             raise RuntimeError("required table sec_xbrl_fact_raw does not exist")
         if not _table_exists(con, "sec_fact_normalized"):
             raise RuntimeError("required table sec_fact_normalized does not exist after schema init")
         if not _table_exists(con, "sec_filing"):
             raise RuntimeError("required table sec_filing does not exist")
+
+        _ensure_pipeline_state_table(con)
 
         raw_probe = _fetch_one_dict(
             con,
@@ -228,6 +362,29 @@ def main() -> int:
             [args.min_period_end_date, args.max_period_end_date],
         )
 
+        watermark_before = _get_watermark(con, PIPELINE_NAME)
+        watermark_after_candidate = _get_global_raw_max_ingested_at(con)
+
+        # ------------------------------------------------------------------
+        # Important:
+        # Le watermark ne doit jamais reculer.
+        #
+        # Cas typique:
+        # - un ancien run a déjà enregistré un watermark plus récent
+        # - le raw courant expose temporairement un max(ingested_at) plus ancien
+        # - si on écrivait ce max brut, on "reculerait" le watermark
+        #
+        # Règle retenue:
+        # - watermark_after_effective = max(watermark_before, watermark_after_candidate)
+        # - si seul l'un des deux existe, on prend celui qui existe
+        # ------------------------------------------------------------------
+        if watermark_before is not None and watermark_after_candidate is not None:
+            watermark_after_effective = max(watermark_before, watermark_after_candidate)
+        elif watermark_before is not None:
+            watermark_after_effective = watermark_before
+        else:
+            watermark_after_effective = watermark_after_candidate
+
         if args.verbose:
             print(
                 f"[build_sec_fact_normalized] raw_probe={json.dumps(raw_probe, default=str, sort_keys=True)}",
@@ -237,18 +394,12 @@ def main() -> int:
                 f"[build_sec_fact_normalized] raw_bad_probe={json.dumps(raw_bad_probe, default=str, sort_keys=True)}",
                 flush=True,
             )
-
-        # ------------------------------------------------------------------
-        # Full refresh déterministe, avec insert chunké.
-        # ------------------------------------------------------------------
-        con.execute("DELETE FROM sec_fact_normalized")
-        if args.verbose:
-            print("[build_sec_fact_normalized] cleared sec_fact_normalized", flush=True)
+            print(f"[build_sec_fact_normalized] watermark_before={watermark_before}", flush=True)
+            print(f"[build_sec_fact_normalized] watermark_after_candidate={watermark_after_candidate}", flush=True)
+            print(f"[build_sec_fact_normalized] watermark_after_effective={watermark_after_effective}", flush=True)
 
         # ------------------------------------------------------------------
         # Map CIK -> company_id effectif
-        # - si symbol_reference expose company_id, on l'utilise
-        # - sinon fallback robuste company_id = cik normalisé
         # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_company_map")
 
@@ -321,9 +472,7 @@ def main() -> int:
             )
 
         # ------------------------------------------------------------------
-        # Meilleur filing par accession_number
-        # Ici il peut y avoir 0 row si sec_filing est vide.
-        # Ce n'est pas bloquant.
+        # Filing best by accession
         # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_filing_best")
         con.execute(
@@ -379,40 +528,45 @@ def main() -> int:
                 flush=True,
             )
 
-        # ------------------------------------------------------------------
-        # Liste des chunks mensuels
-        # ------------------------------------------------------------------
-        month_starts = _fetch_month_starts(
-            con,
-            args.min_period_end_date,
-            args.max_period_end_date,
+        impacted_months = _fetch_impacted_months(
+            con=con,
+            watermark=watermark_before,
+            min_period_end_date=args.min_period_end_date,
+            max_period_end_date=args.max_period_end_date,
+            reprocess_recent_months=args.reprocess_recent_months,
         )
 
-        if not month_starts:
-            summary = {
+        if args.verbose:
+            print(f"[build_sec_fact_normalized] impacted_months={len(impacted_months)}", flush=True)
+            if impacted_months:
+                print(
+                    f"[build_sec_fact_normalized] first_month={impacted_months[0]} last_month={impacted_months[-1]}",
+                    flush=True,
+                )
+
+        if not impacted_months:
+            _set_watermark(
+                con,
+                PIPELINE_NAME,
+                watermark_after_effective,
+                notes="noop_no_impacted_months",
+            )
+            result = {
                 "table_name": "sec_fact_normalized",
-                "rows": 0,
+                "rows_changed": 0,
                 "month_chunks": 0,
-                "inserted_rows": 0,
-                "message": "no eligible monthly chunks found in sec_xbrl_fact_raw",
+                "watermark_before": str(watermark_before) if watermark_before is not None else None,
+                "watermark_after": str(watermark_after_effective) if watermark_after_effective is not None else None,
+                "message": "no impacted months to rebuild",
             }
-            print(json.dumps(summary, indent=2, default=str), flush=True)
+            print(json.dumps(result, indent=2, default=str), flush=True)
             return 0
 
-        if args.verbose:
-            print(f"[build_sec_fact_normalized] month_chunks={len(month_starts)}", flush=True)
-            print(
-                f"[build_sec_fact_normalized] first_month={month_starts[0]} last_month={month_starts[-1]}",
-                flush=True,
-            )
-
+        deleted_total = 0
         inserted_total = 0
 
-        # ------------------------------------------------------------------
-        # Traitement chunké par mois
-        # ------------------------------------------------------------------
         for idx, month_start in enumerate(
-            tqdm(month_starts, desc="sec_fact_normalized_months", unit="month"),
+            tqdm(impacted_months, desc="sec_fact_normalized_months", unit="month"),
             start=1,
         ):
             month_end = con.execute(
@@ -420,14 +574,13 @@ def main() -> int:
                 [month_start],
             ).fetchone()[0]
 
-            if args.verbose or idx == 1 or idx == len(month_starts) or idx % 12 == 0:
+            if args.verbose or idx == 1 or idx == len(impacted_months) or idx % 12 == 0:
                 print(
-                    f"[build_sec_fact_normalized] month_chunk {idx}/{len(month_starts)}: "
+                    f"[build_sec_fact_normalized] month_chunk {idx}/{len(impacted_months)}: "
                     f"{month_start} -> {month_end}",
                     flush=True,
                 )
 
-            # Scope mensuel nettoyé.
             con.execute("DROP TABLE IF EXISTS tmp_sec_fact_scope")
             con.execute(
                 """
@@ -457,17 +610,16 @@ def main() -> int:
                   AND TRIM(CAST(taxonomy AS VARCHAR)) <> ''
                   AND concept IS NOT NULL
                   AND TRIM(CAST(concept AS VARCHAR)) <> ''
-                  AND period_end_date IS NOT NULL
+                  AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
                   AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
                   AND (
                         value_numeric IS NOT NULL
                      OR (value_text IS NOT NULL AND TRIM(CAST(value_text AS VARCHAR)) <> '')
                   )
                 """,
-                [month_start, month_end],
+                [month_start, month_end, args.min_period_end_date, args.max_period_end_date],
             )
 
-            # Dédup logique au grain utile pour la table cible réelle.
             con.execute("DROP TABLE IF EXISTS tmp_sec_fact_dedup")
             con.execute(
                 """
@@ -519,6 +671,14 @@ def main() -> int:
                 """,
             )
 
+            deleted_rows = con.execute(
+                """
+                DELETE FROM sec_fact_normalized
+                WHERE period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                """,
+                [month_start, month_end],
+            ).fetchone()[0]
+
             inserted_rows = con.execute(
                 """
                 INSERT INTO sec_fact_normalized (
@@ -565,16 +725,19 @@ def main() -> int:
                 """
             ).fetchone()[0]
 
+            deleted_total += int(deleted_rows)
             inserted_total += int(inserted_rows)
 
-            if args.verbose or idx == 1 or idx == len(month_starts) or idx % 12 == 0:
+            if args.verbose or idx == 1 or idx == len(impacted_months) or idx % 12 == 0:
                 payload = {
                     "month_start": str(month_start),
                     "month_end": str(month_end),
                     "scoped_rows": int(month_scope_probe["scoped_rows"] or 0),
                     "scoped_ciks": int(month_scope_probe["scoped_ciks"] or 0),
                     "scoped_concepts": int(month_scope_probe["scoped_concepts"] or 0),
+                    "deleted_rows": int(deleted_rows),
                     "inserted_rows": int(inserted_rows),
+                    "deleted_rows_cumulative": int(deleted_total),
                     "inserted_rows_cumulative": int(inserted_total),
                 }
                 print(
@@ -582,9 +745,16 @@ def main() -> int:
                     flush=True,
                 )
 
-        # ------------------------------------------------------------------
-        # Final probes
-        # ------------------------------------------------------------------
+        _set_watermark(
+            con,
+            PIPELINE_NAME,
+            watermark_after_effective,
+            notes=(
+                f"success deleted={deleted_total} inserted={inserted_total} "
+                f"chunks={len(impacted_months)}"
+            ),
+        )
+
         final_probe = _fetch_one_dict(
             con,
             """
@@ -617,11 +787,14 @@ def main() -> int:
             "concepts": int(final_probe["concepts"] or 0),
             "min_period_end_date": str(final_probe["min_period_end_date"]) if final_probe["min_period_end_date"] is not None else None,
             "max_period_end_date": str(final_probe["max_period_end_date"]) if final_probe["max_period_end_date"] is not None else None,
-            "month_chunks": int(len(month_starts)),
+            "month_chunks": int(len(impacted_months)),
+            "deleted_rows": int(deleted_total),
             "inserted_rows": int(inserted_total),
             "rows_with_filing_id": int(join_probe["rows_with_filing_id"] or 0),
             "rows_with_company_id": int(join_probe["rows_with_company_id"] or 0),
             "rows_using_cik_fallback_company_id": int(join_probe["rows_using_cik_fallback_company_id"] or 0),
+            "watermark_before": str(watermark_before) if watermark_before is not None else None,
+            "watermark_after": str(watermark_after_effective) if watermark_after_effective is not None else None,
         }
 
         print(json.dumps(result, indent=2, default=str), flush=True)
