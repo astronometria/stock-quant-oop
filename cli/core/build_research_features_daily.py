@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Build canonical research_features_daily.
+
+Objectif
+--------
+Assembler les familles de features canoniques dans une seule table de recherche
+point-in-time safe, en joignant directement les tables canoniques:
+
+- feature_price_momentum_daily
+- feature_price_trend_daily
+- feature_price_volatility_daily
+- short_features_daily
+
+Important
+---------
+- `feature_short_daily` a été retirée: c'était une projection legacy redondante
+  de `short_features_daily`.
+- Le chemin canonique short est maintenant:
+    finra_daily_short_volume_source_raw
+    -> daily_short_volume_history
+    -> short_features_daily
+    -> research_features_daily
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -47,11 +71,12 @@ def main() -> int:
         temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
         con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
 
+        # Tables canoniques requises.
         required_tables = [
             "feature_price_momentum_daily",
             "feature_price_trend_daily",
             "feature_price_volatility_daily",
-            "feature_short_daily",
+            "short_features_daily",
         ]
 
         for table_name in required_tables:
@@ -61,6 +86,7 @@ def main() -> int:
             if args.verbose:
                 print(f"[research_features] {table_name}_rows={row_count}", flush=True)
 
+        # Rebuild complet de la table canonique de recherche.
         con.execute("DROP TABLE IF EXISTS research_features_daily")
 
         con.execute(
@@ -116,7 +142,7 @@ def main() -> int:
                 'build_research_features_daily.py' AS source_name,
                 CURRENT_TIMESTAMP AS created_at
             FROM price_base p
-            LEFT JOIN feature_short_daily s
+            LEFT JOIN short_features_daily s
               ON UPPER(TRIM(s.symbol)) = UPPER(TRIM(p.symbol))
              AND s.as_of_date = p.as_of_date
             WHERE p.symbol IS NOT NULL
@@ -144,26 +170,28 @@ def main() -> int:
             """
         ).fetchone()
 
-        print(json.dumps(
-            {
-                "table_name": "research_features_daily",
-                "rows": int(row[0]),
-                "close_rows": int(row[1]),
-                "returns_1d_rows": int(row[2]),
-                "rsi_14_rows": int(row[3]),
-                "sma_20_rows": int(row[4]),
-                "sma_50_rows": int(row[5]),
-                "sma_200_rows": int(row[6]),
-                "close_to_sma_20_rows": int(row[7]),
-                "atr_14_rows": int(row[8]),
-                "volatility_20_rows": int(row[9]),
-                "short_volume_ratio_rows": int(row[10]),
-                "min_date": str(row[11]) if row[11] is not None else None,
-                "max_date": str(row[12]) if row[12] is not None else None,
-            },
-            indent=2,
-        ), flush=True)
-
+        print(
+            json.dumps(
+                {
+                    "table_name": "research_features_daily",
+                    "rows": int(row[0]),
+                    "close_rows": int(row[1]),
+                    "returns_1d_rows": int(row[2]),
+                    "rsi_14_rows": int(row[3]),
+                    "sma_20_rows": int(row[4]),
+                    "sma_50_rows": int(row[5]),
+                    "sma_200_rows": int(row[6]),
+                    "close_to_sma_20_rows": int(row[7]),
+                    "atr_14_rows": int(row[8]),
+                    "volatility_20_rows": int(row[9]),
+                    "short_volume_ratio_rows": int(row[10]),
+                    "min_date": str(row[11]) if row[11] is not None else None,
+                    "max_date": str(row[12]) if row[12] is not None else None,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         return 0
     finally:
         con.close()
