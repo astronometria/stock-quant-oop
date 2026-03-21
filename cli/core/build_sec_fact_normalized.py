@@ -2,62 +2,41 @@
 from __future__ import annotations
 
 """
-SQL-first builder for sec_fact_normalized.
+SQL-first builder for sec_fact_normalized with visible chunk progress.
 
 Objectif
 --------
-Construire la couche normalized SEC à partir de sec_xbrl_fact_raw,
-sans charger des millions de lignes en mémoire Python.
+Construire `sec_fact_normalized` à partir de `sec_xbrl_fact_raw` en gardant:
+- une logique SQL-first
+- un full refresh déterministe
+- une progression visible dans le terminal
+- un découpage par mois de `period_end_date`
 
-Pourquoi cette réécriture
--------------------------
-La version précédente du flux SEC avait plusieurs fragilités :
+Pourquoi chunker
+----------------
+Le full refresh monolithique fonctionne, mais il est opaque:
+- gros DELETE
+- gros CREATE TEMP TABLE
+- gros INSERT INTO ... SELECT ...
+- aucune visibilité pendant plusieurs minutes
 
-1) elle traitait trop le join filings <-> facts comme une dépendance dure
-2) elle pouvait perdre des facts valides quand un accession_number issu de
-   companyfacts ne retrouvait pas un filing dans sec_filing
-3) elle n'était pas assez homogène avec les autres scripts lourds du repo
-   concernant :
-   - PRAGMA DuckDB
-   - logs de probes
-   - contrôle SQL-first
-   - structure de sortie JSON
-
-Cette version :
-- reste SQL-first
-- applique les PRAGMA runtime comme les autres scripts lourds
-- produit des métriques de qualité utiles
-- enrichit les facts avec filing_id / company_id / available_at
-- n'élimine PAS les facts simplement parce que le join filing échoue
-- garde une logique PIT explicite :
-  - available_at prioritaire depuis sec_filing.available_at
-  - sinon accepted_at
-  - sinon filing_date cast timestamp
-  - sinon fallback technique sur ingested_at du raw
-
-Important
----------
-On n'utilise PAS period_end_date comme substitut de visibilité marché.
-period_end_date décrit la période comptable, pas la date de publication.
-
-Contexte important du SEC
--------------------------
-Les companyfacts SEC peuvent référencer des accession numbers déposés par des
-filing agents. Donc :
-- le fact peut être valide
-- l'accession peut être présent dans companyfacts
-- mais ne pas se retrouver dans notre sec_filing si le raw filings n'est pas
-  chargé au même niveau d'historique
-
-Conclusion :
-- sec_xbrl_fact_raw = vérité source des facts
-- sec_filing = enrichissement quand disponible
+Cette version:
+- garde les mêmes règles métiers
+- garde le fallback robuste company_id = cik si nécessaire
+- reconstruit `sec_fact_normalized` par mois de `period_end_date`
+- affiche une progression concrète + cumul de lignes insérées
 """
 
 import argparse
 import json
 from pathlib import Path
 from typing import Any
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 from stock_quant.infrastructure.config.settings_loader import build_app_config
 from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
@@ -66,33 +45,19 @@ from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 
 
 # =============================================================================
-# Helpers simples
+# Helpers
 # =============================================================================
-
-
 def _quote_sql_string(value: str) -> str:
-    """
-    Escape minimal pour injecter une string dans un PRAGMA SQL.
-    """
     return str(value).replace("'", "''")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build sec_fact_normalized from sec_xbrl_fact_raw using SQL-first transformations."
+        description="Build sec_fact_normalized from sec_xbrl_fact_raw with chunked monthly progress."
     )
     parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
-    parser.add_argument(
-        "--memory-limit",
-        default="24GB",
-        help="DuckDB memory_limit pragma, e.g. 8GB, 24GB.",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=6,
-        help="DuckDB worker threads.",
-    )
+    parser.add_argument("--memory-limit", default="24GB", help="DuckDB memory_limit pragma, e.g. 8GB, 24GB.")
+    parser.add_argument("--threads", type=int, default=6, help="DuckDB worker threads.")
     parser.add_argument(
         "--temp-dir",
         default="/home/marty/stock-quant-oop/tmp",
@@ -111,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--truncate",
         action="store_true",
-        help="Flag conservé pour clarté d'interface. Le build fait un full refresh de toute façon.",
+        help="Conservé pour compatibilité. Le build reste un full refresh déterministe.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     return parser.parse_args()
@@ -143,24 +108,31 @@ def _column_exists(con: Any, table_name: str, column_name: str) -> bool:
 
 
 def _fetch_one_dict(con: Any, sql: str, params: list[Any] | None = None) -> dict[str, object]:
-    """
-    Retourne une seule ligne sous forme dict, pratique pour les probes.
-    """
     cursor = con.execute(sql, params or [])
     columns = [str(desc[0]) for desc in cursor.description]
     row = cursor.fetchone()
-
     if row is None:
         return {col: None for col in columns}
-
     return {columns[i]: row[i] for i in range(len(columns))}
+
+
+def _fetch_month_starts(con: Any, min_date: str, max_date: str) -> list[Any]:
+    rows = con.execute(
+        """
+        SELECT DISTINCT date_trunc('month', period_end_date)::DATE AS month_start
+        FROM sec_xbrl_fact_raw
+        WHERE period_end_date IS NOT NULL
+          AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+        ORDER BY month_start
+        """,
+        [min_date, max_date],
+    ).fetchall()
+    return [row[0] for row in rows]
 
 
 # =============================================================================
 # Main
 # =============================================================================
-
-
 def main() -> int:
     args = parse_args()
 
@@ -189,32 +161,26 @@ def main() -> int:
 
         if uow.connection is None:
             raise RuntimeError("missing active DB connection")
-
         con = uow.connection
 
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # Runtime PRAGMA
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         con.execute(f"PRAGMA memory_limit='{_quote_sql_string(args.memory_limit)}'")
         con.execute(f"PRAGMA threads={int(args.threads)}")
         con.execute("PRAGMA preserve_insertion_order=false")
         con.execute(f"PRAGMA temp_directory='{_quote_sql_string(str(temp_dir_path))}'")
 
-        # ---------------------------------------------------------------------
-        # Préflight minimal
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Préflight
+        # ------------------------------------------------------------------
         if not _table_exists(con, "sec_xbrl_fact_raw"):
             raise RuntimeError("required table sec_xbrl_fact_raw does not exist")
-
         if not _table_exists(con, "sec_fact_normalized"):
             raise RuntimeError("required table sec_fact_normalized does not exist after schema init")
-
         if not _table_exists(con, "sec_filing"):
             raise RuntimeError("required table sec_filing does not exist")
 
-        # ---------------------------------------------------------------------
-        # Probes raw
-        # ---------------------------------------------------------------------
         raw_probe = _fetch_one_dict(
             con,
             """
@@ -227,7 +193,6 @@ def main() -> int:
             FROM sec_xbrl_fact_raw
             """,
         )
-
         raw_bad_probe = _fetch_one_dict(
             con,
             """
@@ -258,26 +223,18 @@ def main() -> int:
                 flush=True,
             )
 
-        # ---------------------------------------------------------------------
-        # Full refresh déterministe
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Full refresh déterministe, mais avec insert chunké.
+        # ------------------------------------------------------------------
         con.execute("DELETE FROM sec_fact_normalized")
-
         if args.verbose:
             print("[build_sec_fact_normalized] cleared sec_fact_normalized", flush=True)
 
-        # ---------------------------------------------------------------------
-        # Map CIK -> company_id
-        #
-        # Objectif:
+        # ------------------------------------------------------------------
+        # Map CIK -> company_id effectif
         # - si symbol_reference expose company_id, on l'utilise
         # - sinon fallback robuste company_id = cik normalisé
-        #
-        # Pourquoi:
-        # - certaines versions du schéma n'ont pas company_id
-        # - certaines chaînes historiques SEC doivent quand même produire
-        #   un identifiant stable
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_company_map")
 
         if _table_exists(con, "symbol_reference") and _column_exists(con, "symbol_reference", "cik"):
@@ -332,14 +289,25 @@ def main() -> int:
                 """
             )
 
-        # ---------------------------------------------------------------------
+        if args.verbose:
+            company_map_probe = _fetch_one_dict(
+                con,
+                """
+                SELECT
+                    COUNT(*) AS rows,
+                    COUNT(DISTINCT cik) AS ciks,
+                    COUNT(DISTINCT company_id) AS company_ids
+                FROM tmp_sec_company_map
+                """,
+            )
+            print(
+                f"[build_sec_fact_normalized] company_map_probe={json.dumps(company_map_probe, default=str, sort_keys=True)}",
+                flush=True,
+            )
+
+        # ------------------------------------------------------------------
         # Meilleur filing par accession_number
-        #
-        # Important:
-        # - on ne suppose pas un mapping parfait accession -> filing historique
-        # - cette table sert d'enrichissement uniquement
-        # - si le filing n'existe pas, le fact doit survivre
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
         con.execute("DROP TABLE IF EXISTS tmp_sec_filing_best")
         con.execute(
             """
@@ -379,286 +347,304 @@ def main() -> int:
             """
         )
 
-        # ---------------------------------------------------------------------
-        # Scope filtré / nettoyé
-        #
-        # On enlève ici:
-        # - période hors bornes
-        # - identité incomplète
-        # - rows sans valeur numérique ni texte
-        # ---------------------------------------------------------------------
-        con.execute("DROP TABLE IF EXISTS tmp_sec_fact_scope")
-        con.execute(
-            """
-            CREATE TEMP TABLE tmp_sec_fact_scope AS
-            SELECT
-                accession_number,
-                LPAD(TRIM(CAST(cik AS VARCHAR)), 10, '0') AS cik,
-                LOWER(TRIM(CAST(taxonomy AS VARCHAR))) AS taxonomy,
-                TRIM(CAST(concept AS VARCHAR)) AS concept,
-                NULLIF(TRIM(CAST(unit AS VARCHAR)), '') AS unit,
-                period_end_date,
-                period_start_date,
-                fiscal_year,
-                NULLIF(TRIM(CAST(fiscal_period AS VARCHAR)), '') AS fiscal_period,
-                NULLIF(TRIM(CAST(frame AS VARCHAR)), '') AS frame,
-                CASE
-                    WHEN value_text IS NULL THEN NULL
-                    WHEN TRIM(CAST(value_text AS VARCHAR)) = '' THEN NULL
-                    ELSE CAST(value_text AS VARCHAR)
-                END AS value_text,
-                value_numeric,
-                source_name,
-                source_file,
-                ingested_at
-            FROM sec_xbrl_fact_raw
-            WHERE accession_number IS NOT NULL
-              AND TRIM(accession_number) <> ''
-              AND cik IS NOT NULL
-              AND TRIM(CAST(cik AS VARCHAR)) <> ''
-              AND taxonomy IS NOT NULL
-              AND TRIM(CAST(taxonomy AS VARCHAR)) <> ''
-              AND concept IS NOT NULL
-              AND TRIM(CAST(concept AS VARCHAR)) <> ''
-              AND period_end_date IS NOT NULL
-              AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-              AND (
-                    value_numeric IS NOT NULL
-                 OR (value_text IS NOT NULL AND TRIM(CAST(value_text AS VARCHAR)) <> '')
-              )
-            """,
-            [args.min_period_end_date, args.max_period_end_date],
-        )
-
-        # ---------------------------------------------------------------------
-        # Dédup logique
-        #
-        # On déduplique à granularité du fact.
-        # On garde la version la plus récente selon ingested_at/source_file/source_name.
-        # ---------------------------------------------------------------------
-        con.execute("DROP TABLE IF EXISTS tmp_sec_fact_dedup")
-        con.execute(
-            """
-            CREATE TEMP TABLE tmp_sec_fact_dedup AS
-            SELECT
-                accession_number,
-                cik,
-                taxonomy,
-                concept,
-                unit,
-                period_end_date,
-                period_start_date,
-                fiscal_year,
-                fiscal_period,
-                frame,
-                value_text,
-                value_numeric,
-                source_name,
-                source_file,
-                ingested_at
-            FROM (
+        if args.verbose:
+            filing_best_probe = _fetch_one_dict(
+                con,
+                """
                 SELECT
-                    *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY
-                            accession_number,
-                            cik,
-                            taxonomy,
-                            concept,
-                            period_end_date,
-                            COALESCE(unit, ''),
-                            COALESCE(value_text, ''),
-                            value_numeric
-                        ORDER BY
-                            ingested_at DESC NULLS LAST,
-                            source_file DESC NULLS LAST,
-                            source_name DESC NULLS LAST
-                    ) AS rn
-                FROM tmp_sec_fact_scope
-            ) x
-            WHERE rn = 1
-            """
-        )
-
-        # ---------------------------------------------------------------------
-        # Insert normalized
-        #
-        # Règle clé:
-        # - le filing enrichit si trouvé
-        # - sinon on garde quand même le fact
-        #
-        # available_at:
-        # - priorité à sec_filing.available_at
-        # - puis accepted_at
-        # - puis filing_date
-        # - puis ingested_at du raw
-        #
-        # On n'utilise jamais period_end_date comme date de publication.
-        # ---------------------------------------------------------------------
-        con.execute(
-            """
-            INSERT INTO sec_fact_normalized (
-                filing_id,
-                company_id,
-                cik,
-                taxonomy,
-                concept,
-                period_end_date,
-                unit,
-                value_text,
-                value_numeric,
-                available_at,
-                source_name,
-                created_at
+                    COUNT(*) AS rows,
+                    COUNT(DISTINCT accession_number) AS accession_numbers
+                FROM tmp_sec_filing_best
+                """,
             )
-            SELECT
-                f.filing_id AS filing_id,
-                COALESCE(
-                    NULLIF(TRIM(CAST(f.company_id AS VARCHAR)), ''),
-                    NULLIF(TRIM(CAST(m.company_id AS VARCHAR)), ''),
-                    d.cik
-                ) AS company_id,
-                d.cik,
-                d.taxonomy,
-                d.concept,
-                d.period_end_date,
-                d.unit,
-                d.value_text,
-                d.value_numeric,
-                COALESCE(
-                    f.available_at,
-                    f.accepted_at,
-                    CAST(f.filing_date AS TIMESTAMP),
-                    d.ingested_at
-                ) AS available_at,
-                COALESCE(f.source_name, d.source_name, 'sec') AS source_name,
-                CURRENT_TIMESTAMP AS created_at
-            FROM tmp_sec_fact_dedup d
-            LEFT JOIN tmp_sec_filing_best f
-              ON f.accession_number = d.accession_number
-            LEFT JOIN tmp_sec_company_map m
-              ON m.cik = d.cik
-            """
-        )
+            print(
+                f"[build_sec_fact_normalized] filing_best_probe={json.dumps(filing_best_probe, default=str, sort_keys=True)}",
+                flush=True,
+            )
 
-        # ---------------------------------------------------------------------
-        # Probes qualité finales
-        # ---------------------------------------------------------------------
-        scope_probe = _fetch_one_dict(
+        # ------------------------------------------------------------------
+        # Liste des chunks mensuels
+        # ------------------------------------------------------------------
+        month_starts = _fetch_month_starts(
             con,
-            """
-            SELECT
-                COUNT(*) AS scoped_rows,
-                COUNT(DISTINCT cik) AS scoped_ciks,
-                COUNT(DISTINCT taxonomy || '|' || concept) AS scoped_concepts,
-                MIN(period_end_date) AS min_period_end_date,
-                MAX(period_end_date) AS max_period_end_date
-            FROM tmp_sec_fact_dedup
-            """,
+            args.min_period_end_date,
+            args.max_period_end_date,
         )
 
-        normalized_probe = _fetch_one_dict(
+        if not month_starts:
+            summary = {
+                "table_name": "sec_fact_normalized",
+                "rows": 0,
+                "month_chunks": 0,
+                "inserted_rows": 0,
+                "message": "no eligible monthly chunks found in sec_xbrl_fact_raw",
+            }
+            print(json.dumps(summary, indent=2, default=str), flush=True)
+            return 0
+
+        if args.verbose:
+            print(f"[build_sec_fact_normalized] month_chunks={len(month_starts)}", flush=True)
+            print(
+                f"[build_sec_fact_normalized] first_month={month_starts[0]} last_month={month_starts[-1]}",
+                flush=True,
+            )
+
+        inserted_total = 0
+
+        # ------------------------------------------------------------------
+        # Traitement chunké par mois
+        # ------------------------------------------------------------------
+        for idx, month_start in enumerate(
+            tqdm(month_starts, desc="sec_fact_normalized_months", unit="month"),
+            start=1,
+        ):
+            month_end = con.execute(
+                "SELECT (date_trunc('month', CAST(? AS DATE)) + INTERVAL '1 month' - INTERVAL '1 day')::DATE",
+                [month_start],
+            ).fetchone()[0]
+
+            if args.verbose or idx == 1 or idx == len(month_starts) or idx % 12 == 0:
+                print(
+                    f"[build_sec_fact_normalized] month_chunk {idx}/{len(month_starts)}: "
+                    f"{month_start} -> {month_end}",
+                    flush=True,
+                )
+
+            con.execute("DROP TABLE IF EXISTS tmp_sec_fact_scope")
+            con.execute(
+                """
+                CREATE TEMP TABLE tmp_sec_fact_scope AS
+                SELECT
+                    accession_number,
+                    LPAD(TRIM(CAST(cik AS VARCHAR)), 10, '0') AS cik,
+                    LOWER(TRIM(CAST(taxonomy AS VARCHAR))) AS taxonomy,
+                    TRIM(CAST(concept AS VARCHAR)) AS concept,
+                    NULLIF(TRIM(CAST(unit AS VARCHAR)), '') AS unit,
+                    period_end_date,
+                    period_start_date,
+                    fiscal_year,
+                    NULLIF(TRIM(CAST(fiscal_period AS VARCHAR)), '') AS fiscal_period,
+                    NULLIF(TRIM(CAST(frame AS VARCHAR)), '') AS frame,
+                    CASE
+                        WHEN value_text IS NULL THEN NULL
+                        WHEN TRIM(CAST(value_text AS VARCHAR)) = '' THEN NULL
+                        ELSE CAST(value_text AS VARCHAR)
+                    END AS value_text,
+                    value_numeric,
+                    source_name,
+                    source_file,
+                    ingested_at
+                FROM sec_xbrl_fact_raw
+                WHERE accession_number IS NOT NULL
+                  AND TRIM(accession_number) <> ''
+                  AND cik IS NOT NULL
+                  AND TRIM(CAST(cik AS VARCHAR)) <> ''
+                  AND taxonomy IS NOT NULL
+                  AND TRIM(CAST(taxonomy AS VARCHAR)) <> ''
+                  AND concept IS NOT NULL
+                  AND TRIM(CAST(concept AS VARCHAR)) <> ''
+                  AND period_end_date IS NOT NULL
+                  AND period_end_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                  AND (
+                        value_numeric IS NOT NULL
+                     OR (value_text IS NOT NULL AND TRIM(CAST(value_text AS VARCHAR)) <> '')
+                  )
+                """,
+                [month_start, month_end],
+            )
+
+            con.execute("DROP TABLE IF EXISTS tmp_sec_fact_dedup")
+            con.execute(
+                """
+                CREATE TEMP TABLE tmp_sec_fact_dedup AS
+                SELECT
+                    accession_number,
+                    cik,
+                    taxonomy,
+                    concept,
+                    unit,
+                    period_end_date,
+                    period_start_date,
+                    fiscal_year,
+                    fiscal_period,
+                    frame,
+                    value_text,
+                    value_numeric,
+                    source_name,
+                    source_file,
+                    ingested_at
+                FROM (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                accession_number,
+                                cik,
+                                taxonomy,
+                                concept,
+                                period_end_date,
+                                COALESCE(unit, ''),
+                                COALESCE(value_text, ''),
+                                value_numeric
+                            ORDER BY
+                                ingested_at DESC NULLS LAST,
+                                source_file DESC NULLS LAST,
+                                source_name DESC NULLS LAST
+                        ) AS rn
+                    FROM tmp_sec_fact_scope
+                ) x
+                WHERE rn = 1
+                """
+            )
+
+            month_scope_probe = _fetch_one_dict(
+                con,
+                """
+                SELECT
+                    COUNT(*) AS scoped_rows,
+                    COUNT(DISTINCT cik) AS scoped_ciks,
+                    COUNT(DISTINCT taxonomy || '|' || concept) AS scoped_concepts
+                FROM tmp_sec_fact_dedup
+                """,
+            )
+
+            inserted_rows = con.execute(
+                """
+                INSERT INTO sec_fact_normalized (
+                    fact_id,
+                    company_id,
+                    filing_id,
+                    cik,
+                    accession_number,
+                    taxonomy,
+                    concept,
+                    unit,
+                    period_end_date,
+                    period_start_date,
+                    fiscal_year,
+                    fiscal_period,
+                    frame,
+                    value_text,
+                    value_numeric,
+                    available_at,
+                    accepted_at,
+                    filing_date,
+                    source_name,
+                    source_file,
+                    created_at
+                )
+                SELECT
+                    sha256(
+                        CONCAT_WS(
+                            '|',
+                            COALESCE(f.accession_number, ''),
+                            COALESCE(f.cik, ''),
+                            COALESCE(f.taxonomy, ''),
+                            COALESCE(f.concept, ''),
+                            COALESCE(CAST(f.period_end_date AS VARCHAR), ''),
+                            COALESCE(f.unit, ''),
+                            COALESCE(f.value_text, ''),
+                            COALESCE(CAST(f.value_numeric AS VARCHAR), '')
+                        )
+                    ) AS fact_id,
+                    COALESCE(
+                        NULLIF(TRIM(CAST(m.company_id AS VARCHAR)), ''),
+                        NULLIF(TRIM(CAST(b.company_id AS VARCHAR)), ''),
+                        f.cik
+                    ) AS company_id,
+                    b.filing_id,
+                    f.cik,
+                    f.accession_number,
+                    f.taxonomy,
+                    f.concept,
+                    f.unit,
+                    f.period_end_date,
+                    f.period_start_date,
+                    f.fiscal_year,
+                    f.fiscal_period,
+                    f.frame,
+                    f.value_text,
+                    f.value_numeric,
+                    COALESCE(
+                        b.available_at,
+                        b.accepted_at,
+                        CAST(b.filing_date AS TIMESTAMP),
+                        f.ingested_at
+                    ) AS available_at,
+                    b.accepted_at,
+                    b.filing_date,
+                    COALESCE(b.source_name, f.source_name) AS source_name,
+                    f.source_file,
+                    CURRENT_TIMESTAMP AS created_at
+                FROM tmp_sec_fact_dedup f
+                LEFT JOIN tmp_sec_company_map m
+                  ON m.cik = f.cik
+                LEFT JOIN tmp_sec_filing_best b
+                  ON b.accession_number = f.accession_number
+                """
+            ).fetchone()[0]
+
+            inserted_total += int(inserted_rows)
+
+            if args.verbose or idx == 1 or idx == len(month_starts) or idx % 12 == 0:
+                payload = {
+                    "month_start": str(month_start),
+                    "month_end": str(month_end),
+                    "scoped_rows": int(month_scope_probe["scoped_rows"] or 0),
+                    "scoped_ciks": int(month_scope_probe["scoped_ciks"] or 0),
+                    "scoped_concepts": int(month_scope_probe["scoped_concepts"] or 0),
+                    "inserted_rows": int(inserted_rows),
+                    "inserted_rows_cumulative": int(inserted_total),
+                }
+                print(
+                    f"[build_sec_fact_normalized] month_chunk_summary={json.dumps(payload, sort_keys=True)}",
+                    flush=True,
+                )
+
+        # ------------------------------------------------------------------
+        # Final probes
+        # ------------------------------------------------------------------
+        final_probe = _fetch_one_dict(
             con,
             """
             SELECT
                 COUNT(*) AS rows,
+                COUNT(DISTINCT company_id) AS company_ids,
                 COUNT(DISTINCT cik) AS ciks,
                 COUNT(DISTINCT taxonomy || '|' || concept) AS concepts,
-                COUNT(CASE WHEN filing_id IS NOT NULL THEN 1 END) AS rows_with_filing_id,
-                COUNT(CASE WHEN company_id IS NOT NULL AND TRIM(company_id) <> '' THEN 1 END) AS rows_with_company_id,
-                COUNT(CASE WHEN available_at IS NOT NULL THEN 1 END) AS rows_with_available_at,
                 MIN(period_end_date) AS min_period_end_date,
                 MAX(period_end_date) AS max_period_end_date
             FROM sec_fact_normalized
             """,
         )
-
         join_probe = _fetch_one_dict(
             con,
             """
             SELECT
-                COUNT(*) AS rows_total,
-                COUNT(CASE WHEN filing_id IS NOT NULL THEN 1 END) AS rows_joined_to_filing,
-                COUNT(CASE WHEN filing_id IS NULL THEN 1 END) AS rows_without_filing_join,
+                COUNT(CASE WHEN filing_id IS NOT NULL THEN 1 END) AS rows_with_filing_id,
+                COUNT(CASE WHEN company_id IS NOT NULL AND TRIM(CAST(company_id AS VARCHAR)) <> '' THEN 1 END) AS rows_with_company_id,
                 COUNT(CASE WHEN company_id = cik THEN 1 END) AS rows_using_cik_fallback_company_id
             FROM sec_fact_normalized
             """,
         )
 
-        top_taxonomy = con.execute(
-            """
-            SELECT
-                taxonomy,
-                COUNT(*) AS rows
-            FROM sec_fact_normalized
-            GROUP BY taxonomy
-            ORDER BY rows DESC, taxonomy
-            LIMIT 10
-            """
-        ).fetchall()
-
-        top_concepts = con.execute(
-            """
-            SELECT
-                taxonomy,
-                concept,
-                COUNT(*) AS rows
-            FROM sec_fact_normalized
-            GROUP BY taxonomy, concept
-            ORDER BY rows DESC, taxonomy, concept
-            LIMIT 10
-            """
-        ).fetchall()
-
-        quality = {
-            "raw_probe": raw_probe,
-            "raw_bad_probe": raw_bad_probe,
-            "scope_probe": scope_probe,
-            "normalized_probe": normalized_probe,
-            "join_probe": join_probe,
-            "top_taxonomy": [
-                {
-                    "taxonomy": row[0],
-                    "rows": int(row[1]),
-                }
-                for row in top_taxonomy
-            ],
-            "top_concepts": [
-                {
-                    "taxonomy": row[0],
-                    "concept": row[1],
-                    "rows": int(row[2]),
-                }
-                for row in top_concepts
-            ],
+        result = {
+            "table_name": "sec_fact_normalized",
+            "rows": int(final_probe["rows"] or 0),
+            "company_ids": int(final_probe["company_ids"] or 0),
+            "ciks": int(final_probe["ciks"] or 0),
+            "concepts": int(final_probe["concepts"] or 0),
+            "min_period_end_date": str(final_probe["min_period_end_date"]) if final_probe["min_period_end_date"] is not None else None,
+            "max_period_end_date": str(final_probe["max_period_end_date"]) if final_probe["max_period_end_date"] is not None else None,
+            "month_chunks": int(len(month_starts)),
+            "inserted_rows": int(inserted_total),
+            "rows_with_filing_id": int(join_probe["rows_with_filing_id"] or 0),
+            "rows_with_company_id": int(join_probe["rows_with_company_id"] or 0),
+            "rows_using_cik_fallback_company_id": int(join_probe["rows_using_cik_fallback_company_id"] or 0),
         }
 
-        if args.verbose:
-            print(
-                f"[build_sec_fact_normalized] quality_summary="
-                f"{json.dumps(quality, default=str, sort_keys=True)}",
-                flush=True,
-            )
-
-        output = {
-            "status": "SUCCESS",
-            "rows_written": int(normalized_probe["rows"] or 0),
-            "metrics": {
-                "raw_rows": int(raw_probe["rows"] or 0),
-                "scoped_rows": int(scope_probe["scoped_rows"] or 0),
-                "normalized_rows": int(normalized_probe["rows"] or 0),
-                "rows_joined_to_filing": int(join_probe["rows_joined_to_filing"] or 0),
-                "rows_without_filing_join": int(join_probe["rows_without_filing_join"] or 0),
-                "rows_using_cik_fallback_company_id": int(
-                    join_probe["rows_using_cik_fallback_company_id"] or 0
-                ),
-            },
-            "quality": quality,
-        }
-
-        print(json.dumps(output, indent=2, sort_keys=True, default=str), flush=True)
-
-    return 0
+        print(json.dumps(result, indent=2, default=str), flush=True)
+        return 0
 
 
 if __name__ == "__main__":
