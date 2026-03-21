@@ -1,120 +1,142 @@
-# README_DEV
+# README_DEV — stock-quant-oop
 
-## Dev Architecture
+## But
 
-This project follows a strict layered architecture:
+Ce document résume les conventions de développement et d'exploitation retenues après stabilisation des pipelines incrémentaux.
 
-```text
-sources -> features -> composition -> dataset -> labels -> backtest
+## Conventions générales
+
+- Architecture : OOP + SQL-first
+- Transformations volumineuses : DuckDB / SQL en priorité
+- Python : orchestration, providers externes, contrôle de flux, retry
+- Logs : `logs/`
+- Scripts longs : progression visible avec `tqdm`
+- Anciennes versions : suffixe `.bak`
+
+## Flux recommandés
+
+### Rebuild from scratch
+
+À utiliser sur une nouvelle machine quand Stooq est déjà présent localement.
+
+Commande cible :
+
+```bash
+cd ~/stock-quant-oop && python3 cli/ops/rebuild_db_from_scratch.py \
+  --db-path /home/marty/stock-quant-oop/market.duckdb \
+  | tee ~/log.txt
 ```
 
-## Layers
+### Refresh incrémental manuel
 
-### Sources
+Commande canonique :
 
-- `price_history`
-- `short_features_daily`
-
-### Feature Layer
-
-Builders:
-
-- `build_feature_price_momentum.py`
-- `build_feature_price_trend.py`
-- `build_feature_price_volatility.py`
-- `build_feature_short.py`
-
-Rules:
-
-- SQL-first
-- no forward-looking data
-- independently rebuildable
-- one family per table
-
-### Composition Layer
-
-`research_features_daily`
-
-This table joins all modular feature tables on:
-
-- `symbol`
-- `as_of_date`
-
-### Dataset Layer
-
-`research_training_dataset`
-
-Rules:
-
-- projection of `research_features_daily`
-- incremental build supported
-- feature columns explicitly controlled by `TARGET_FEATURE_COLUMNS`
-
-### Labels Layer
-
-`research_labels`
-
-Rules:
-
-- built after dataset
-- tied to `dataset_id`
-
-### Backtest Layer
-
-`research_backtest`
-
-Rules:
-
-- consumes dataset + labels
-- split-aware: `train / valid / test`
-- signal logic remains SQL-first
-
-## Adding a New Indicator
-
-1. Create a new feature table or extend the right feature family.
-2. Build it from canonical sources using SQL window functions.
-3. Add it to `research_features_daily`.
-4. Add it to dataset projection if needed.
-5. Consume it in a signal.
-
-## PIT Safety Rules
-
-- Never use future rows to compute a feature.
-- For same-frequency daily joins, use exact date joins.
-- For delayed sources, use `available_at <= as_of_date`.
-
-Reference pattern:
-
-```sql
-f.as_of_date <= p.as_of_date
-ORDER BY f.as_of_date DESC
-LIMIT 1
+```bash
+cd ~/stock-quant-oop && python3 cli/ops/run_manual_incremental_data_refresh.py \
+  --db-path /home/marty/stock-quant-oop/market.duckdb \
+  | tee ~/log.txt
 ```
 
-## Debug Order
+## Price pipeline
 
-Always probe in this order:
+### Décisions retenues
 
-1. feature table coverage
-2. `research_features_daily` coverage
-3. dataset coverage
-4. labels coverage
-5. backtest output
+- Rebuild complet : Stooq local
+- Incrémental : Yahoo Finance
+- Ajustement week-end dans `PriceRefreshWindowService`
+- Réduction du scope aux symboles réellement en retard
+- Provider Yahoo rendu plus conservateur face au rate limit
 
-## Performance Rules
+### Risques connus
 
-- use DuckDB window functions
-- avoid Python row loops
-- keep joins narrow
-- chunk large builds
-- prefer incremental rebuilds when safe
+- certains symboles spéciaux restent mal couverts par Yahoo
+- warrants / units / preferred / syntaxes exotiques peuvent être exclus
+- la notion de `last_complete_date` peut encore être sévère selon le scope historique
 
-## Reference Signal
+## FINRA pipeline
 
-`rsi_threshold`
+### État retenu
 
-Use it as the template for future signals such as:
+- raw sur disque validé
+- chargement raw DuckDB validé
+- `daily_short_volume_history` incrémental validé
+- `short_features_daily` incrémental validé
 
-- `sma_cross`
-- volatility regime filters
-- composite multi-feature signals
+### Notes pratiques
+
+- certaines archives historiques contiennent seulement une ligne `0`
+- ces fichiers doivent être traités comme payloads vides
+- conserver la progression visible pendant les loads bulk
+
+## SEC pipeline
+
+### État retenu
+
+- `build_sec_filings.py` chunké et incrémental
+- `build_sec_fact_normalized.py` chunké par mois et incrémental
+- le watermark facts doit suivre `sec_xbrl_fact_raw.ingested_at`
+- ne pas utiliser `sec_filing.created_at` comme signal incrémental
+
+### Propriété importante
+
+Le pipeline SEC est maintenant :
+- chunké
+- visible
+- réellement incrémental
+
+## Cron
+
+L'ancien cron utilisateur lançant `cli/run_daily_pipeline.py` a été commenté pour éviter :
+- les runs concurrents
+- les conflits de lock DuckDB
+- les diagnostics confus
+
+## Débogage recommandé
+
+### Vérifier un lock DuckDB
+
+```bash
+lsof /home/marty/stock-quant-oop/market.duckdb
+```
+
+### Vérifier l'état final des tables
+
+```bash
+cd ~/stock-quant-oop && {
+  echo "===== DATE ====="
+  date
+  python3 <<'PY'
+import duckdb
+con = duckdb.connect('/home/marty/stock-quant-oop/market.duckdb', read_only=True)
+try:
+    for table, sql in [
+        ('price_history', 'SELECT COUNT(*), MIN(price_date), MAX(price_date) FROM price_history'),
+        ('daily_short_volume_history', 'SELECT COUNT(*), MIN(trade_date), MAX(trade_date) FROM daily_short_volume_history'),
+        ('short_features_daily', 'SELECT COUNT(*), MIN(as_of_date), MAX(as_of_date) FROM short_features_daily'),
+        ('sec_filing', 'SELECT COUNT(*), MIN(filing_date), MAX(filing_date) FROM sec_filing'),
+        ('sec_fact_normalized', 'SELECT COUNT(*), MIN(period_end_date), MAX(period_end_date) FROM sec_fact_normalized'),
+        ('research_features_daily', 'SELECT COUNT(*), MIN(as_of_date), MAX(as_of_date) FROM research_features_daily'),
+    ]:
+        print(table, '=', con.execute(sql).fetchone())
+finally:
+    con.close()
+PY
+} | tee ~/log.txt
+```
+
+## Fichiers importants
+
+- `cli/ops/run_manual_incremental_data_refresh.py`
+- `cli/ops/rebuild_db_from_scratch.py`
+- `cli/core/build_prices.py`
+- `cli/core/build_sec_filings.py`
+- `cli/core/build_sec_fact_normalized.py`
+- `cli/core/build_finra_daily_short_volume.py`
+- `cli/core/build_short_features.py`
+
+## Règle d'exploitation
+
+Pour les gros jobs :
+- séparer l'écriture du script et son exécution
+- garder les prompts de troubleshooting en un seul bloc copiable
+- éviter les runs concurrents sur la même DB
