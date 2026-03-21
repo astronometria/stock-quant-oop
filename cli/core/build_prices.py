@@ -52,8 +52,92 @@ def main():
 
     canonical_symbols, symbol_scope_source = repo.get_refresh_symbols(args.symbols)
 
+    run_started_at = datetime.utcnow()
+    base_log = {
+        "timestamp": run_started_at.isoformat(),
+        "symbol_scope_source": symbol_scope_source,
+        "research_scope_symbol_count": len(canonical_symbols),
+    }
+
+    # ------------------------------------------------------------------
+    # Resolve refresh window first.
+    #
+    # Important:
+    # On utilise encore le scope complet ici pour mesurer l'état global du
+    # dataset, mais on va ensuite réduire le fetch aux symboles réellement
+    # en retard jusqu'à effective_end_date.
+    # ------------------------------------------------------------------
+    window = PriceRefreshWindowService(
+        repo,
+        catchup_max_days=args.catchup_max_days,
+    ).resolve_window(
+        requested_start_date=parse_date(args.start_date),
+        requested_end_date=parse_date(args.end_date),
+        as_of=parse_date(args.as_of),
+        lookback_days=args.lookback_days,
+        symbols=canonical_symbols,
+        today=date.today(),
+    )
+
+    base_log.update(
+        {
+            "effective_start_date": str(window.effective_start_date),
+            "effective_end_date": str(window.effective_end_date),
+            "gap_days": window.gap_days,
+            "window_reason": window.window_reason,
+            "is_noop": window.is_noop,
+            "requires_range_fetch": window.requires_range_fetch,
+            "last_any_date": str(window.last_any_date) if window.last_any_date else None,
+            "last_complete_date": str(window.last_complete_date) if window.last_complete_date else None,
+            "expected_count": window.expected_count,
+            "observed_latest_count": window.observed_latest_count,
+        }
+    )
+
+    if window.is_noop or window.effective_end_date is None:
+        write_jsonl_log("logs/build_prices.log", base_log)
+        print(json.dumps(base_log, indent=2))
+        return
+
+    # ------------------------------------------------------------------
+    # Symbol-level incremental reduction.
+    #
+    # Cas explicite:
+    # - si l'utilisateur force des dates/as_of/symbols, on respecte le scope
+    #   fourni sans réduction additionnelle
+    #
+    # Cas automatique:
+    # - on ne fetch que les symboles dont MAX(price_date) < effective_end_date
+    # ------------------------------------------------------------------
+    explicit_request = bool(
+        args.symbols
+        or args.start_date
+        or args.end_date
+        or args.as_of
+    )
+
+    if explicit_request:
+        symbols_to_refresh = canonical_symbols
+        symbol_refresh_reason = "explicit_request_scope"
+    else:
+        symbols_to_refresh = repo.get_symbols_needing_refresh_through(
+            target_date=window.effective_end_date,
+            symbols=canonical_symbols,
+        )
+        symbol_refresh_reason = "lagging_symbols_only"
+
+    base_log["refresh_scope_symbol_count"] = len(symbols_to_refresh)
+    base_log["symbol_refresh_reason"] = symbol_refresh_reason
+
+    if not symbols_to_refresh:
+        base_log["is_noop"] = True
+        base_log["window_reason"] = f"{window.window_reason}|no_symbols_need_refresh"
+        write_jsonl_log("logs/build_prices.log", base_log)
+        print(json.dumps(base_log, indent=2))
+        return
+
     provider_service = PriceProviderSymbolService()
-    plan = provider_service.build_yfinance_plan(canonical_symbols)
+    plan = provider_service.build_yfinance_plan(symbols_to_refresh)
 
     failed_provider_symbols = set(failure_repo.get_recent_failures("yfinance"))
     filtered_provider_symbols = [
@@ -61,21 +145,19 @@ def main():
         for symbol in plan.eligible_provider_symbols
         if symbol not in failed_provider_symbols
     ]
-
     filtered_out_failures = len(plan.eligible_provider_symbols) - len(filtered_provider_symbols)
-    run_started_at = datetime.utcnow()
 
-    log = {
-        "timestamp": run_started_at.isoformat(),
-        "symbol_scope_source": symbol_scope_source,
-        "research_scope_symbol_count": len(canonical_symbols),
-        "provider_candidate_symbol_count": plan.total_input_count,
-        "provider_eligible_symbol_count": plan.eligible_count,
-        "provider_excluded_symbol_count": plan.excluded_count,
-        "mapping_applied_count": plan.mapping_applied_count,
-        "exclusion_breakdown": plan.exclusion_breakdown,
-        "filtered_out_failures": filtered_out_failures,
-    }
+    log = dict(base_log)
+    log.update(
+        {
+            "provider_candidate_symbol_count": plan.total_input_count,
+            "provider_eligible_symbol_count": plan.eligible_count,
+            "provider_excluded_symbol_count": plan.excluded_count,
+            "mapping_applied_count": plan.mapping_applied_count,
+            "exclusion_breakdown": plan.exclusion_breakdown,
+            "filtered_out_failures": filtered_out_failures,
+        }
+    )
 
     if plan.excluded_count > 0:
         exclusion_payload = {
@@ -95,30 +177,9 @@ def main():
         }
         write_jsonl_log("logs/provider_symbol_mapping.log", exclusion_payload)
 
-    window = PriceRefreshWindowService(
-        repo,
-        catchup_max_days=args.catchup_max_days,
-    ).resolve_window(
-        requested_start_date=parse_date(args.start_date),
-        requested_end_date=parse_date(args.end_date),
-        as_of=parse_date(args.as_of),
-        lookback_days=args.lookback_days,
-        symbols=canonical_symbols,
-        today=date.today(),
-    )
-
-    log.update(
-        {
-            "effective_start_date": str(window.effective_start_date),
-            "effective_end_date": str(window.effective_end_date),
-            "gap_days": window.gap_days,
-            "window_reason": window.window_reason,
-            "is_noop": window.is_noop,
-            "requires_range_fetch": window.requires_range_fetch,
-        }
-    )
-
-    if window.is_noop or not filtered_provider_symbols:
+    if not filtered_provider_symbols:
+        log["is_noop"] = True
+        log["window_reason"] = f"{window.window_reason}|no_provider_symbols_after_filter"
         write_jsonl_log("logs/build_prices.log", log)
         print(json.dumps(log, indent=2))
         return

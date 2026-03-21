@@ -44,13 +44,15 @@ class DuckDbPriceRepository:
                 """
                 return con.execute(query, symbols).fetchall()
 
-            return con.execute("""
+            return con.execute(
+                """
                 SELECT price_date, COUNT(DISTINCT symbol)
                 FROM price_history
                 GROUP BY price_date
                 ORDER BY price_date DESC
                 LIMIT 30
-            """).fetchall()
+                """
+            ).fetchall()
 
     def get_latest_complete_price_date(
         self,
@@ -87,14 +89,17 @@ class DuckDbPriceRepository:
             tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
 
             if "market_universe" in tables:
-                latest_as_of_row = con.execute("""
+                latest_as_of_row = con.execute(
+                    """
                     SELECT MAX(as_of_date)
                     FROM market_universe
-                """).fetchone()
+                    """
+                ).fetchone()
                 latest_as_of = latest_as_of_row[0] if latest_as_of_row else None
 
                 if latest_as_of is not None:
-                    rows = con.execute("""
+                    rows = con.execute(
+                        """
                         SELECT DISTINCT symbol
                         FROM market_universe
                         WHERE as_of_date = ?
@@ -102,39 +107,105 @@ class DuckDbPriceRepository:
                           AND symbol IS NOT NULL
                           AND TRIM(symbol) <> ''
                         ORDER BY symbol
-                    """, [latest_as_of]).fetchall()
+                        """,
+                        [latest_as_of],
+                    ).fetchall()
 
                     values = [row[0] for row in rows if row[0]]
                     if values:
                         return values, "market_universe_latest_as_of"
 
             if "symbol_reference" in tables:
-                rows = con.execute("""
+                rows = con.execute(
+                    """
                     SELECT DISTINCT symbol
                     FROM symbol_reference
                     WHERE symbol IS NOT NULL
                       AND TRIM(symbol) <> ''
                     ORDER BY symbol
-                """).fetchall()
+                    """
+                ).fetchall()
 
                 values = [row[0] for row in rows if row[0]]
                 if values:
                     return values, "symbol_reference_all"
 
             if "price_history" in tables:
-                rows = con.execute("""
+                rows = con.execute(
+                    """
                     SELECT DISTINCT symbol
                     FROM price_history
                     WHERE symbol IS NOT NULL
                       AND TRIM(symbol) <> ''
                     ORDER BY symbol
-                """).fetchall()
+                    """
+                ).fetchall()
 
                 values = [row[0] for row in rows if row[0]]
                 if values:
                     return values, "price_history_distinct"
 
         return [], "none"
+
+    def get_symbols_needing_refresh_through(
+        self,
+        *,
+        target_date: date,
+        symbols: List[str],
+    ) -> list[str]:
+        """
+        Retourne seulement les symboles dont la dernière date prix connue
+        est strictement antérieure à `target_date`, ou absente.
+
+        Pourquoi
+        --------
+        Le pipeline actuel est incrémental en dates, mais pas en symboles.
+        Cette méthode réduit le scope provider aux symboles réellement
+        en retard jusqu'à la date cible.
+
+        Note technique
+        --------------
+        On utilise un DataFrame enregistré temporairement plutôt qu'une très
+        longue liste de placeholders SQL. Cela évite les erreurs de binding
+        et reste lisible.
+        """
+        cleaned = sorted({str(s).strip().upper() for s in symbols if str(s).strip()})
+        if not cleaned:
+            return []
+
+        scope_df = pd.DataFrame({"symbol": cleaned})
+
+        with self._connect() as con:
+            con.register("price_refresh_scope_df", scope_df)
+
+            rows = con.execute(
+                """
+                WITH scope AS (
+                    SELECT UPPER(TRIM(CAST(symbol AS VARCHAR))) AS symbol
+                    FROM price_refresh_scope_df
+                ),
+                latest AS (
+                    SELECT
+                        UPPER(TRIM(symbol)) AS symbol,
+                        MAX(price_date) AS max_price_date
+                    FROM price_history
+                    WHERE UPPER(TRIM(symbol)) IN (SELECT symbol FROM scope)
+                    GROUP BY 1
+                )
+                SELECT s.symbol
+                FROM scope s
+                LEFT JOIN latest l
+                  ON l.symbol = s.symbol
+                WHERE l.max_price_date IS NULL
+                   OR l.max_price_date < CAST(? AS DATE)
+                ORDER BY s.symbol
+                """,
+                [target_date],
+            ).fetchall()
+
+            con.unregister("price_refresh_scope_df")
+
+        return [str(row[0]).strip().upper() for row in rows if row[0]]
 
     # ------------------------------------------------------------------
     # WRITES
@@ -188,7 +259,8 @@ class DuckDbPriceRepository:
         with self._connect() as con:
             con.register("price_upsert_stage_df", working)
 
-            con.execute("""
+            con.execute(
+                """
                 CREATE TEMP TABLE price_upsert_stage AS
                 SELECT
                     CAST(symbol AS VARCHAR) AS symbol,
@@ -201,18 +273,22 @@ class DuckDbPriceRepository:
                     CAST(source_name AS VARCHAR) AS source_name,
                     CAST(ingested_at AS TIMESTAMP) AS ingested_at
                 FROM price_upsert_stage_df
-            """)
+                """
+            )
 
             staged_rows = con.execute("SELECT COUNT(*) FROM price_upsert_stage").fetchone()[0]
 
-            deleted_existing_rows = con.execute("""
+            deleted_existing_rows = con.execute(
+                """
                 DELETE FROM price_history
                 USING price_upsert_stage s
                 WHERE price_history.symbol = s.symbol
                   AND price_history.price_date = s.price_date
-            """).fetchone()[0]
+                """
+            ).fetchone()[0]
 
-            inserted_rows = con.execute("""
+            inserted_rows = con.execute(
+                """
                 INSERT INTO price_history (
                     symbol,
                     price_date,
@@ -235,7 +311,8 @@ class DuckDbPriceRepository:
                     source_name,
                     ingested_at
                 FROM price_upsert_stage
-            """).fetchone()[0]
+                """
+            ).fetchone()[0]
 
             con.unregister("price_upsert_stage_df")
 
@@ -303,7 +380,9 @@ class DuckDbPriceRepository:
                 return {"deleted_rows": deleted_rows, "inserted_rows": inserted_rows}
 
             deleted_rows = con.execute("DELETE FROM price_latest").fetchone()[0]
-            inserted_rows = con.execute("""
+
+            inserted_rows = con.execute(
+                """
                 INSERT INTO price_latest (
                     symbol,
                     latest_price_date,
@@ -334,6 +413,7 @@ class DuckDbPriceRepository:
                     CURRENT_TIMESTAMP AS updated_at
                 FROM ranked
                 WHERE rn = 1
-            """).fetchone()[0]
+                """
+            ).fetchone()[0]
 
             return {"deleted_rows": deleted_rows, "inserted_rows": inserted_rows}

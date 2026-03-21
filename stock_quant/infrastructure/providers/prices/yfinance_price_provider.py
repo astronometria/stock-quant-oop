@@ -1,347 +1,420 @@
 from __future__ import annotations
 
 """
-YfinancePriceProvider
+Safe Yahoo Finance provider.
 
-Responsabilités :
-- fetch Yahoo Finance
-- batching pour limiter le rate limit
-- normalisation robuste mono / multi-symboles
-- capture des erreurs provider par symbole quand yfinance les expose
+Objectif
+--------
+- respecter le contrat attendu par ProviderFrameAdapter (`fetch`)
+- exposer aussi `fetch_prices` pour compatibilité
+- éviter les rate limits Yahoo avec petits batches + backoff
+- garder les failures consultables via `get_last_failures()`
 
-IMPORTANT :
-- `end` est exclusif chez Yahoo => on ajoute +1 jour
-- les symboles renvoyés par ce provider restent des symboles provider
-- le remap vers symbole canonique se fait dans l'adapter
+Contrat de sortie
+-----------------
+Retourne un DataFrame canonique avec les colonnes:
+- symbol
+- price_date
+- open
+- high
+- low
+- close
+- volume
+- source_name
+
+Notes
+-----
+- Python mince pour l'orchestration batch/retry
+- yfinance fait le fetch réseau
+- beaucoup de commentaires pour aider les autres développeurs
 """
 
-from dataclasses import dataclass
-from datetime import timedelta
+import random
 import time
-from typing import Iterable
+from dataclasses import dataclass
+from typing import Any, Iterable
 
 import pandas as pd
 import yfinance as yf
-from tqdm import tqdm
 
 try:
-    # API interne yfinance, utile pour récupérer les erreurs par ticker.
-    # Si cette API change, le provider continuera de fonctionner avec un fallback.
-    import yfinance.shared as yf_shared
-except Exception:  # pragma: no cover - dépend du runtime
-    yf_shared = None
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
+# -----------------------------------------------------------------------------
+# Failure model expected by build_prices.py
+# -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class YfinanceFetchFailure:
+    """
+    Failure normalisé pour le pipeline prix.
+
+    Champs utilisés plus loin:
+    - provider_symbol
+    - failure_reason
+    - is_transient
+    """
+
     provider_symbol: str
     failure_reason: str
     is_transient: bool
 
 
-TRANSIENT_ERROR_KEYWORDS = [
-    "too many requests",
-    "rate limited",
-    "rate limit",
-    "timeout",
-    "timed out",
-    "connection",
-    "network",
-    "temporarily unavailable",
-    "temporarily down",
-]
-
-PERMANENT_ERROR_KEYWORDS = [
-    "possibly delisted",
-    "no timezone found",
-    "no price data found",
-    "quote not found",
-    "symbol may be delisted",
-]
-
-
-def is_transient_error_message(message: str) -> bool:
-    text = (message or "").strip().lower()
-    return any(keyword in text for keyword in TRANSIENT_ERROR_KEYWORDS)
-
-
-def is_permanent_error_message(message: str) -> bool:
-    text = (message or "").strip().lower()
-    return any(keyword in text for keyword in PERMANENT_ERROR_KEYWORDS)
-
-
+# -----------------------------------------------------------------------------
+# Provider
+# -----------------------------------------------------------------------------
 class YfinancePriceProvider:
+    """
+    Provider Yahoo Finance avec throttling défensif.
+
+    Pourquoi cette implémentation
+    -----------------------------
+    - Yahoo peut rate-limit sans préavis
+    - de gros batches agressifs échouent plus souvent
+    - on préfère des petits batches plus lents mais stables
+    """
+
     def __init__(
         self,
-        batch_size: int = 100,
-        sleep_seconds: float = 1.0,
-        max_retries: int = 2,
-    ):
-        self.batch_size = batch_size
-        self.sleep_seconds = sleep_seconds
-        self.max_retries = max_retries
+        *,
+        batch_size: int = 25,
+        sleep_seconds: float = 3.0,
+        max_retries: int = 5,
+        jitter_min_seconds: float = 0.50,
+        jitter_max_seconds: float = 2.00,
+    ) -> None:
+        self.batch_size = max(1, int(batch_size))
+        self.sleep_seconds = max(0.0, float(sleep_seconds))
+        self.max_retries = max(1, int(max_retries))
+        self.jitter_min_seconds = max(0.0, float(jitter_min_seconds))
+        self.jitter_max_seconds = max(self.jitter_min_seconds, float(jitter_max_seconds))
         self._last_failures: list[YfinanceFetchFailure] = []
 
-    def get_last_failures(self) -> list[YfinanceFetchFailure]:
-        """
-        Retourne les failures du dernier fetch global.
-        """
-        return list(self._last_failures)
-
-    def _reset_failures(self) -> None:
-        self._last_failures = []
-
-    def _chunked(self, symbols: list[str]) -> Iterable[list[str]]:
-        for i in range(0, len(symbols), self.batch_size):
-            yield symbols[i:i + self.batch_size]
-
+    # ------------------------------------------------------------------
+    # Public API expected by ProviderFrameAdapter
+    # ------------------------------------------------------------------
     def fetch(
         self,
+        *,
         symbols: list[str],
-        start_date,
-        end_date,
-        requires_range_fetch: bool,
+        start_date: str | None,
+        end_date: str | None,
+        requires_range_fetch: bool | None = None,
     ) -> pd.DataFrame:
         """
-        Yahoo traite `end` comme exclusif.
-        Donc pour inclure `end_date`, on passe `end_date + 1 jour`.
+        Main provider entrypoint expected by ProviderFrameAdapter.
         """
-        self._reset_failures()
+        self._last_failures = []
 
-        if not symbols:
-            return pd.DataFrame()
+        normalized_symbols = self._normalize_symbols(symbols)
+        if not normalized_symbols:
+            return self._empty_price_frame()
 
-        yahoo_end_date = end_date + timedelta(days=1)
-
-        all_frames: list[pd.DataFrame] = []
-        batches = list(self._chunked(symbols))
-
-        for batch in tqdm(batches, desc="yfinance batches"):
-            batch_df = self._fetch_batch_with_retry(
-                batch=batch,
-                start_date=start_date,
-                end_date_exclusive=yahoo_end_date,
-            )
-            if batch_df is not None and not batch_df.empty:
-                all_frames.append(batch_df)
-
-            time.sleep(self.sleep_seconds)
-
-        if not all_frames:
-            return pd.DataFrame()
-
-        combined = pd.concat(all_frames, ignore_index=True)
-        combined = combined.drop_duplicates(subset=["symbol", "price_date"]).reset_index(drop=True)
-
-        return combined
-
-    def _fetch_batch_with_retry(
-        self,
-        batch: list[str],
-        start_date,
-        end_date_exclusive,
-    ) -> pd.DataFrame | None:
-        for attempt in range(self.max_retries + 1):
-            batch_result = self._fetch_batch(
-                batch=batch,
-                start_date=start_date,
-                end_date_exclusive=end_date_exclusive,
-            )
-
-            # Si aucune erreur transitoire n'est présente, on accepte le résultat.
-            transient_failures = [f for f in batch_result["failures"] if f.is_transient]
-            if not transient_failures:
-                self._last_failures.extend(batch_result["failures"])
-                return batch_result["frame"]
-
-            # Si on a des erreurs transitoires mais plus de retries disponibles,
-            # on garde quand même les failures observées.
-            if attempt >= self.max_retries:
-                self._last_failures.extend(batch_result["failures"])
-                return batch_result["frame"]
-
-            sleep_for = 2.0 * (attempt + 1)
-            print(
-                f"[RETRY] yfinance transient retry={attempt + 1}/{self.max_retries} "
-                f"batch_size={len(batch)} transient_failures={len(transient_failures)} "
-                f"sleep={sleep_for}s"
-            )
-            time.sleep(sleep_for)
-
-        return None
-
-    def _fetch_batch(
-        self,
-        batch: list[str],
-        start_date,
-        end_date_exclusive,
-    ) -> dict:
-        self._clear_yfinance_shared_errors()
-
-        raw = yf.download(
-            tickers=" ".join(batch),
-            start=start_date,
-            end=end_date_exclusive,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=False,
-        )
-
-        frame = self._normalize_download_frame(raw=raw, batch=batch)
-        returned_symbols = set(frame["symbol"].astype(str).unique()) if frame is not None and not frame.empty else set()
-
-        captured_errors = self._collect_yfinance_shared_errors()
-
-        failures: list[YfinanceFetchFailure] = []
-
-        # 1) erreurs explicites remontées par yfinance
-        for provider_symbol, message in captured_errors.items():
-            failures.append(
-                YfinanceFetchFailure(
-                    provider_symbol=provider_symbol,
-                    failure_reason=message,
-                    is_transient=is_transient_error_message(message),
-                )
-            )
-
-        # 2) fallback : symbole demandé mais absent, sans message explicite
-        captured_symbols = set(captured_errors.keys())
-        missing_without_explicit_error = [
-            provider_symbol
-            for provider_symbol in batch
-            if provider_symbol not in returned_symbols and provider_symbol not in captured_symbols
+        batches = [
+            normalized_symbols[i:i + self.batch_size]
+            for i in range(0, len(normalized_symbols), self.batch_size)
         ]
-        for provider_symbol in missing_without_explicit_error:
-            failures.append(
-                YfinanceFetchFailure(
-                    provider_symbol=provider_symbol,
-                    failure_reason="no_data_returned",
-                    is_transient=False,
-                )
-            )
 
-        return {
-            "frame": frame,
-            "failures": failures,
-        }
-
-    def _clear_yfinance_shared_errors(self) -> None:
-        if yf_shared is None:
-            return
-        try:
-            if hasattr(yf_shared, "_ERRORS") and isinstance(yf_shared._ERRORS, dict):
-                yf_shared._ERRORS.clear()
-            if hasattr(yf_shared, "_TRACEBACKS") and isinstance(yf_shared._TRACEBACKS, dict):
-                yf_shared._TRACEBACKS.clear()
-        except Exception:
-            # Le provider doit rester robuste même si l'API interne change.
-            return
-
-    def _collect_yfinance_shared_errors(self) -> dict[str, str]:
-        if yf_shared is None:
-            return {}
-
-        try:
-            errors = getattr(yf_shared, "_ERRORS", {})
-            if not isinstance(errors, dict):
-                return {}
-
-            normalized: dict[str, str] = {}
-            for key, value in errors.items():
-                provider_symbol = str(key).strip().upper()
-                message = str(value).strip()
-                if provider_symbol and message:
-                    normalized[provider_symbol] = message
-            return normalized
-        except Exception:
-            return {}
-
-    def _normalize_download_frame(
-        self,
-        raw: pd.DataFrame,
-        batch: list[str],
-    ) -> pd.DataFrame:
-        """
-        Normalise les 2 formes principales de yfinance :
-
-        1) batch multi-symboles :
-           colonnes MultiIndex, ex. ('AAPL', 'Open')
-
-        2) batch mono-symbole :
-           colonnes simples ou parfois MultiIndex selon version/comportement
-        """
-        if raw is None or raw.empty:
-            return pd.DataFrame()
+        print(
+            f"[yfinance] total_symbols={len(normalized_symbols)} "
+            f"batches={len(batches)} batch_size={self.batch_size}",
+            flush=True,
+        )
 
         frames: list[pd.DataFrame] = []
 
-        if isinstance(raw.columns, pd.MultiIndex):
-            level0 = set(raw.columns.get_level_values(0))
-
-            for provider_symbol in batch:
-                if provider_symbol not in level0:
-                    continue
-
-                symbol_frame = raw[provider_symbol].copy()
-                normalized = self._normalize_symbol_frame(
-                    symbol_frame=symbol_frame,
-                    provider_symbol=provider_symbol,
-                )
-                if normalized is not None and not normalized.empty:
-                    frames.append(normalized)
-
-        else:
-            if len(batch) != 1:
-                return pd.DataFrame()
-
-            provider_symbol = batch[0]
-            normalized = self._normalize_symbol_frame(
-                symbol_frame=raw.copy(),
-                provider_symbol=provider_symbol,
+        for batch in tqdm(batches, desc="yfinance batches"):
+            batch_frame = self._fetch_batch_with_retry(
+                batch=batch,
+                start_date=start_date,
+                end_date=end_date,
             )
-            if normalized is not None and not normalized.empty:
-                frames.append(normalized)
+
+            if batch_frame is not None and not batch_frame.empty:
+                frames.append(batch_frame)
+
+            # Pause volontaire entre les batches pour réduire la pression
+            # sur Yahoo Finance.
+            time.sleep(self.sleep_seconds)
 
         if not frames:
-            return pd.DataFrame()
+            return self._empty_price_frame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        if combined.empty:
+            return self._empty_price_frame()
+
+        # Dédup défensif au cas où un rerun batch renvoie des doublons.
+        combined = combined.drop_duplicates(subset=["symbol", "price_date"]).reset_index(drop=True)
+        return combined
+
+    def fetch_prices(
+        self,
+        *,
+        symbols: list[str],
+        start_date: str | None,
+        end_date: str | None,
+        requires_range_fetch: bool | None = None,
+    ) -> pd.DataFrame:
+        """
+        Alias conservé pour compatibilité avec d'autres appels éventuels.
+        """
+        return self.fetch(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            requires_range_fetch=requires_range_fetch,
+        )
+
+    def get_last_failures(self) -> list[YfinanceFetchFailure]:
+        """
+        Retourne les failures du dernier run.
+        """
+        return list(self._last_failures)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _normalize_symbols(self, symbols: Iterable[str]) -> list[str]:
+        """
+        Normalise et déduplique les symboles.
+        """
+        return sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in symbols
+                if str(symbol).strip()
+            }
+        )
+
+    def _fetch_batch_with_retry(
+        self,
+        *,
+        batch: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame | None:
+        """
+        Fetch un batch avec retry exponentiel + jitter.
+
+        En cas de rate limit complet:
+        - on enregistre chaque symbole comme failure transitoire
+        - on retourne None pour ce batch
+        """
+        last_error_message = ""
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                # threads=False pour être plus conservateur côté Yahoo.
+                raw = yf.download(
+                    tickers=" ".join(batch),
+                    start=start_date,
+                    end=end_date,
+                    group_by="ticker",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+
+                if raw is None or raw.empty:
+                    # Vide ne veut pas forcément dire erreur; on considère
+                    # que le batch a répondu, puis on laisse la normalisation
+                    # décider si des lignes exploitables existent.
+                    return self._normalize_yfinance_output(raw=raw, batch=batch)
+
+                return self._normalize_yfinance_output(raw=raw, batch=batch)
+
+            except Exception as exc:
+                last_error_message = str(exc)
+                is_transient = self._is_transient_error(last_error_message)
+
+                sleep_time = (2 ** attempt) + random.uniform(
+                    self.jitter_min_seconds,
+                    self.jitter_max_seconds,
+                )
+
+                print(
+                    f"[yfinance] retry {attempt}/{self.max_retries} "
+                    f"batch_size={len(batch)} "
+                    f"transient={is_transient} "
+                    f"sleep={sleep_time:.2f}s "
+                    f"error={last_error_message}",
+                    flush=True,
+                )
+
+                # Si l'erreur paraît permanente, inutile d'insister trop.
+                if not is_transient:
+                    break
+
+                time.sleep(sleep_time)
+
+        # Si on arrive ici, le batch a échoué définitivement pour ce run.
+        is_transient = self._is_transient_error(last_error_message)
+        for symbol in batch:
+            self._last_failures.append(
+                YfinanceFetchFailure(
+                    provider_symbol=symbol,
+                    failure_reason=last_error_message or "unknown_yfinance_error",
+                    is_transient=is_transient,
+                )
+            )
+
+        print(
+            f"[yfinance] FAILED batch permanently size={len(batch)} error={last_error_message}",
+            flush=True,
+        )
+        return None
+
+    def _normalize_yfinance_output(
+        self,
+        *,
+        raw: Any,
+        batch: list[str],
+    ) -> pd.DataFrame:
+        """
+        Convertit la sortie yfinance en DataFrame canonique.
+
+        Gère:
+        - batch multi-symboles (columns MultiIndex)
+        - batch mono-symbole
+        """
+        if raw is None:
+            return self._empty_price_frame()
+
+        if not isinstance(raw, pd.DataFrame) or raw.empty:
+            return self._empty_price_frame()
+
+        frames: list[pd.DataFrame] = []
+
+        # ------------------------------------------------------------------
+        # Cas multi-symboles
+        # ------------------------------------------------------------------
+        if isinstance(raw.columns, pd.MultiIndex):
+            top_level = set(raw.columns.get_level_values(0))
+
+            for symbol in batch:
+                if symbol not in top_level:
+                    # Symbole absent du retour: souvent pas de data ou response
+                    # partielle. On ne marque pas automatiquement comme failure
+                    # permanente ici.
+                    continue
+
+                symbol_frame = raw[symbol].copy()
+                canonical = self._normalize_single_symbol_frame(
+                    frame=symbol_frame,
+                    symbol=symbol,
+                )
+                if canonical is not None and not canonical.empty:
+                    frames.append(canonical)
+
+        # ------------------------------------------------------------------
+        # Cas mono-symbole
+        # ------------------------------------------------------------------
+        else:
+            symbol = batch[0]
+            canonical = self._normalize_single_symbol_frame(
+                frame=raw.copy(),
+                symbol=symbol,
+            )
+            if canonical is not None and not canonical.empty:
+                frames.append(canonical)
+
+        if not frames:
+            return self._empty_price_frame()
 
         return pd.concat(frames, ignore_index=True)
 
-    def _normalize_symbol_frame(
+    def _normalize_single_symbol_frame(
         self,
-        symbol_frame: pd.DataFrame,
-        provider_symbol: str,
+        *,
+        frame: pd.DataFrame,
+        symbol: str,
     ) -> pd.DataFrame | None:
-        if symbol_frame is None or symbol_frame.empty:
+        """
+        Normalise un DataFrame OHLCV pour un seul symbole.
+        """
+        if frame is None or frame.empty:
             return None
 
-        frame = symbol_frame.copy()
+        working = frame.copy().reset_index()
 
-        rename_map = {
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Adj Close": "adj_close",
-            "Volume": "volume",
+        # yfinance renvoie normalement "Date". On garde un fallback souple.
+        column_map = {str(col).strip().lower(): col for col in working.columns}
+
+        date_col = None
+        for candidate in ["date", "datetime"]:
+            if candidate in column_map:
+                date_col = column_map[candidate]
+                break
+        if date_col is None:
+            return None
+
+        required_candidates = {
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
         }
-        frame = frame.rename(columns=rename_map)
 
-        required = ["open", "high", "low", "close", "volume"]
-        missing = [col for col in required if col not in frame.columns]
-        if missing:
+        missing_required = [src for src in required_candidates if src not in column_map]
+        if missing_required:
             return None
 
-        frame = frame.reset_index()
-        index_col = frame.columns[0]
-        frame = frame.rename(columns={index_col: "price_date"})
+        canonical = pd.DataFrame(
+            {
+                "symbol": symbol,
+                "price_date": pd.to_datetime(working[date_col], errors="coerce").dt.date,
+                "open": pd.to_numeric(working[column_map["open"]], errors="coerce"),
+                "high": pd.to_numeric(working[column_map["high"]], errors="coerce"),
+                "low": pd.to_numeric(working[column_map["low"]], errors="coerce"),
+                "close": pd.to_numeric(working[column_map["close"]], errors="coerce"),
+                "volume": pd.to_numeric(working[column_map["volume"]], errors="coerce").fillna(0).astype("int64"),
+                "source_name": "yfinance",
+            }
+        )
 
-        frame["price_date"] = pd.to_datetime(frame["price_date"]).dt.date
-        frame["symbol"] = provider_symbol
+        canonical = canonical.dropna(
+            subset=["symbol", "price_date", "open", "high", "low", "close"]
+        )
+        if canonical.empty:
+            return None
 
-        out = frame[["symbol", "price_date", "open", "high", "low", "close", "volume"]].copy()
-        out = out.dropna(subset=["price_date", "close"])
+        return canonical
 
-        return out.reset_index(drop=True)
+    def _empty_price_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "price_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "source_name",
+            ]
+        )
+
+    def _is_transient_error(self, message: str) -> bool:
+        """
+        Détecte les erreurs réseau / throttling qui méritent un retry.
+        """
+        lowered = str(message or "").lower()
+        transient_markers = [
+            "rate limit",
+            "too many requests",
+            "yfratelimiterror",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "remote end closed connection",
+            "server error",
+            "bad gateway",
+            "service unavailable",
+        ]
+        return any(marker in lowered for marker in transient_markers)
