@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
-from stock_quant.pipelines.base_pipeline import BasePipeline
+# REMOVED: BasePipeline supprimé pendant la consolidation brutale
 from stock_quant.shared.exceptions import PipelineError
 
 

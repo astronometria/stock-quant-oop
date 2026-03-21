@@ -1,82 +1,171 @@
 """
-pipeline_runner.py
+Runner canonique des pipelines.
 
-Runner standard pour exécuter les pipelines.
+Ce module est la SEULE porte d'entrée autorisée pour envelopper une exécution
+pipeline et produire un PipelineResult normalisé.
 
-Ce module centralise :
+Invariants:
+- Une seule vérité pour PipelineResult:
+  stock_quant.app.dto.pipeline_result.PipelineResult
+- Une seule vérité pour PipelineStatus:
+  stock_quant.shared.enums.PipelineStatus
+- Les pipelines concrets ne doivent PAS construire PipelineResult eux-mêmes.
+- Les pipelines concrets doivent renvoyer un dict avec:
+    rows_read
+    rows_written
+    rows_skipped
+    warnings
+    metrics
 
-- le timing
-- la gestion d'erreur
-- la construction du PipelineResult
-
-Les pipelines peuvent ainsi rester très simples.
+Important:
+Ce module ne doit pas contenir de logique métier PIT/survivorship.
+Ces garanties doivent rester dans les services, policies, repositories et SQL.
 """
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable, Mapping
+from datetime import datetime
+from typing import Any
 
-from stock_quant.shared.pipeline_result import PipelineResult
-from stock_quant.shared.pipeline_status import PipelineStatus
-from stock_quant.shared.time_utils import utcnow, isoformat_utc
+from stock_quant.app.dto.pipeline_result import PipelineResult
+from stock_quant.shared.enums import PipelineStatus
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """
+    Convertit proprement une valeur arbitraire en int.
+
+    On reste volontairement strict mais robuste:
+    - None => default
+    - bool => 0/1 via int(bool)
+    - int/float/str numérique => int(...)
+    - sinon => default
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_warnings(value: Any) -> list[str]:
+    """
+    Normalise les warnings en liste[str].
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, tuple):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _coerce_metrics(value: Any) -> dict[str, Any]:
+    """
+    Normalise les métriques en dict.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {"raw_metrics": value}
+
+
+def _normalize_payload(payload: Any) -> dict[str, Any]:
+    """
+    Normalise la sortie métier retournée par un pipeline concret.
+
+    Contrat attendu:
+    {
+        "rows_read": int,
+        "rows_written": int,
+        "rows_skipped": int,
+        "warnings": list[str],
+        "metrics": dict[str, Any],
+    }
+
+    Compatibilité volontairement minimale:
+    - None => structure vide
+    - dict partiel => champs manquants complétés
+    - toute autre valeur => placée dans metrics.raw_payload
+    """
+    if payload is None:
+        return {
+            "rows_read": 0,
+            "rows_written": 0,
+            "rows_skipped": 0,
+            "warnings": [],
+            "metrics": {},
+        }
+
+    if isinstance(payload, Mapping):
+        return {
+            "rows_read": _coerce_int(payload.get("rows_read", 0)),
+            "rows_written": _coerce_int(payload.get("rows_written", 0)),
+            "rows_skipped": _coerce_int(payload.get("rows_skipped", 0)),
+            "warnings": _coerce_warnings(payload.get("warnings", [])),
+            "metrics": _coerce_metrics(payload.get("metrics", {})),
+        }
+
+    return {
+        "rows_read": 0,
+        "rows_written": 0,
+        "rows_skipped": 0,
+        "warnings": [],
+        "metrics": {"raw_payload": payload},
+    }
 
 
 def run_pipeline(
     pipeline_name: str,
-    func: Callable[[], dict],
+    fn: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
 ) -> PipelineResult:
     """
-    Exécute une fonction pipeline avec gestion standardisée.
+    Exécute une unité pipeline métier et retourne un PipelineResult canonique.
 
-    La fonction fournie doit retourner un dict contenant :
-
-        rows_read
-        rows_written
-        rows_skipped
-        metrics
-
-    Exemple :
-
-        run_pipeline(
-            "build_prices",
-            lambda: service.build()
-        )
+    Notes:
+    - Aucun pipeline concret ne doit instancier PipelineResult directement.
+    - Toute exception non gérée devient un status FAILED.
+    - Aucune logique PIT métier n'est implémentée ici.
     """
-
-    started = utcnow()
+    started_at = datetime.utcnow()
 
     try:
-        result = func()
+        raw_payload = fn(*args, **kwargs)
+        payload = _normalize_payload(raw_payload)
 
-        finished = utcnow()
-        duration = (finished - started).total_seconds()
+        finished_at = datetime.utcnow()
 
         return PipelineResult(
             pipeline_name=pipeline_name,
             status=PipelineStatus.SUCCESS,
-            started_at=isoformat_utc(started),
-            finished_at=isoformat_utc(finished),
-            duration_seconds=duration,
-            rows_read=result.get("rows_read", 0),
-            rows_written=result.get("rows_written", 0),
-            rows_skipped=result.get("rows_skipped", 0),
+            started_at=started_at,
+            finished_at=finished_at,
+            rows_read=payload["rows_read"],
+            rows_written=payload["rows_written"],
+            rows_skipped=payload["rows_skipped"],
+            warnings=payload["warnings"],
+            metrics=payload["metrics"],
             error_message=None,
-            metrics=result.get("metrics", {}),
         )
 
     except Exception as exc:
-        finished = utcnow()
-        duration = (finished - started).total_seconds()
+        finished_at = datetime.utcnow()
 
         return PipelineResult(
             pipeline_name=pipeline_name,
             status=PipelineStatus.FAILED,
-            started_at=isoformat_utc(started),
-            finished_at=isoformat_utc(finished),
-            duration_seconds=duration,
+            started_at=started_at,
+            finished_at=finished_at,
             rows_read=0,
             rows_written=0,
             rows_skipped=0,
-            error_message=str(exc),
+            warnings=[],
             metrics={},
+            error_message=str(exc),
         )

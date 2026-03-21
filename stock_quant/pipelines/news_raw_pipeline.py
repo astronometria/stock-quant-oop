@@ -3,7 +3,7 @@ from __future__ import annotations
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.app.services.news_raw_ingestion_service import NewsRawIngestionService
 from stock_quant.infrastructure.repositories.duckdb_news_repository import DuckDbNewsRepository
-from stock_quant.pipelines.base_pipeline import BasePipeline
+# REMOVED: BasePipeline supprimé pendant la consolidation brutale
 from stock_quant.shared.exceptions import PipelineError
 
 
