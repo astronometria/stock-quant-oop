@@ -1,192 +1,120 @@
 # README_DEV
 
-Developer-oriented documentation for `stock-quant-oop`.
+## Dev Architecture
 
-## What is current in the codebase
-
-The codebase is no longer just a generic market-data pipeline. It now has a working research branch with:
-
-- chunked Stooq historical loading
-- daily Yahoo price refresh
-- SEC filing normalization
-- fundamentals build entrypoint
-- FINRA short-data history and derived short features
-- chunked research dataset building
-- dataset-scoped label generation with outlier filtering
-- split-aware, cost-aware backtests
-- experiment manifests with streamed child-process logging
-
-## Design rules
-
-### 1. Canonical over serving
-Research must read canonical historical tables first:
-
-- `price_history`
-- normalized SEC tables
-- normalized FINRA history tables
-- `short_features_daily`
-
-Serving tables are operational conveniences:
-
-- `price_latest`
-- any latest/snapshot helper table
-
-### 2. Point-in-time safety
-The dataset builder and feature joins must stay PIT-safe.
-Current research flow does this by:
-- anchoring rows on `research_training_dataset.as_of_date`
-- using backward-looking joins for features
-- keeping forward-looking logic confined to `research_labels`
-
-### 3. SQL-first, Python-thin
-DuckDB SQL should keep the heavy lifting for:
-- canonical rebuilds
-- date alignment
-- feature joins
-- label derivation
-- backtest aggregation
-
-Python should stay focused on:
-- CLI surfaces
-- runtime parameter plumbing
-- progress bars
-- temp-dir / thread / memory settings
-- lightweight orchestration
-
-### 4. Reproducibility
-The research path is dataset-id based, not ad hoc.
-Core identities:
-- `snapshot_id`
-- `split_id`
-- `dataset_id`
-- `backtest_id`
-- `experiment_id`
-
-## Current research pipeline
-
-### Dataset build
-Entrypoint:
-
-```bash
-python3 cli/core/build_research_training_dataset.py \
-  --db-path /path/to/market.duckdb \
-  --snapshot-id <snapshot_id> \
-  --split-id <split_id> \
-  --dataset-id <optional_dataset_id> \
-  --memory-limit 24GB \
-  --threads 6 \
-  --temp-dir /path/to/tmp \
-  --verbose
-```
-
-Behavior:
-- monthly chunking by partition window
-- SQL-first temp tables
-- backward-looking join from prices to `short_features_daily`
-- optional symbol filtering mode in current code (`common_only` path)
-
-### Labels build
-Entrypoint:
-
-```bash
-python3 cli/core/build_research_labels.py \
-  --db-path /path/to/market.duckdb \
-  --snapshot-id <snapshot_id> \
-  --dataset-id <dataset_id> \
-  --split-id <split_id> \
-  --memory-limit 24GB \
-  --threads 6 \
-  --temp-dir /path/to/tmp \
-  --max-abs-return 1.0 \
-  --verbose
-```
-
-Behavior:
-- dataset-scoped label build
-- forward returns: 1d / 5d / 20d
-- invalid close checks
-- extreme-return filtering via `--max-abs-return`
-- quality summary emitted as JSON/log lines
-
-### Backtest build
-Entrypoint:
-
-```bash
-python3 cli/core/build_research_backtest.py \
-  --db-path /path/to/market.duckdb \
-  --dataset-id <dataset_id> \
-  --split-id <split_id> \
-  --transaction-cost-bps 10 \
-  --signal-threshold 0.5 \
-  --memory-limit 24GB \
-  --threads 6 \
-  --temp-dir /path/to/tmp \
-  --verbose
-```
-
-Behavior:
-- split-aware partitioning (`train`, `valid`, `test`)
-- long-only threshold rule on `short_volume_ratio`
-- turnover and cost accounting
-- JSON output stable enough for the runner
-
-### Full experiment runner
-Entrypoint:
-
-```bash
-python3 cli/core/run_research_experiment.py \
-  --db-path /path/to/market.duckdb \
-  --snapshot-id <snapshot_id> \
-  --split-id <split_id> \
-  --experiment-name research_scientific_v3 \
-  --transaction-cost-bps 10 \
-  --signal-threshold 0.5 \
-  --memory-limit 24GB \
-  --threads 6 \
-  --temp-dir /path/to/tmp \
-  --verbose
-```
-
-Behavior:
-- streams child stdout/stderr live
-- passes runtime settings to children
-- parses trailing JSON payloads robustly
-- writes experiment manifest only if all steps succeed
-
-## Operational notes
-
-### Memory-heavy jobs
-For the large research path, current operational defaults in code are:
-
-- `--memory-limit 24GB`
-- `--threads 6`
-- explicit `--temp-dir`
-
-### Long-running price backfills
-Use the chunked Stooq loader for historical rebuilds; it is materially better than a one-big-glob approach for visibility and stability.
-
-### Logging
-The repository already uses `logs/` heavily. Keep heavy runs streamed and tee'd to log files.
-
-### DuckDB locking
-Do not open a second writer against the same `.duckdb` file while a heavy writer is already running.
-
-## What is still not generalized
-
-The current research backtest is **not** yet a signal framework.
-It is still effectively:
+This project follows a strict layered architecture:
 
 ```text
-short_volume_ratio > threshold -> long, else flat
+sources -> features -> composition -> dataset -> labels -> backtest
 ```
 
-That means:
-- the runner is reusable
-- the dataset/labels/backtest plumbing is reusable
-- the signal logic is still strategy-specific
+## Layers
 
-A next step would be to decouple:
-1. features
-2. signal definition
-3. portfolio construction
-4. evaluation
+### Sources
+
+- `price_history`
+- `short_features_daily`
+
+### Feature Layer
+
+Builders:
+
+- `build_feature_price_momentum.py`
+- `build_feature_price_trend.py`
+- `build_feature_price_volatility.py`
+- `build_feature_short.py`
+
+Rules:
+
+- SQL-first
+- no forward-looking data
+- independently rebuildable
+- one family per table
+
+### Composition Layer
+
+`research_features_daily`
+
+This table joins all modular feature tables on:
+
+- `symbol`
+- `as_of_date`
+
+### Dataset Layer
+
+`research_training_dataset`
+
+Rules:
+
+- projection of `research_features_daily`
+- incremental build supported
+- feature columns explicitly controlled by `TARGET_FEATURE_COLUMNS`
+
+### Labels Layer
+
+`research_labels`
+
+Rules:
+
+- built after dataset
+- tied to `dataset_id`
+
+### Backtest Layer
+
+`research_backtest`
+
+Rules:
+
+- consumes dataset + labels
+- split-aware: `train / valid / test`
+- signal logic remains SQL-first
+
+## Adding a New Indicator
+
+1. Create a new feature table or extend the right feature family.
+2. Build it from canonical sources using SQL window functions.
+3. Add it to `research_features_daily`.
+4. Add it to dataset projection if needed.
+5. Consume it in a signal.
+
+## PIT Safety Rules
+
+- Never use future rows to compute a feature.
+- For same-frequency daily joins, use exact date joins.
+- For delayed sources, use `available_at <= as_of_date`.
+
+Reference pattern:
+
+```sql
+f.as_of_date <= p.as_of_date
+ORDER BY f.as_of_date DESC
+LIMIT 1
+```
+
+## Debug Order
+
+Always probe in this order:
+
+1. feature table coverage
+2. `research_features_daily` coverage
+3. dataset coverage
+4. labels coverage
+5. backtest output
+
+## Performance Rules
+
+- use DuckDB window functions
+- avoid Python row loops
+- keep joins narrow
+- chunk large builds
+- prefer incremental rebuilds when safe
+
+## Reference Signal
+
+`rsi_threshold`
+
+Use it as the template for future signals such as:
+
+- `sma_cross`
+- volatility regime filters
+- composite multi-feature signals

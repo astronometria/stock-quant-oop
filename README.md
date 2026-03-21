@@ -1,130 +1,100 @@
 # stock-quant-oop
 
-Quant research pipeline centered on DuckDB, SQL-first transforms, and point-in-time-safe research artifacts.
+A modular, SQL-first quantitative research framework built on DuckDB.
 
-## Current state
+## Overview
 
-The repository currently supports four practical layers:
+This project implements a **point-in-time safe research pipeline** for quantitative signals.
 
-1. **Raw ingestion and staging**
-   - Stooq directory backfills into `price_source_daily_raw_all`
-   - Yahoo daily refresh into raw/normalized price flows
-   - SEC raw filing index ingestion
-   - FINRA short-interest and daily short-volume staging
+It is designed to be:
 
-2. **Canonical history**
-   - `price_history`
-   - `price_latest` (serving only)
-   - SEC normalized filing tables
-   - FINRA normalized history tables
-   - `short_features_daily`
+- modular
+- reproducible
+- scalable
+- SQL-first
 
-3. **Research artifacts**
-   - `research_training_dataset`
-   - `research_labels`
-   - `research_backtest`
-   - experiment manifests and split manifests
+## Architecture
 
-4. **Operational wrappers**
-   - `cli/ops/run_price_daily_refresh.py`
-   - `cli/ops/run_sec_fundamentals_daily.py`
-   - `cli/ops/run_research_daily.py`
-   - `cli/core/run_research_experiment.py`
+See:
 
-## Core principles
+- `docs/architecture_diagram.png`
+- `docs/pipeline_sequence_diagram.png`
+- `docs/MODULAR_FEATURE_ARCHITECTURE.md`
+- `docs/QUICKSTART.md`
 
-- **SQL-first:** business-heavy transforms stay in DuckDB SQL.
-- **Thin Python:** Python handles orchestration, IO, validation, progress bars, and logging.
-- **Point-in-time safe:** research uses canonical history, not serving tables.
-- **Reproducible research:** dataset ids, split ids, and experiment ids are explicit.
-- **Memory-safe large jobs:** heavy loaders and research builders use chunking plus DuckDB temp spilling.
+## Core Flow
 
-## Recommended command paths
-
-### Initialize the database
-
-```bash
-python3 cli/core/init_market_db.py --db-path /path/to/market.duckdb
+```text
+price_history / short_features_daily
+        ↓
+feature_*_daily
+        ↓
+research_features_daily
+        ↓
+research_training_dataset
+        ↓
+research_labels
+        ↓
+research_backtest
 ```
 
-### Price pipeline
+## Modular Features
 
-Daily refresh from Yahoo:
+Each indicator family has its own table:
 
-```bash
-python3 cli/core/build_prices.py --db-path /path/to/market.duckdb --mode daily --verbose
-```
+- `feature_price_momentum_daily`
+- `feature_price_trend_daily`
+- `feature_price_volatility_daily`
+- `feature_short_daily`
 
-Historical Stooq directory load into `price_source_daily_raw_all`:
+## Research Artifacts
 
-```bash
-python3 cli/raw/load_price_source_daily_raw_all_from_stooq_dir.py \
-  --db-path /path/to/market.duckdb \
-  --root-dir /path/to/data/raw/stooq/daily/us \
-  --truncate \
-  --memory-limit 24GB \
-  --threads 8 \
-  --temp-dir /path/to/tmp \
-  --verbose
-```
-
-Canonical / research-grade price refresh:
-
-```bash
-python3 cli/core/build_prices_research.py --db-path /path/to/market.duckdb --verbose
-```
-
-### SEC / fundamentals
-
-```bash
-python3 cli/core/build_sec_filings.py --db-path /path/to/market.duckdb --verbose
-python3 cli/core/build_fundamentals.py --db-path /path/to/market.duckdb --verbose
-```
-
-### Research experiment
-
-```bash
-python3 cli/core/run_research_experiment.py \
-  --db-path /path/to/market.duckdb \
-  --snapshot-id <snapshot_id> \
-  --split-id <split_id> \
-  --experiment-name research_scientific_v3 \
-  --transaction-cost-bps 10 \
-  --signal-threshold 0.5 \
-  --memory-limit 24GB \
-  --threads 6 \
-  --temp-dir /path/to/tmp \
-  --verbose
-```
-
-## Tables that matter most
-
-### Prices
-- `price_source_daily_raw_all`
-- `price_history`
-- `price_latest`
-
-### Short data
-- `daily_short_volume_history`
-- `finra_short_interest_history`
-- `short_features_daily`
-
-### Research
+- `research_features_daily`
 - `research_training_dataset`
 - `research_labels`
 - `research_backtest`
 
-## Important caveats
+## Signals
 
-- `price_latest` is **serving only** and should not drive labels, features, datasets, or backtests.
-- The current research backtest is still a **single-rule long-only threshold strategy** on `short_volume_ratio`.
-- Label generation now supports **dataset-scoped sanitization** with `--max-abs-return`.
-- Recent code added a **common-only** dataset build mode to exclude likely warrants, rights, units, and special/test symbols earlier in the pipeline.
+Signals declare:
 
-## Where to read next
+- required features
+- parameters
+- warmup
+- SQL-first execution logic
 
-- `README_DEV.md`
-- `docs/ARCHITECTURE.md`
-- `docs/PIPELINE_USAGE.md`
-- `docs/PRICE_PIPELINE.md`
-- `docs/RESEARCH_PIPELINE_IMPLEMENTATION.md`
+Current reference signal:
+
+- `rsi_threshold`
+
+## Quickstart
+
+See the full guide in `docs/QUICKSTART.md`.
+
+Minimal flow:
+
+```bash
+python3 cli/core/build_feature_price_momentum.py --db-path market.duckdb
+python3 cli/core/build_feature_price_trend.py --db-path market.duckdb
+python3 cli/core/build_feature_price_volatility.py --db-path market.duckdb
+python3 cli/core/build_feature_short.py --db-path market.duckdb
+python3 cli/core/build_research_features_daily.py --db-path market.duckdb
+python3 cli/core/build_research_training_dataset.py --db-path market.duckdb --snapshot-id <SNAPSHOT_ID> --split-id <SPLIT_ID>
+python3 cli/core/build_research_labels.py --db-path market.duckdb --snapshot-id <SNAPSHOT_ID> --dataset-id <DATASET_ID> --split-id <SPLIT_ID>
+python3 cli/core/build_research_backtest.py --db-path market.duckdb --dataset-id <DATASET_ID> --split-id <SPLIT_ID> --signal-name rsi_threshold --signal-params-json '{"feature_name":"rsi_14","oversold_threshold":30.0,"overbought_threshold":70.0}'
+```
+
+## Status
+
+- RSI14 signal works end-to-end
+- modular feature system implemented
+- research feature composition implemented
+- incremental dataset build implemented
+
+## Philosophy
+
+- Simple over complex
+- Explicit over implicit
+- SQL over Python loops
+- Modular over monolithic
+- Reproducible over ad hoc
