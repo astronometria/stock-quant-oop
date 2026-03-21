@@ -2,27 +2,25 @@
 from __future__ import annotations
 
 """
-Build canonical research_features_daily.
+Build research_features_daily incrementally.
 
 Objectif
 --------
 Assembler les familles de features canoniques dans une seule table de recherche
-point-in-time safe, en joignant directement les tables canoniques:
+point-in-time safe, avec refresh incrémental.
 
+Sources canoniques
+------------------
 - feature_price_momentum_daily
 - feature_price_trend_daily
 - feature_price_volatility_daily
 - short_features_daily
 
-Important
----------
-- `feature_short_daily` a été retirée: c'était une projection legacy redondante
-  de `short_features_daily`.
-- Le chemin canonique short est maintenant:
-    finra_daily_short_volume_source_raw
-    -> daily_short_volume_history
-    -> short_features_daily
-    -> research_features_daily
+Pourquoi overlap 220 jours
+--------------------------
+La famille trend dépend de SMA 200.
+Même si research_features_daily lui-même ne calcule aucun rolling,
+il doit retraiter la même zone que la feature price la plus exigeante.
 """
 
 import argparse
@@ -30,6 +28,9 @@ import json
 from pathlib import Path
 
 import duckdb
+
+
+TARGET_OVERLAP_DAYS = 220
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +59,39 @@ def table_count(con: duckdb.DuckDBPyConnection, table_name: str) -> int:
     return int(con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
 
 
+def ensure_target_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS research_features_daily (
+            instrument_id VARCHAR,
+            company_id VARCHAR,
+            symbol VARCHAR,
+            as_of_date DATE,
+            close DOUBLE,
+            returns_1d DOUBLE,
+            returns_5d DOUBLE,
+            returns_20d DOUBLE,
+            sma_20 DOUBLE,
+            sma_50 DOUBLE,
+            sma_200 DOUBLE,
+            close_to_sma_20 DOUBLE,
+            rsi_14 DOUBLE,
+            atr_14 DOUBLE,
+            volatility_20 DOUBLE,
+            short_interest DOUBLE,
+            days_to_cover DOUBLE,
+            short_volume_ratio DOUBLE,
+            short_interest_change_pct DOUBLE,
+            short_squeeze_score DOUBLE,
+            short_pressure_zscore DOUBLE,
+            days_to_cover_zscore DOUBLE,
+            source_name VARCHAR,
+            created_at TIMESTAMP WITH TIME ZONE
+        )
+        """
+    )
+
+
 def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
@@ -71,7 +105,8 @@ def main() -> int:
         temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
         con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
 
-        # Tables canoniques requises.
+        ensure_target_table(con)
+
         required_tables = [
             "feature_price_momentum_daily",
             "feature_price_trend_daily",
@@ -86,12 +121,37 @@ def main() -> int:
             if args.verbose:
                 print(f"[research_features] {table_name}_rows={row_count}", flush=True)
 
-        # Rebuild complet de la table canonique de recherche.
-        con.execute("DROP TABLE IF EXISTS research_features_daily")
+        target_rows_before = table_count(con, "research_features_daily")
+        max_target_date = con.execute(
+            "SELECT MAX(as_of_date) FROM research_features_daily"
+        ).fetchone()[0]
 
+        con.execute("DROP TABLE IF EXISTS tmp_research_features_window")
+        con.execute(
+            f"""
+            CREATE TEMP TABLE tmp_research_features_window AS
+            SELECT
+                CASE
+                    WHEN ? IS NULL THEN DATE '1900-01-01'
+                    ELSE CAST(? - INTERVAL '{TARGET_OVERLAP_DAYS} days' AS DATE)
+                END AS target_window_start
+            """,
+            [max_target_date, max_target_date],
+        )
+
+        target_window_start = con.execute(
+            "SELECT target_window_start FROM tmp_research_features_window"
+        ).fetchone()[0]
+
+        if args.verbose:
+            print(f"[research_features] target_rows_before={target_rows_before}", flush=True)
+            print(f"[research_features] max_target_date={max_target_date}", flush=True)
+            print(f"[research_features] target_window_start={target_window_start}", flush=True)
+
+        con.execute("DROP TABLE IF EXISTS tmp_research_features_stage")
         con.execute(
             """
-            CREATE TABLE research_features_daily AS
+            CREATE TEMP TABLE tmp_research_features_stage AS
             WITH price_base AS (
                 SELECT
                     COALESCE(m.instrument_id, t.instrument_id, v.instrument_id) AS instrument_id,
@@ -115,6 +175,7 @@ def main() -> int:
                 FULL OUTER JOIN feature_price_volatility_daily v
                   ON UPPER(TRIM(COALESCE(m.symbol, t.symbol))) = UPPER(TRIM(v.symbol))
                  AND COALESCE(m.as_of_date, t.as_of_date) = v.as_of_date
+                WHERE COALESCE(m.as_of_date, t.as_of_date, v.as_of_date) >= CAST(? AS DATE)
             )
             SELECT
                 p.instrument_id,
@@ -147,8 +208,76 @@ def main() -> int:
              AND s.as_of_date = p.as_of_date
             WHERE p.symbol IS NOT NULL
               AND p.as_of_date IS NOT NULL
-            """
+            """,
+            [target_window_start],
         )
+
+        stage_rows = table_count(con, "tmp_research_features_stage")
+
+        deleted_rows = con.execute(
+            """
+            DELETE FROM research_features_daily
+            WHERE as_of_date >= CAST(? AS DATE)
+            """,
+            [target_window_start],
+        ).fetchone()[0]
+
+        inserted_rows = con.execute(
+            """
+            INSERT INTO research_features_daily (
+                instrument_id,
+                company_id,
+                symbol,
+                as_of_date,
+                close,
+                returns_1d,
+                returns_5d,
+                returns_20d,
+                sma_20,
+                sma_50,
+                sma_200,
+                close_to_sma_20,
+                rsi_14,
+                atr_14,
+                volatility_20,
+                short_interest,
+                days_to_cover,
+                short_volume_ratio,
+                short_interest_change_pct,
+                short_squeeze_score,
+                short_pressure_zscore,
+                days_to_cover_zscore,
+                source_name,
+                created_at
+            )
+            SELECT
+                instrument_id,
+                company_id,
+                symbol,
+                as_of_date,
+                close,
+                returns_1d,
+                returns_5d,
+                returns_20d,
+                sma_20,
+                sma_50,
+                sma_200,
+                close_to_sma_20,
+                rsi_14,
+                atr_14,
+                volatility_20,
+                short_interest,
+                days_to_cover,
+                short_volume_ratio,
+                short_interest_change_pct,
+                short_squeeze_score,
+                short_pressure_zscore,
+                days_to_cover_zscore,
+                source_name,
+                created_at
+            FROM tmp_research_features_stage
+            """
+        ).fetchone()[0]
 
         row = con.execute(
             """
@@ -187,11 +316,17 @@ def main() -> int:
                     "short_volume_ratio_rows": int(row[10]),
                     "min_date": str(row[11]) if row[11] is not None else None,
                     "max_date": str(row[12]) if row[12] is not None else None,
+                    "target_rows_before": int(target_rows_before),
+                    "target_window_start": str(target_window_start) if target_window_start is not None else None,
+                    "stage_rows": int(stage_rows),
+                    "deleted_rows": int(deleted_rows),
+                    "inserted_rows": int(inserted_rows),
                 },
                 indent=2,
             ),
             flush=True,
         )
+
         return 0
     finally:
         con.close()
