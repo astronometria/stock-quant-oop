@@ -1,5 +1,37 @@
 from __future__ import annotations
 
+"""
+Canonical SQL-first builder for short_features_daily.
+
+Version incrémentale
+--------------------
+Objectif:
+- lire les sources canoniques:
+    - daily_short_volume_history
+    - finra_short_interest_history
+- recalculer uniquement une fenêtre récente
+- upsert cette fenêtre dans short_features_daily
+
+Pourquoi une fenêtre de recouvrement
+------------------------------------
+Les features short utilisent:
+- des rolling windows 20 jours
+- des as-of joins PIT-safe sur short interest
+
+Donc un mode "strict > max(as_of_date)" serait fragile.
+On recalcule une fenêtre glissante suffisamment large pour:
+- laisser respirer les rolling metrics
+- absorber les arrivées tardives / corrections
+- garder le job quotidien rapide
+
+Convention
+----------
+- overlap_days = 45
+  Couvre largement:
+  - rolling 20 jours
+  - quelques jours de correction / retard
+"""
+
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -8,28 +40,12 @@ from stock_quant.app.dto.pipeline_result import PipelineResult
 
 
 class BuildShortFeaturesPipeline:
-    """
-    Canonical SQL-first builder for short_features_daily.
-
-    Design goals
-    ------------
-    - SQL-first: toute la logique lourde vit dans DuckDB.
-    - PIT-safe: on joint short interest seulement si la ligne était disponible
-      au moment du signal short-volume (`ingested_at <= max_source_available_at`).
-    - Idempotent: rebuild complet stable.
-    - Memory-safe: rebuild en 2 phases
-        1) pré-agrégation + enrichissement rolling dans une table temporaire
-        2) insertion batchée par mois dans la table cible
-    - Symbol normalization:
-        - applique `symbol_normalization` quand présent
-        - fallback sur le symbole brut sinon
-    """
-
     pipeline_name = "build_short_features"
+    overlap_days = 45
 
     def __init__(self, con) -> None:
         self.con = con
-        self._progress_total_steps = 3
+        self._progress_total_steps = 6
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -122,12 +138,29 @@ class BuildShortFeaturesPipeline:
         }
         return "symbol_normalization" in existing
 
-    def _create_temp_daily_enriched(self) -> int:
+    def _window_start_date(self) -> Any:
+        """
+        Si short_features_daily est vide -> full rebuild.
+        Sinon on repart de max(as_of_date) - overlap_days.
+        """
+        return self.con.execute(
+            f"""
+            SELECT
+                CASE
+                    WHEN MAX(as_of_date) IS NULL THEN DATE '1900-01-01'
+                    ELSE CAST(MAX(as_of_date) - INTERVAL '{self.overlap_days} days' AS DATE)
+                END AS window_start_date
+            FROM short_features_daily
+            """
+        ).fetchone()[0]
+
+    def _create_temp_daily_enriched(self, window_start_date: Any) -> int:
         """
         Phase 1:
         - agrège daily_short_volume_history à grain (symbol normalisé, as_of_date)
         - calcule les rolling metrics
         - conserve max_source_available_at pour le PIT join
+        - limite la source à la fenêtre utile
         """
         self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_daily_enriched")
 
@@ -142,9 +175,11 @@ class BuildShortFeaturesPipeline:
             ),
             """
             daily_symbol_expr = "COALESCE(n.normalized_symbol, UPPER(TRIM(d.symbol)))"
+            norm_join = "LEFT JOIN norm_map AS n ON UPPER(TRIM(d.symbol)) = n.raw_symbol"
         else:
             norm_map_cte = ""
             daily_symbol_expr = "UPPER(TRIM(d.symbol))"
+            norm_join = ""
 
         self.con.execute(
             f"""
@@ -160,13 +195,12 @@ class BuildShortFeaturesPipeline:
                     SUM(COALESCE(d.total_volume, 0.0)) AS total_volume,
                     MAX(d.available_at) AS max_source_available_at
                 FROM daily_short_volume_history AS d
-                {"LEFT JOIN norm_map AS n ON UPPER(TRIM(d.symbol)) = n.raw_symbol" if self._has_symbol_normalization() else ""}
+                {norm_join}
                 WHERE d.symbol IS NOT NULL
                   AND TRIM(d.symbol) <> ''
                   AND d.trade_date IS NOT NULL
-                GROUP BY
-                    {daily_symbol_expr},
-                    d.trade_date
+                  AND d.trade_date >= CAST(? AS DATE)
+                GROUP BY {daily_symbol_expr}, d.trade_date
             ),
             daily_roll AS (
                 SELECT
@@ -219,7 +253,8 @@ class BuildShortFeaturesPipeline:
                 short_volume_ratio_20d_std,
                 max_source_available_at
             FROM daily_roll
-            """
+            """,
+            [window_start_date],
         )
 
         return self._safe_scalar(
@@ -227,31 +262,10 @@ class BuildShortFeaturesPipeline:
             0,
         )
 
-    def _month_starts(self) -> list[Any]:
-        rows = self.con.execute(
-            """
-            SELECT DISTINCT date_trunc('month', as_of_date)::DATE AS month_start
-            FROM tmp_short_feature_daily_enriched
-            ORDER BY month_start
-            """
-        ).fetchall()
-        return [row[0] for row in rows]
-
-    def _rebuild_short_features_daily(self) -> dict[str, int]:
+    def _create_temp_short_interest_norm(self) -> None:
         """
-        Phase 2:
-        - rebuild complet de short_features_daily
-        - insertion batchée par mois pour limiter l'empreinte mémoire
+        Normalise short interest une seule fois pour éviter de répéter la logique.
         """
-        before_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
-
-        # Rebuild complet.
-        self.con.execute("DELETE FROM short_features_daily")
-
-        temp_daily_rows = self._create_temp_daily_enriched()
-        month_starts = self._month_starts()
-
-        # Temp short-interest normalisé pour éviter de répéter la logique.
         self.con.execute("DROP TABLE IF EXISTS tmp_short_interest_norm")
 
         if self._has_symbol_normalization():
@@ -304,7 +318,35 @@ class BuildShortFeaturesPipeline:
                 """
             )
 
+    def _month_starts(self) -> list[Any]:
+        rows = self.con.execute(
+            """
+            SELECT DISTINCT date_trunc('month', as_of_date)::DATE AS month_start
+            FROM tmp_short_feature_daily_enriched
+            ORDER BY month_start
+            """
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def _delete_target_window(self, window_start_date: Any) -> int:
+        before = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        self.con.execute(
+            """
+            DELETE FROM short_features_daily
+            WHERE as_of_date >= CAST(? AS DATE)
+            """,
+            [window_start_date],
+        )
+        after = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        return max(0, before - after)
+
+    def _insert_window_months(self) -> dict[str, int]:
+        """
+        Phase 2:
+        - insertion batchée par mois pour la seule fenêtre recalculée
+        """
         inserted_total = 0
+        month_starts = self._month_starts()
         month_batch_count = len(month_starts)
 
         for idx, month_start in enumerate(month_starts, start=1):
@@ -411,7 +453,8 @@ class BuildShortFeaturesPipeline:
                         j.shares_float,
                         j.short_interest_pct_float,
                         CASE
-                            WHEN j.short_interest IS NOT NULL AND j.previous_short_interest IS NOT NULL
+                            WHEN j.short_interest IS NOT NULL
+                             AND j.previous_short_interest IS NOT NULL
                             THEN j.short_interest - j.previous_short_interest
                             ELSE NULL
                         END AS short_interest_change,
@@ -449,30 +492,35 @@ class BuildShortFeaturesPipeline:
                             ) / NULLIF(j.short_volume_ratio_20d_std, 0)
                         END AS short_pressure_zscore,
                         CASE
-                            WHEN j.days_to_cover IS NULL AND j.short_volume_ratio IS NULL THEN NULL
-                            ELSE COALESCE(
-                                (
-                                    j.short_volume_ratio - j.short_volume_ratio_20d_avg
-                                ) / NULLIF(j.short_volume_ratio_20d_std, 0),
-                                0
-                            ) + COALESCE(
-                                (
-                                    j.days_to_cover
-                                    - AVG(j.days_to_cover) OVER (
-                                        PARTITION BY j.symbol
-                                        ORDER BY j.as_of_date
-                                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                                    )
-                                ) / NULLIF(
-                                    STDDEV_SAMP(j.days_to_cover) OVER (
-                                        PARTITION BY j.symbol
-                                        ORDER BY j.as_of_date
-                                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                            WHEN j.days_to_cover IS NULL
+                             AND j.short_volume_ratio IS NULL
+                            THEN NULL
+                            ELSE
+                                COALESCE(
+                                    (
+                                        j.short_volume_ratio - j.short_volume_ratio_20d_avg
+                                    ) / NULLIF(j.short_volume_ratio_20d_std, 0),
+                                    0
+                                )
+                                +
+                                COALESCE(
+                                    (
+                                        j.days_to_cover
+                                        - AVG(j.days_to_cover) OVER (
+                                            PARTITION BY j.symbol
+                                            ORDER BY j.as_of_date
+                                            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                                        )
+                                    ) / NULLIF(
+                                        STDDEV_SAMP(j.days_to_cover) OVER (
+                                            PARTITION BY j.symbol
+                                            ORDER BY j.as_of_date
+                                            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                                        ),
+                                        0
                                     ),
                                     0
-                                ),
-                                0
-                            )
+                                )
                         END AS short_squeeze_score,
                         j.max_source_available_at,
                         CURRENT_TIMESTAMP AS created_at,
@@ -512,22 +560,9 @@ class BuildShortFeaturesPipeline:
             after_batch = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
             inserted_total += max(0, after_batch - before_batch)
 
-        after_count = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
-
-        # Nettoyage temp.
-        self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_daily_enriched")
-        self.con.execute("DROP TABLE IF EXISTS tmp_short_interest_norm")
-
         return {
-            "temp_daily_enriched_rows": int(temp_daily_rows),
             "month_batch_count": int(month_batch_count),
             "short_features_rows_inserted": int(inserted_total),
-            "scored_short_feature_rows": int(after_count),
-            "short_features_rows_before": int(before_count),
-            "short_features_rows_after": int(after_count),
-            "max_short_features_as_of_date": str(
-                self._safe_optional_scalar("SELECT MAX(as_of_date) FROM short_features_daily")
-            ),
         }
 
     def run(self) -> PipelineResult:
@@ -539,18 +574,20 @@ class BuildShortFeaturesPipeline:
         try:
             self._ensure_required_tables()
 
-            self._log_step(1, "inspect short-data source tables")
+            self._log_step(1, "inspect canonical short source tables")
 
             daily_count = self._safe_scalar("SELECT COUNT(*) FROM daily_short_volume_history", 0)
             short_interest_count = self._safe_scalar("SELECT COUNT(*) FROM finra_short_interest_history", 0)
+            short_features_before = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
 
             metrics["daily_short_volume_history_count"] = int(daily_count)
             metrics["finra_short_interest_history_count"] = int(short_interest_count)
+            metrics["short_features_rows_before"] = int(short_features_before)
 
             rows_read = int(daily_count + short_interest_count)
 
-            if daily_count == 0 or short_interest_count == 0:
-                metrics["build_decision"] = "noop_missing_inputs"
+            if daily_count == 0:
+                metrics["build_decision"] = "noop_missing_daily_short_volume_history"
                 return self._build_pipeline_result(
                     status="noop",
                     started_at=started_at,
@@ -561,18 +598,53 @@ class BuildShortFeaturesPipeline:
                     metrics=metrics,
                 )
 
-            metrics["build_decision"] = "rebuild_short_features_daily"
+            self._log_step(2, "compute incremental window")
+            window_start_date = self._window_start_date()
+            metrics["overlap_days"] = self.overlap_days
+            metrics["window_start_date"] = None if window_start_date is None else str(window_start_date)
 
-            self._log_step(2, "rebuild short_features_daily from canonical sources")
-            build_result = self._rebuild_short_features_daily()
-            metrics.update(build_result)
+            self._log_step(3, "create incremental daily short enriched stage")
+            temp_daily_rows = self._create_temp_daily_enriched(window_start_date)
+            metrics["temp_daily_enriched_rows"] = int(temp_daily_rows)
 
-            rows_written = int(build_result.get("short_features_rows_inserted", 0))
+            if temp_daily_rows == 0:
+                metrics["build_decision"] = "noop_no_incremental_rows"
+                metrics["short_features_rows_after"] = short_features_before
+                metrics["max_short_features_as_of_date"] = str(
+                    self._safe_optional_scalar("SELECT MAX(as_of_date) FROM short_features_daily")
+                )
+                return self._build_pipeline_result(
+                    status="noop",
+                    started_at=started_at,
+                    finished_at=self._now(),
+                    rows_read=rows_read,
+                    rows_written=0,
+                    error_message=None,
+                    metrics=metrics,
+                )
 
-            self._log_step(3, "collect final short feature state")
-            metrics["final_short_features_count"] = self._safe_scalar(
+            self._log_step(4, "normalize short interest once for PIT-safe joins")
+            self._create_temp_short_interest_norm()
+
+            self._log_step(5, "delete overlapping target window then insert recalculated months")
+            deleted_rows = self._delete_target_window(window_start_date)
+            metrics["short_features_rows_deleted_window"] = int(deleted_rows)
+
+            insert_result = self._insert_window_months()
+            metrics.update(insert_result)
+            rows_written = int(insert_result.get("short_features_rows_inserted", 0))
+
+            self._log_step(6, "collect final short feature state")
+
+            self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_daily_enriched")
+            self.con.execute("DROP TABLE IF EXISTS tmp_short_interest_norm")
+
+            metrics["short_features_rows_after"] = self._safe_scalar(
                 "SELECT COUNT(*) FROM short_features_daily",
                 0,
+            )
+            metrics["max_short_features_as_of_date"] = str(
+                self._safe_optional_scalar("SELECT MAX(as_of_date) FROM short_features_daily")
             )
 
             return self._build_pipeline_result(
