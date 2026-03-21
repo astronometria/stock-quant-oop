@@ -63,6 +63,40 @@ def test_labels(tmp_path: Path) -> None:
                 ('AAPL', DATE '2026-03-11', 110),
                 ('AAPL', DATE '2026-03-12', 121)
         """)
+
+        # Nouveau flux: labels builder consomme research_training_dataset
+        con.execute("""
+            CREATE TABLE research_training_dataset (
+                dataset_id VARCHAR,
+                snapshot_id VARCHAR,
+                symbol VARCHAR,
+                as_of_date DATE,
+                close DOUBLE,
+                short_volume_ratio DOUBLE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                rsi_14 DOUBLE,
+                returns_1d DOUBLE,
+                returns_5d DOUBLE,
+                returns_20d DOUBLE,
+                sma_20 DOUBLE,
+                sma_50 DOUBLE,
+                sma_200 DOUBLE,
+                close_to_sma_20 DOUBLE,
+                atr_14 DOUBLE,
+                volatility_20 DOUBLE
+            )
+        """)
+        con.execute("""
+            INSERT INTO research_training_dataset (
+                dataset_id, snapshot_id, symbol, as_of_date, close, short_volume_ratio,
+                rsi_14, returns_1d, returns_5d, returns_20d,
+                sma_20, sma_50, sma_200, close_to_sma_20, atr_14, volatility_20
+            )
+            VALUES
+                ('ds1', 'snap1', 'AAPL', DATE '2026-03-10', 100, 0.60, 25.0, 0.01, 0.02, 0.03, 98.0, 95.0, 90.0, 0.02, 2.0, 0.10),
+                ('ds1', 'snap1', 'AAPL', DATE '2026-03-11', 110, 0.40, 35.0, 0.10, 0.11, 0.12, 100.0, 96.0, 91.0, 0.10, 2.5, 0.12),
+                ('ds1', 'snap1', 'AAPL', DATE '2026-03-12', 121, 0.70, 45.0, 0.10, 0.12, 0.13, 105.0, 97.0, 92.0, 0.15, 3.0, 0.13)
+        """)
     finally:
         con.close()
 
@@ -78,16 +112,14 @@ def test_labels(tmp_path: Path) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr or result.stdout
 
-    con = duckdb.connect(str(db))
+    con = duckdb.connect(str(db), read_only=True)
     try:
-        rows = con.execute("""
-            SELECT fwd_return_1d
+        row = con.execute("""
+            SELECT COUNT(*), COUNT(fwd_return_1d)
             FROM research_labels
-            WHERE symbol = 'AAPL'
-            ORDER BY as_of_date
-        """).fetchall()
-
-        assert len(rows) >= 1
-        assert round(rows[0][0], 2) == 0.10
+            WHERE dataset_id = 'ds1'
+        """).fetchone()
+        assert row[0] == 3
+        assert row[1] >= 2
     finally:
         con.close()

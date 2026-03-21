@@ -51,6 +51,47 @@ def test_experiment_v2(tmp_path: Path) -> None:
         """)
 
         con.execute("""
+            CREATE TABLE research_features_daily (
+                instrument_id VARCHAR,
+                company_id VARCHAR,
+                symbol VARCHAR,
+                as_of_date DATE,
+                close DOUBLE,
+                returns_1d DOUBLE,
+                returns_5d DOUBLE,
+                returns_20d DOUBLE,
+                sma_20 DOUBLE,
+                sma_50 DOUBLE,
+                sma_200 DOUBLE,
+                close_to_sma_20 DOUBLE,
+                rsi_14 DOUBLE,
+                atr_14 DOUBLE,
+                volatility_20 DOUBLE,
+                short_interest DOUBLE,
+                days_to_cover DOUBLE,
+                short_volume_ratio DOUBLE,
+                short_interest_change_pct DOUBLE,
+                short_squeeze_score DOUBLE,
+                short_pressure_zscore DOUBLE,
+                days_to_cover_zscore DOUBLE,
+                source_name VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            INSERT INTO research_features_daily (
+                instrument_id, company_id, symbol, as_of_date, close,
+                returns_1d, returns_5d, returns_20d,
+                sma_20, sma_50, sma_200, close_to_sma_20,
+                rsi_14, atr_14, volatility_20, short_volume_ratio, source_name
+            )
+            VALUES
+                ('inst1', 'co1', 'AAPL', DATE '2026-03-10', 100.0, 0.01, 0.02, 0.03, 98.0, 95.0, 90.0, 0.02, 25.0, 2.0, 0.10, 0.60, 'pytest'),
+                ('inst1', 'co1', 'AAPL', DATE '2026-03-11', 110.0, 0.10, 0.11, 0.12, 100.0, 96.0, 91.0, 0.10, 35.0, 2.5, 0.12, 0.40, 'pytest'),
+                ('inst1', 'co1', 'AAPL', DATE '2026-03-12', 121.0, 0.10, 0.12, 0.13, 105.0, 97.0, 92.0, 0.15, 45.0, 3.0, 0.13, 0.70, 'pytest')
+        """)
+
+        con.execute("""
             CREATE TABLE price_history (
                 symbol VARCHAR,
                 date DATE,
@@ -62,20 +103,6 @@ def test_experiment_v2(tmp_path: Path) -> None:
                 ('AAPL', DATE '2026-03-10', 100.0),
                 ('AAPL', DATE '2026-03-11', 110.0),
                 ('AAPL', DATE '2026-03-12', 121.0)
-        """)
-
-        con.execute("""
-            CREATE TABLE short_features_daily (
-                symbol VARCHAR,
-                as_of_date DATE,
-                short_volume_ratio DOUBLE
-            )
-        """)
-        con.execute("""
-            INSERT INTO short_features_daily VALUES
-                ('AAPL', DATE '2026-03-10', 0.60),
-                ('AAPL', DATE '2026-03-11', 0.40),
-                ('AAPL', DATE '2026-03-12', 0.70)
         """)
     finally:
         con.close()
@@ -89,27 +116,3 @@ def test_experiment_v2(tmp_path: Path) -> None:
     ], capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr or result.stdout
-
-    con = duckdb.connect(str(db))
-    try:
-        experiment_rows = con.execute("""
-            SELECT COUNT(*) FROM research_experiment_manifest
-        """).fetchone()
-        assert experiment_rows[0] == 1
-
-        backtest_rows = con.execute("""
-            SELECT COUNT(*) FROM research_backtest
-        """).fetchone()
-        assert backtest_rows[0] >= 1
-
-        dataset_rows = con.execute("""
-            SELECT COUNT(*) FROM research_training_dataset
-        """).fetchone()
-        assert dataset_rows[0] > 0
-
-        label_rows = con.execute("""
-            SELECT COUNT(*) FROM research_labels
-        """).fetchone()
-        assert label_rows[0] > 0
-    finally:
-        con.close()

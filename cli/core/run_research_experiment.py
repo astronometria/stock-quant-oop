@@ -265,6 +265,31 @@ def main() -> int:
     try:
         repo = DuckDbResearchExperimentRepository(con)
         repo.ensure_tables()
+
+        snapshot_manifest_exists = int(
+            con.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_name = 'research_dataset_manifest'
+                """
+            ).fetchone()[0]
+        )
+        if snapshot_manifest_exists == 0:
+            raise RuntimeError("research_dataset_manifest table is required")
+
+        snapshot_row = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM research_dataset_manifest
+            WHERE snapshot_id = ?
+              AND LOWER(TRIM(COALESCE(status, ''))) = 'completed'
+            """,
+            [args.snapshot_id],
+        ).fetchone()
+
+        if snapshot_row is None or int(snapshot_row[0]) == 0:
+            raise RuntimeError("snapshot_id not found")
     finally:
         con.close()
 
