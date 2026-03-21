@@ -3,12 +3,19 @@ from __future__ import annotations
 """
 Canonical SQL-first FINRA daily short volume pipeline.
 
-Responsibilities
-----------------
-- read finra_daily_short_volume_source_raw
-- normalize into daily_short_volume_history
-- preserve PIT metadata
-- remain idempotent
+Version incrémentale + auto-migration légère
+--------------------------------------------
+Objectif:
+- lire finra_daily_short_volume_source_raw
+- normaliser vers daily_short_volume_history
+- ne recalculer qu'une fenêtre récente pour les mises à jour quotidiennes
+- migrer les colonnes manquantes sur une DB locale plus ancienne
+
+Principe
+--------
+- full build si l'historique est vide
+- sinon rebuild d'une fenêtre glissante depuis max(trade_date) - overlap_days
+- delete + insert uniquement sur la fenêtre retraitée
 """
 
 from datetime import datetime, timezone
@@ -19,10 +26,11 @@ from stock_quant.app.dto.pipeline_result import PipelineResult
 
 class BuildDailyShortVolumePipeline:
     pipeline_name = "build_daily_short_volume"
+    overlap_days = 7
 
     def __init__(self, con: Any) -> None:
         self.con = con
-        self._progress_total_steps = 4
+        self._progress_total_steps = 6
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -36,6 +44,35 @@ class BuildDailyShortVolumePipeline:
     def _max_date(self, table_name: str, column_name: str) -> str | None:
         value = self.con.execute(f"SELECT MAX({column_name}) FROM {table_name}").fetchone()[0]
         return None if value is None else str(value)
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        return {
+            str(row[1]).strip()
+            for row in self.con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+        }
+
+    def _ensure_history_columns(self) -> None:
+        """
+        Migration légère et idempotente pour DB locales plus anciennes.
+        On ajoute seulement les colonnes manquantes nécessaires au chemin canonique actuel.
+        """
+        existing = self._table_columns("daily_short_volume_history")
+
+        required_columns = [
+            ("short_exempt_ratio", "DOUBLE"),
+            ("available_at", "TIMESTAMP"),
+            ("ingested_at", "TIMESTAMP"),
+            ("publication_date", "DATE"),
+            ("market_code", "VARCHAR"),
+            ("source_file", "VARCHAR"),
+            ("source_name", "VARCHAR"),
+        ]
+
+        for column_name, column_type in required_columns:
+            if column_name not in existing:
+                self.con.execute(
+                    f"ALTER TABLE daily_short_volume_history ADD COLUMN {column_name} {column_type}"
+                )
 
     def _build_result(
         self,
@@ -79,12 +116,17 @@ class BuildDailyShortVolumePipeline:
 
         try:
             self._log_step(1, "inspect raw and canonical state")
+
             raw_count = self._table_count("finra_daily_short_volume_source_raw")
             history_before = self._table_count("daily_short_volume_history")
+            max_raw_trade_date = self._max_date("finra_daily_short_volume_source_raw", "trade_date")
+            max_history_trade_date_before = self._max_date("daily_short_volume_history", "trade_date")
+
             metrics["raw_row_count"] = raw_count
             metrics["history_rows_before"] = history_before
-            metrics["max_raw_trade_date"] = self._max_date("finra_daily_short_volume_source_raw", "trade_date")
-            metrics["max_history_trade_date_before"] = self._max_date("daily_short_volume_history", "trade_date")
+            metrics["max_raw_trade_date"] = max_raw_trade_date
+            metrics["max_history_trade_date_before"] = max_history_trade_date_before
+            metrics["overlap_days"] = self.overlap_days
 
             if raw_count == 0:
                 return self._build_result(
@@ -97,12 +139,36 @@ class BuildDailyShortVolumePipeline:
                     error_message=None,
                 )
 
-            self._log_step(2, "create temporary canonical source")
+            self._log_step(2, "ensure target schema compatibility")
+            self._ensure_history_columns()
+
+            self._log_step(3, "compute incremental window")
+
+            self.con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_window")
+            self.con.execute(
+                f"""
+                CREATE TEMP TABLE tmp_daily_short_volume_window AS
+                SELECT
+                    CASE
+                        WHEN MAX(trade_date) IS NULL THEN DATE '1900-01-01'
+                        ELSE CAST(MAX(trade_date) - INTERVAL '{self.overlap_days} days' AS DATE)
+                    END AS window_start_date
+                FROM daily_short_volume_history
+                """
+            )
+
+            window_start_date = self.con.execute(
+                "SELECT window_start_date FROM tmp_daily_short_volume_window"
+            ).fetchone()[0]
+            metrics["window_start_date"] = None if window_start_date is None else str(window_start_date)
+
+            self._log_step(4, "create incremental canonical stage")
+
             self.con.execute("DROP TABLE IF EXISTS tmp_daily_short_volume_canonical_source")
             self.con.execute(
                 """
                 CREATE TEMP TABLE tmp_daily_short_volume_canonical_source AS
-                WITH base AS (
+                WITH incremental_raw AS (
                     SELECT
                         UPPER(TRIM(symbol)) AS symbol,
                         trade_date,
@@ -113,16 +179,22 @@ class BuildDailyShortVolumePipeline:
                             WHEN total_volume IS NULL OR total_volume = 0 THEN NULL
                             ELSE short_volume / total_volume
                         END AS short_volume_ratio,
+                        CASE
+                            WHEN total_volume IS NULL OR total_volume = 0 THEN NULL
+                            WHEN short_exempt_volume IS NULL THEN NULL
+                            ELSE short_exempt_volume / total_volume
+                        END AS short_exempt_ratio,
                         market_code,
                         source_name,
                         source_file,
                         publication_date,
                         available_at,
-                        ingested_at
+                        available_at AS ingested_at
                     FROM finra_daily_short_volume_source_raw
                     WHERE symbol IS NOT NULL
                       AND TRIM(symbol) <> ''
                       AND trade_date IS NOT NULL
+                      AND trade_date >= (SELECT window_start_date FROM tmp_daily_short_volume_window)
                 ),
                 ranked AS (
                     SELECT
@@ -131,20 +203,19 @@ class BuildDailyShortVolumePipeline:
                             PARTITION BY symbol, trade_date, source_file
                             ORDER BY available_at DESC NULLS LAST, ingested_at DESC NULLS LAST
                         ) AS rn
-                    FROM base
+                    FROM incremental_raw
                 )
                 SELECT
-                    NULL::VARCHAR AS instrument_id,
-                    NULL::VARCHAR AS company_id,
                     symbol,
                     trade_date,
                     short_volume,
                     short_exempt_volume,
                     total_volume,
                     short_volume_ratio,
-                    market_code,
+                    short_exempt_ratio,
                     source_name,
                     source_file,
+                    market_code,
                     publication_date,
                     available_at,
                     ingested_at
@@ -152,9 +223,26 @@ class BuildDailyShortVolumePipeline:
                 WHERE rn = 1
                 """
             )
-            metrics["history_stage_rows"] = self._table_count("tmp_daily_short_volume_canonical_source")
 
-            self._log_step(3, "upsert canonical daily short volume history")
+            stage_rows = self._table_count("tmp_daily_short_volume_canonical_source")
+            metrics["history_stage_rows"] = stage_rows
+
+            if stage_rows == 0:
+                history_after = self._table_count("daily_short_volume_history")
+                metrics["history_rows_after"] = history_after
+                metrics["max_history_trade_date_after"] = self._max_date("daily_short_volume_history", "trade_date")
+                return self._build_result(
+                    status="noop",
+                    started_at=started_at,
+                    finished_at=self._now(),
+                    rows_read=raw_count,
+                    rows_written=0,
+                    metrics=metrics | {"build_decision": "noop_no_incremental_rows"},
+                    error_message=None,
+                )
+
+            self._log_step(5, "upsert incremental canonical history")
+
             self.con.execute(
                 """
                 DELETE FROM daily_short_volume_history AS target
@@ -164,36 +252,35 @@ class BuildDailyShortVolumePipeline:
                   AND COALESCE(target.source_file, '') = COALESCE(stage.source_file, '')
                 """
             )
+
             self.con.execute(
                 """
                 INSERT INTO daily_short_volume_history (
-                    instrument_id,
-                    company_id,
                     symbol,
                     trade_date,
                     short_volume,
                     short_exempt_volume,
                     total_volume,
                     short_volume_ratio,
-                    market_code,
+                    short_exempt_ratio,
                     source_name,
                     source_file,
+                    market_code,
                     publication_date,
                     available_at,
                     ingested_at
                 )
                 SELECT
-                    instrument_id,
-                    company_id,
                     symbol,
                     trade_date,
                     short_volume,
                     short_exempt_volume,
                     total_volume,
                     short_volume_ratio,
-                    market_code,
+                    short_exempt_ratio,
                     source_name,
                     source_file,
+                    market_code,
                     publication_date,
                     available_at,
                     ingested_at
@@ -201,11 +288,11 @@ class BuildDailyShortVolumePipeline:
                 """
             )
 
-            self._log_step(4, "collect final canonical state")
+            self._log_step(6, "collect final canonical state")
+
             history_after = self._table_count("daily_short_volume_history")
-            inserted = max(history_after - history_before, 0)
             metrics["history_rows_after"] = history_after
-            metrics["history_rows_inserted"] = inserted
+            metrics["history_rows_inserted"] = stage_rows
             metrics["max_history_trade_date_after"] = self._max_date("daily_short_volume_history", "trade_date")
 
             return self._build_result(
@@ -213,7 +300,7 @@ class BuildDailyShortVolumePipeline:
                 started_at=started_at,
                 finished_at=self._now(),
                 rows_read=raw_count,
-                rows_written=inserted,
+                rows_written=stage_rows,
                 metrics=metrics,
                 error_message=None,
             )
