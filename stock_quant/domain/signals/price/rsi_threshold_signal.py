@@ -1,24 +1,21 @@
-from __future__ import annotations
-
 """
 RSI Threshold Signal
 
-Signal long-only basé sur RSI.
+Signal long-only simple basé sur RSI14.
 
 Règles
 ------
-- RSI <= oversold_threshold  -> long (signal_value = 1.0)
-- RSI >= overbought_threshold -> flat (signal_value = 0.0)
-- sinon -> flat (signal_value = 0.0)
+- si rsi_14 <= oversold_threshold : signal actif (1.0)
+- sinon : flat (0.0)
 
-Notes research-grade
---------------------
-- dépend uniquement d'une feature PIT-safe : rsi_14
-- ne reconstruit jamais l'univers
-- compatible avec execution_lag_bars >= 1
-- le calcul réel du backtest reste SQL-first ; la méthode Python ci-dessous
-  sert surtout au contrat domaine, aux probes et aux futurs tests unitaires
+Important
+---------
+- compute_signal_value est là pour le contrat, le debug et les tests
+- l'exécution de recherche réelle reste SQL-first côté backtest
+- aucune donnée future n'est utilisée ici
 """
+
+from __future__ import annotations
 
 from typing import Any
 
@@ -27,13 +24,22 @@ from stock_quant.domain.signals.base import BaseSignal
 
 class RsiThresholdSignal(BaseSignal):
     """
-    Signal de seuil RSI simple.
+    Signal RSI14 threshold.
 
-    Paramètres attendus
-    -------------------
-    - feature_name: nom de la colonne RSI dans le dataset
-    - oversold_threshold: seuil de survente
-    - overbought_threshold: seuil de surachat
+    Paramètres supportés
+    --------------------
+    - feature_name: par défaut "rsi_14"
+    - oversold_threshold: par défaut 30.0
+    - overbought_threshold: par défaut 70.0
+
+    Note
+    ----
+    La règle v1 est long-only :
+    - RSI <= oversold_threshold => 1.0
+    - sinon => 0.0
+
+    Le paramètre overbought_threshold est conservé pour stabilité d'interface,
+    documentation et évolutions futures.
     """
 
     signal_name = "rsi_threshold"
@@ -42,7 +48,7 @@ class RsiThresholdSignal(BaseSignal):
     @classmethod
     def default_params(cls) -> dict[str, Any]:
         """
-        Paramètres par défaut conservateurs.
+        Paramètres par défaut du signal.
         """
         return {
             "feature_name": "rsi_14",
@@ -53,14 +59,19 @@ class RsiThresholdSignal(BaseSignal):
     @classmethod
     def required_features(cls) -> tuple[str, ...]:
         """
-        Ce signal lit uniquement une colonne RSI.
+        Features minimales requises par le signal.
+
+        Important:
+        - le contrat de classe doit rester stable
+        - la feature réellement consommée peut être redéfinie via params
+        - pour les contrôles statiques, on annonce le cas nominal
         """
         return ("rsi_14",)
 
     @classmethod
     def warmup_bars(cls) -> int:
         """
-        RSI(14) nécessite un historique minimal explicite.
+        RSI14 nécessite un warmup minimal de 14 barres.
         """
         return 14
 
@@ -69,66 +80,58 @@ class RsiThresholdSignal(BaseSignal):
         """
         Valide et normalise les paramètres du signal.
         """
-        merged = dict(cls.default_params())
-        merged.update(params or {})
+        merged: dict[str, Any] = {
+            **cls.default_params(),
+            **(params or {}),
+        }
 
-        feature_name = str(merged.get("feature_name", "")).strip()
+        feature_name = str(merged.get("feature_name", "rsi_14")).strip()
         if not feature_name:
             raise ValueError("feature_name must be a non-empty string")
 
-        try:
-            oversold_threshold = float(merged.get("oversold_threshold", 30.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("oversold_threshold must be numeric") from exc
+        oversold = merged.get("oversold_threshold", 30.0)
+        overbought = merged.get("overbought_threshold", 70.0)
 
-        try:
-            overbought_threshold = float(merged.get("overbought_threshold", 70.0))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("overbought_threshold must be numeric") from exc
+        if not isinstance(oversold, (int, float)):
+            raise ValueError("oversold_threshold must be numeric")
+        if not isinstance(overbought, (int, float)):
+            raise ValueError("overbought_threshold must be numeric")
 
-        if oversold_threshold < 0 or oversold_threshold > 100:
+        oversold = float(oversold)
+        overbought = float(overbought)
+
+        if not 0.0 <= oversold <= 100.0:
             raise ValueError("oversold_threshold must be between 0 and 100")
-
-        if overbought_threshold < 0 or overbought_threshold > 100:
+        if not 0.0 <= overbought <= 100.0:
             raise ValueError("overbought_threshold must be between 0 and 100")
-
-        if oversold_threshold >= overbought_threshold:
-            raise ValueError("oversold_threshold must be strictly lower than overbought_threshold")
+        if oversold > overbought:
+            raise ValueError("oversold_threshold cannot be greater than overbought_threshold")
 
         return {
             "feature_name": feature_name,
-            "oversold_threshold": oversold_threshold,
-            "overbought_threshold": overbought_threshold,
+            "oversold_threshold": oversold,
+            "overbought_threshold": overbought,
         }
 
     def compute_signal_value(self, row: dict[str, Any]) -> float | None:
         """
-        Calcule la valeur de signal sur une ligne.
+        Contrat de signal pour debug/tests.
 
-        Convention v1
-        -------------
-        - feature absente/invalide => None
-        - RSI <= oversold          => 1.0
-        - RSI >= overbought        => 0.0
-        - entre les deux           => 0.0
+        Retour:
+        - None si feature absente
+        - 1.0 si RSI <= oversold_threshold
+        - 0.0 sinon
         """
-        feature_name = str(self.params["feature_name"])
-        oversold_threshold = float(self.params["oversold_threshold"])
-        overbought_threshold = float(self.params["overbought_threshold"])
+        feature_name = str(self.params.get("feature_name", "rsi_14")).strip() or "rsi_14"
+        value = row.get(feature_name)
 
-        raw_value = row.get(feature_name)
-        if raw_value is None:
+        if value is None:
             return None
 
-        try:
-            rsi_value = float(raw_value)
-        except (TypeError, ValueError):
-            return None
+        rsi = float(value)
+        oversold = float(self.params.get("oversold_threshold", 30.0))
 
-        if rsi_value <= oversold_threshold:
+        if rsi <= oversold:
             return 1.0
-
-        if rsi_value >= overbought_threshold:
-            return 0.0
 
         return 0.0
