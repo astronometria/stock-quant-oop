@@ -6,11 +6,11 @@ import json
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.app.services.dataset_version_service import DatasetVersionService
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+# REMOVED: BasePipeline supprimé pendant la consolidation brutale
 from stock_quant.shared.exceptions import PipelineError
-from stock_quant.shared.pipeline_runner import run_pipeline
 
 
-class BuildDatasetBuilderPipeline:
+class BuildDatasetBuilderPipeline(BasePipeline):
     pipeline_name = "build_dataset_builder"
 
     def __init__(
@@ -465,7 +465,7 @@ class BuildDatasetBuilderPipeline:
             ).fetchone()[0]
         )
 
-    def _finalize_result(self, result: PipelineResult) -> PipelineResult:
+    def finalize(self, result: PipelineResult) -> PipelineResult:
         result.rows_read = self._rows_read
         result.rows_written = self._dataset_rows
         result.metrics["dataset_rows"] = self._dataset_rows
@@ -474,39 +474,3 @@ class BuildDatasetBuilderPipeline:
         result.metrics["pit_filter_source"] = "universe_membership_history"
         result.metrics["survivor_bias_aware"] = 1
         return result
-
-    def _execute_pipeline_steps(self) -> dict:
-        """
-        Exécute le cycle pipeline historique sans BasePipeline.
-
-        Important:
-        - la logique PIT / anti-survivorship reste dans validate/load/finalize
-        - cette méthode ne doit pas déplacer la logique métier hors du module
-        """
-        data = self.extract()
-        data = self.transform(data)
-        self.validate(data)
-        self.load(data)
-
-        return {
-            "rows_read": getattr(self, "_rows_read", 0),
-            "rows_written": getattr(self, "_rows_written", 0),
-            "rows_skipped": getattr(self, "_rows_skipped", 0),
-            "warnings": [],
-            "metrics": getattr(self, "_metrics", {}),
-        }
-
-    def run(self):
-        """
-        Point d'entrée canonique local.
-
-        Le runner partagé construit PipelineResult.
-        La logique métier locale peut ensuite enrichir le résultat
-        via _finalize_result(...) si le module le définit.
-        """
-        result = run_pipeline(self.pipeline_name, self._execute_pipeline_steps)
-        finalizer = getattr(self, "_finalize_result", None)
-        if callable(finalizer):
-            return finalizer(result)
-        return result
-

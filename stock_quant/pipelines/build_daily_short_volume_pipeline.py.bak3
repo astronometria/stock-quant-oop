@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
-from stock_quant.shared.pipeline_runner import run_pipeline
 
 
 class BuildDailyShortVolumePipeline:
@@ -75,7 +74,7 @@ class BuildDailyShortVolumePipeline:
                     f"ALTER TABLE daily_short_volume_history ADD COLUMN {column_name} {column_type}"
                 )
 
-        def _build_payload(
+    def _build_result(
         self,
         *,
         status: str,
@@ -83,28 +82,35 @@ class BuildDailyShortVolumePipeline:
         finished_at: datetime,
         rows_read: int,
         rows_written: int,
-        error_message: str | None,
         metrics: dict[str, Any],
-    ) -> dict[str, Any]:
-        """
-        Construit un payload canonique pour run_pipeline(...).
+        error_message: str | None,
+    ) -> PipelineResult:
+        try:
+            return PipelineResult(
+                pipeline_name=self.pipeline_name,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                rows_read=rows_read,
+                rows_written=rows_written,
+                rows_skipped=0,
+                warnings=[],
+                metrics=metrics,
+                error_message=error_message,
+            )
+        except TypeError:
+            return PipelineResult(
+                pipeline_name=self.pipeline_name,
+                status=status,
+                started_at=started_at,
+                finished_at=finished_at,
+                rows_read=rows_read,
+                rows_written=rows_written,
+                metrics=metrics,
+                error_message=error_message,
+            )
 
-        IMPORTANT:
-        - aucune construction directe de PipelineResult ici
-        - les statuts métier comme noop/skipped restent visibles
-        - le runner partagé convertit ensuite ce payload en PipelineResult
-        """
-        return {
-            "status": status,
-            "rows_read": rows_read,
-            "rows_written": rows_written,
-            "rows_skipped": 0,
-            "warnings": [],
-            "metrics": metrics,
-            "error_message": error_message,
-        }
-
-    def _run_impl(self) -> dict[str, Any]:
+    def run(self) -> PipelineResult:
         started_at = self._now()
         metrics: dict[str, Any] = {}
 
@@ -123,7 +129,7 @@ class BuildDailyShortVolumePipeline:
             metrics["overlap_days"] = self.overlap_days
 
             if raw_count == 0:
-                return self._build_payload(
+                return self._build_result(
                     status="noop",
                     started_at=started_at,
                     finished_at=self._now(),
@@ -225,7 +231,7 @@ class BuildDailyShortVolumePipeline:
                 history_after = self._table_count("daily_short_volume_history")
                 metrics["history_rows_after"] = history_after
                 metrics["max_history_trade_date_after"] = self._max_date("daily_short_volume_history", "trade_date")
-                return self._build_payload(
+                return self._build_result(
                     status="noop",
                     started_at=started_at,
                     finished_at=self._now(),
@@ -289,7 +295,7 @@ class BuildDailyShortVolumePipeline:
             metrics["history_rows_inserted"] = stage_rows
             metrics["max_history_trade_date_after"] = self._max_date("daily_short_volume_history", "trade_date")
 
-            return self._build_payload(
+            return self._build_result(
                 status="success",
                 started_at=started_at,
                 finished_at=self._now(),
@@ -300,7 +306,7 @@ class BuildDailyShortVolumePipeline:
             )
 
         except Exception as exc:
-            return self._build_payload(
+            return self._build_result(
                 status="failed",
                 started_at=started_at,
                 finished_at=self._now(),
@@ -309,13 +315,3 @@ class BuildDailyShortVolumePipeline:
                 metrics=metrics,
                 error_message=str(exc),
             )
-
-    def run(self) -> PipelineResult:
-        """
-        Point d'entrée canonique.
-
-        La logique SQL/PIT reste dans _run_impl().
-        Le runner partagé construit le PipelineResult canonique.
-        """
-        return run_pipeline(self.pipeline_name, self._run_impl)
-

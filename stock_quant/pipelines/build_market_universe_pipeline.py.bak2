@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from stock_quant.app.dto.pipeline_result import PipelineResult
+# REMOVED: BasePipeline supprimé pendant la consolidation brutale
 from stock_quant.shared.exceptions import PipelineError
-from stock_quant.shared.pipeline_runner import run_pipeline
 
 
-class BuildMarketUniversePipeline:
+class BuildMarketUniversePipeline(BasePipeline):
     """
     Construit `market_universe` à partir de `symbol_reference_source_raw`.
 
@@ -521,44 +521,8 @@ class BuildMarketUniversePipeline:
             "unit_excluded_count": unit_excluded_count,
         }
 
-    def _finalize_result(self, result: PipelineResult) -> PipelineResult:
+    def finalize(self, result: PipelineResult) -> PipelineResult:
         result.rows_read = int(self._metrics.get("raw_candidates", 0))
         result.rows_written = self._written_universe
         result.metrics.update(self._metrics)
         return result
-
-    def _execute_pipeline_steps(self) -> dict:
-        """
-        Exécute le cycle pipeline historique sans BasePipeline.
-
-        Important:
-        - la logique PIT / anti-survivorship reste dans validate/load/finalize
-        - cette méthode ne doit pas déplacer la logique métier hors du module
-        """
-        data = self.extract()
-        data = self.transform(data)
-        self.validate(data)
-        self.load(data)
-
-        return {
-            "rows_read": getattr(self, "_rows_read", 0),
-            "rows_written": getattr(self, "_rows_written", 0),
-            "rows_skipped": getattr(self, "_rows_skipped", 0),
-            "warnings": [],
-            "metrics": getattr(self, "_metrics", {}),
-        }
-
-    def run(self):
-        """
-        Point d'entrée canonique local.
-
-        Le runner partagé construit PipelineResult.
-        La logique métier locale peut ensuite enrichir le résultat
-        via _finalize_result(...) si le module le définit.
-        """
-        result = run_pipeline(self.pipeline_name, self._execute_pipeline_steps)
-        finalizer = getattr(self, "_finalize_result", None)
-        if callable(finalizer):
-            return finalizer(result)
-        return result
-

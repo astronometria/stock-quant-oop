@@ -16,6 +16,9 @@ Invariants:
     rows_skipped
     warnings
     metrics
+  et peuvent optionnellement renvoyer:
+    status
+    error_message
 
 Important:
 Ce module ne doit pas contenir de logique métier PIT/survivorship.
@@ -35,12 +38,6 @@ from stock_quant.shared.enums import PipelineStatus
 def _coerce_int(value: Any, default: int = 0) -> int:
     """
     Convertit proprement une valeur arbitraire en int.
-
-    On reste volontairement strict mais robuste:
-    - None => default
-    - bool => 0/1 via int(bool)
-    - int/float/str numérique => int(...)
-    - sinon => default
     """
     if value is None:
         return default
@@ -74,48 +71,97 @@ def _coerce_metrics(value: Any) -> dict[str, Any]:
     return {"raw_metrics": value}
 
 
+def _coerce_error_message(value: Any) -> str | None:
+    """
+    Normalise le message d'erreur.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_status(value: Any) -> PipelineStatus:
+    """
+    Convertit un statut brut en PipelineStatus canonique.
+
+    Conventions supportées:
+    - PipelineStatus.*                    -> inchangé
+    - "success", "ok"                    -> SUCCESS
+    - "failed", "error"                  -> FAILED
+    - "skipped", "skip", "noop", "no-op" -> SKIPPED
+
+    Toute valeur inconnue est ramenée à SUCCESS pour éviter les faux FAILED
+    silencieux quand un pipeline renvoie un payload partiel.
+    """
+    if isinstance(value, PipelineStatus):
+        return value
+
+    if value is None:
+        return PipelineStatus.SUCCESS
+
+    raw = str(value).strip().lower()
+
+    if raw in {"success", "ok", "done", "completed"}:
+        return PipelineStatus.SUCCESS
+    if raw in {"failed", "error", "exception"}:
+        return PipelineStatus.FAILED
+    if raw in {"skipped", "skip", "noop", "no-op", "no_op"}:
+        return PipelineStatus.SKIPPED
+
+    return PipelineStatus.SUCCESS
+
+
 def _normalize_payload(payload: Any) -> dict[str, Any]:
     """
     Normalise la sortie métier retournée par un pipeline concret.
 
     Contrat attendu:
     {
+        "status": "success|failed|skipped|noop" | PipelineStatus,
         "rows_read": int,
         "rows_written": int,
         "rows_skipped": int,
         "warnings": list[str],
         "metrics": dict[str, Any],
+        "error_message": str | None,
     }
 
     Compatibilité volontairement minimale:
-    - None => structure vide
+    - None => structure vide SUCCESS
     - dict partiel => champs manquants complétés
     - toute autre valeur => placée dans metrics.raw_payload
     """
     if payload is None:
         return {
+            "status": PipelineStatus.SUCCESS,
             "rows_read": 0,
             "rows_written": 0,
             "rows_skipped": 0,
             "warnings": [],
             "metrics": {},
+            "error_message": None,
         }
 
     if isinstance(payload, Mapping):
         return {
+            "status": _coerce_status(payload.get("status")),
             "rows_read": _coerce_int(payload.get("rows_read", 0)),
             "rows_written": _coerce_int(payload.get("rows_written", 0)),
             "rows_skipped": _coerce_int(payload.get("rows_skipped", 0)),
             "warnings": _coerce_warnings(payload.get("warnings", [])),
             "metrics": _coerce_metrics(payload.get("metrics", {})),
+            "error_message": _coerce_error_message(payload.get("error_message")),
         }
 
     return {
+        "status": PipelineStatus.SUCCESS,
         "rows_read": 0,
         "rows_written": 0,
         "rows_skipped": 0,
         "warnings": [],
         "metrics": {"raw_payload": payload},
+        "error_message": None,
     }
 
 
@@ -138,12 +184,11 @@ def run_pipeline(
     try:
         raw_payload = fn(*args, **kwargs)
         payload = _normalize_payload(raw_payload)
-
         finished_at = datetime.utcnow()
 
         return PipelineResult(
             pipeline_name=pipeline_name,
-            status=PipelineStatus.SUCCESS,
+            status=payload["status"],
             started_at=started_at,
             finished_at=finished_at,
             rows_read=payload["rows_read"],
@@ -151,7 +196,7 @@ def run_pipeline(
             rows_skipped=payload["rows_skipped"],
             warnings=payload["warnings"],
             metrics=payload["metrics"],
-            error_message=None,
+            error_message=payload["error_message"],
         )
 
     except Exception as exc:

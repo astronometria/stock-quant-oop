@@ -3,11 +3,11 @@ from __future__ import annotations
 from stock_quant.app.dto.pipeline_result import PipelineResult
 from stock_quant.app.services.master_data_service import MasterDataService
 from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
+# REMOVED: BasePipeline supprimé pendant la consolidation brutale
 from stock_quant.shared.exceptions import PipelineError
-from stock_quant.shared.pipeline_runner import run_pipeline
 
 
-class BuildMasterDataPipeline:
+class BuildMasterDataPipeline(BasePipeline):
     pipeline_name = "build_master_data"
 
     def __init__(self, repository=None, uow: DuckDbUnitOfWork | None = None) -> None:
@@ -71,44 +71,8 @@ class BuildMasterDataPipeline:
             + self._metrics["identifier_map_rows"]
         )
 
-    def _finalize_result(self, result: PipelineResult) -> PipelineResult:
+    def finalize(self, result: PipelineResult) -> PipelineResult:
         result.rows_read = self._rows_read
         result.rows_written = self._rows_written
         result.metrics.update(self._metrics)
         return result
-
-    def _execute_pipeline_steps(self) -> dict:
-        """
-        Exécute le cycle pipeline historique sans BasePipeline.
-
-        Important:
-        - la logique PIT / anti-survivorship reste dans validate/load/finalize
-        - cette méthode ne doit pas déplacer la logique métier hors du module
-        """
-        data = self.extract()
-        data = self.transform(data)
-        self.validate(data)
-        self.load(data)
-
-        return {
-            "rows_read": getattr(self, "_rows_read", 0),
-            "rows_written": getattr(self, "_rows_written", 0),
-            "rows_skipped": getattr(self, "_rows_skipped", 0),
-            "warnings": [],
-            "metrics": getattr(self, "_metrics", {}),
-        }
-
-    def run(self):
-        """
-        Point d'entrée canonique local.
-
-        Le runner partagé construit PipelineResult.
-        La logique métier locale peut ensuite enrichir le résultat
-        via _finalize_result(...) si le module le définit.
-        """
-        result = run_pipeline(self.pipeline_name, self._execute_pipeline_steps)
-        finalizer = getattr(self, "_finalize_result", None)
-        if callable(finalizer):
-            return finalizer(result)
-        return result
-
