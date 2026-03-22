@@ -2,32 +2,20 @@
 from __future__ import annotations
 
 """
-Build feature_price_volatility_daily incrementally.
+Build feature_price_volatility_daily incrementally or full-rebuild safely.
 
-Objectif
---------
-Construire / rafraîchir:
-- atr_14
-- volatility_20
-
-Fenêtres
---------
-Cette famille a besoin de:
-- LAG 1
-- ATR 14
-- STDDEV_SAMP returns_1d sur 20 jours
-
-Donc:
-- overlap cible = 45 jours
-- source lookback = 30 jours
+Correctif principal:
+- supporte max_target_date = NULL en full rebuild
+- calcule les fenêtres de retraitement côté Python
+- garde la logique SQL-first pour les features elles-mêmes
 """
 
 import argparse
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
-
 
 TARGET_OVERLAP_DAYS = 45
 SOURCE_LOOKBACK_DAYS = 30
@@ -100,6 +88,27 @@ def ensure_target_table(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def compute_windows(max_target_date: date | None) -> tuple[date, date]:
+    """
+    Full rebuild:
+      target_window_start = 1900-01-01
+      source_window_start = 1900-01-01
+
+    Incremental rebuild:
+      target_window_start = max_target_date - overlap
+      source_window_start = max_target_date - (overlap + lookback)
+    """
+    if max_target_date is None:
+        full_start = date(1900, 1, 1)
+        return full_start, full_start
+
+    target_window_start = max_target_date - timedelta(days=TARGET_OVERLAP_DAYS)
+    source_window_start = max_target_date - timedelta(
+        days=TARGET_OVERLAP_DAYS + SOURCE_LOOKBACK_DAYS
+    )
+    return target_window_start, source_window_start
+
+
 def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
@@ -131,6 +140,7 @@ def main() -> int:
             raise RuntimeError("Neither price_bars_adjusted nor price_history exists")
 
         price_cols = get_columns(con, price_table)
+
         symbol_col = pick_first(price_cols, ["symbol"], "symbol")
         date_col = pick_first(price_cols, ["bar_date", "price_date", "as_of_date", "date"], "date")
         close_col = pick_first(price_cols, ["adj_close", "close", "adjusted_close"], "close")
@@ -148,38 +158,10 @@ def main() -> int:
             "SELECT MAX(as_of_date) FROM feature_price_volatility_daily"
         ).fetchone()[0]
 
-        con.execute("DROP TABLE IF EXISTS tmp_feature_price_volatility_window")
-        con.execute(
-            f"""
-            CREATE TEMP TABLE tmp_feature_price_volatility_window AS
-            SELECT
-                CASE
-                    WHEN ? IS NULL THEN DATE '1900-01-01'
-                    ELSE CAST(? - INTERVAL '{TARGET_OVERLAP_DAYS} days' AS DATE)
-                END AS target_window_start,
-                CASE
-                    WHEN ? IS NULL THEN DATE '1900-01-01'
-                    ELSE CAST(? - INTERVAL '{TARGET_OVERLAP_DAYS + SOURCE_LOOKBACK_DAYS} days' AS DATE)
-                END AS source_window_start
-            """,
-            [max_target_date, max_target_date, max_target_date, max_target_date],
-        )
-
-        target_window_start, source_window_start = con.execute(
-            """
-            SELECT target_window_start, source_window_start
-            FROM tmp_feature_price_volatility_window
-            """
-        ).fetchone()
+        target_window_start, source_window_start = compute_windows(max_target_date)
 
         if args.verbose:
             print(f"[volatility] price_table={price_table}", flush=True)
-            if table_exists(con, "price_bars_adjusted"):
-                adjusted_rows = int(con.execute("SELECT COUNT(*) FROM price_bars_adjusted").fetchone()[0])
-                print(f"[volatility] price_bars_adjusted_rows={adjusted_rows}", flush=True)
-            if table_exists(con, "price_history"):
-                history_rows = int(con.execute("SELECT COUNT(*) FROM price_history").fetchone()[0])
-                print(f"[volatility] price_history_rows={history_rows}", flush=True)
             print(f"[volatility] symbol_col={symbol_col}", flush=True)
             print(f"[volatility] date_col={date_col}", flush=True)
             print(f"[volatility] close_col={close_col}", flush=True)
@@ -198,6 +180,7 @@ def main() -> int:
         )
 
         con.execute("DROP TABLE IF EXISTS tmp_feature_price_volatility_stage")
+
         con.execute(
             f"""
             CREATE TEMP TABLE tmp_feature_price_volatility_stage AS
@@ -340,8 +323,8 @@ def main() -> int:
                     "min_date": str(row[3]) if row[3] is not None else None,
                     "max_date": str(row[4]) if row[4] is not None else None,
                     "target_rows_before": int(target_rows_before),
-                    "target_window_start": str(target_window_start) if target_window_start is not None else None,
-                    "source_window_start": str(source_window_start) if source_window_start is not None else None,
+                    "target_window_start": str(target_window_start),
+                    "source_window_start": str(source_window_start),
                     "stage_rows": int(stage_rows),
                     "deleted_rows": int(deleted_rows),
                     "inserted_rows": int(inserted_rows),
@@ -350,7 +333,6 @@ def main() -> int:
             ),
             flush=True,
         )
-
         return 0
     finally:
         con.close()

@@ -1,14 +1,3 @@
-"""
-Trend feature builder (STRICT warm-up).
-
-Source:
-- price_source_daily_raw
-
-Règle:
-- SMA / EMA proxy / MACD ont un warm-up strict
-- avant assez d'observations, la feature retourne NULL
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -26,13 +15,19 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict:
         CREATE TABLE feature_price_trend_daily AS
         WITH base AS (
             SELECT
-                symbol,
-                price_date AS as_of_date,
-                close
-            FROM price_source_daily_raw
+                COALESCE(im.instrument_id, ps.symbol) AS instrument_id,
+                im.company_id AS company_id,
+                ps.symbol,
+                ps.price_date AS as_of_date,
+                ps.close
+            FROM price_source_daily_raw ps
+            LEFT JOIN instrument_master im
+                ON ps.symbol = im.symbol
         ),
         ma_base AS (
             SELECT
+                instrument_id,
+                company_id,
                 symbol,
                 as_of_date,
                 close,
@@ -75,6 +70,8 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict:
         ),
         strict_ma AS (
             SELECT
+                instrument_id,
+                company_id,
                 symbol,
                 as_of_date,
                 close,
@@ -89,6 +86,8 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict:
         ),
         macd_line_base AS (
             SELECT
+                instrument_id,
+                company_id,
                 symbol,
                 as_of_date,
                 close,
@@ -106,6 +105,8 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict:
         ),
         macd_signal_base AS (
             SELECT
+                instrument_id,
+                company_id,
                 symbol,
                 as_of_date,
                 close,
@@ -127,6 +128,8 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict:
             FROM macd_line_base
         )
         SELECT
+            instrument_id,
+            company_id,
             symbol,
             as_of_date,
             close,

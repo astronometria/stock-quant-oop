@@ -2,25 +2,12 @@
 from __future__ import annotations
 
 """
-Build research_features_daily incrementally.
+Build research_features_daily as a robust full rebuild.
 
-Objectif
---------
-Assembler les familles de features canoniques dans une seule table de recherche
-point-in-time safe, avec refresh incrémental.
-
-Sources canoniques
-------------------
-- feature_price_momentum_daily
-- feature_price_trend_daily
-- feature_price_volatility_daily
-- short_features_daily
-
-Pourquoi overlap 220 jours
---------------------------
-La famille trend dépend de SMA 200.
-Même si research_features_daily lui-même ne calcule aucun rolling,
-il doit retraiter la même zone que la feature price la plus exigeante.
+Objectif:
+- assembler les familles de features dans une seule table
+- éviter toute logique incrémentale fragile tant que la convergence du repo
+  n'est pas terminée
 """
 
 import argparse
@@ -30,66 +17,10 @@ from pathlib import Path
 import duckdb
 
 
-TARGET_OVERLAP_DAYS = 220
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", required=True)
-    p.add_argument("--memory-limit", default="24GB")
-    p.add_argument("--threads", type=int, default=4)
-    p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
-    p.add_argument("--verbose", action="store_true")
     return p.parse_args()
-
-
-def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
-    row = con.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE table_name = ?
-        """,
-        [table_name],
-    ).fetchone()
-    return bool(row and int(row[0]) > 0)
-
-
-def table_count(con: duckdb.DuckDBPyConnection, table_name: str) -> int:
-    return int(con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
-
-
-def ensure_target_table(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS research_features_daily (
-            instrument_id VARCHAR,
-            company_id VARCHAR,
-            symbol VARCHAR,
-            as_of_date DATE,
-            close DOUBLE,
-            returns_1d DOUBLE,
-            returns_5d DOUBLE,
-            returns_20d DOUBLE,
-            sma_20 DOUBLE,
-            sma_50 DOUBLE,
-            sma_200 DOUBLE,
-            close_to_sma_20 DOUBLE,
-            rsi_14 DOUBLE,
-            atr_14 DOUBLE,
-            volatility_20 DOUBLE,
-            short_interest DOUBLE,
-            days_to_cover DOUBLE,
-            short_volume_ratio DOUBLE,
-            short_interest_change_pct DOUBLE,
-            short_squeeze_score DOUBLE,
-            short_pressure_zscore DOUBLE,
-            days_to_cover_zscore DOUBLE,
-            source_name VARCHAR,
-            created_at TIMESTAMP WITH TIME ZONE
-        )
-        """
-    )
 
 
 def main() -> int:
@@ -98,191 +29,130 @@ def main() -> int:
 
     con = duckdb.connect(str(db_path))
     try:
-        con.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
-        con.execute(f"PRAGMA threads={int(args.threads)}")
-        con.execute("PRAGMA preserve_insertion_order=false")
+        con.execute("DROP TABLE IF EXISTS research_features_daily")
 
-        temp_dir_sql = str(Path(args.temp_dir).expanduser().resolve()).replace("'", "''")
-        con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
-
-        ensure_target_table(con)
-
-        required_tables = [
-            "feature_price_momentum_daily",
-            "feature_price_trend_daily",
-            "feature_price_volatility_daily",
-            "short_features_daily",
-        ]
-
-        for table_name in required_tables:
-            if not table_exists(con, table_name):
-                raise RuntimeError(f"required table missing: {table_name}")
-            row_count = table_count(con, table_name)
-            if args.verbose:
-                print(f"[research_features] {table_name}_rows={row_count}", flush=True)
-
-        target_rows_before = table_count(con, "research_features_daily")
-        max_target_date = con.execute(
-            "SELECT MAX(as_of_date) FROM research_features_daily"
-        ).fetchone()[0]
-
-        con.execute("DROP TABLE IF EXISTS tmp_research_features_window")
-        con.execute(
-            f"""
-            CREATE TEMP TABLE tmp_research_features_window AS
-            SELECT
-                CASE
-                    WHEN ? IS NULL THEN DATE '1900-01-01'
-                    ELSE CAST(? - INTERVAL '{TARGET_OVERLAP_DAYS} days' AS DATE)
-                END AS target_window_start
-            """,
-            [max_target_date, max_target_date],
-        )
-
-        target_window_start = con.execute(
-            "SELECT target_window_start FROM tmp_research_features_window"
-        ).fetchone()[0]
-
-        if args.verbose:
-            print(f"[research_features] target_rows_before={target_rows_before}", flush=True)
-            print(f"[research_features] max_target_date={max_target_date}", flush=True)
-            print(f"[research_features] target_window_start={target_window_start}", flush=True)
-
-        con.execute("DROP TABLE IF EXISTS tmp_research_features_stage")
         con.execute(
             """
-            CREATE TEMP TABLE tmp_research_features_stage AS
-            WITH price_base AS (
+            CREATE TABLE research_features_daily AS
+            WITH m AS (
                 SELECT
-                    COALESCE(m.instrument_id, t.instrument_id, v.instrument_id) AS instrument_id,
-                    COALESCE(m.symbol, t.symbol, v.symbol) AS symbol,
-                    COALESCE(m.as_of_date, t.as_of_date, v.as_of_date) AS as_of_date,
-                    m.close,
-                    m.returns_1d,
-                    m.returns_5d,
-                    m.returns_20d,
-                    m.rsi_14,
-                    t.sma_20,
-                    t.sma_50,
-                    t.sma_200,
-                    t.close_to_sma_20,
-                    v.atr_14,
-                    v.volatility_20
-                FROM feature_price_momentum_daily m
-                FULL OUTER JOIN feature_price_trend_daily t
-                  ON UPPER(TRIM(m.symbol)) = UPPER(TRIM(t.symbol))
-                 AND m.as_of_date = t.as_of_date
-                FULL OUTER JOIN feature_price_volatility_daily v
-                  ON UPPER(TRIM(COALESCE(m.symbol, t.symbol))) = UPPER(TRIM(v.symbol))
-                 AND COALESCE(m.as_of_date, t.as_of_date) = v.as_of_date
-                WHERE COALESCE(m.as_of_date, t.as_of_date, v.as_of_date) >= CAST(? AS DATE)
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    close,
+                    returns_1d,
+                    returns_5d,
+                    returns_10d,
+                    returns_20d,
+                    returns_60d,
+                    rsi_14,
+                    williams_r_14,
+                    distance_from_252d_high
+                FROM feature_price_momentum_daily
+            ),
+            t AS (
+                SELECT
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    close AS trend_close,
+                    sma_20,
+                    sma_50,
+                    sma_200,
+                    close_to_sma_20,
+                    close_to_sma_50,
+                    close_to_sma_200,
+                    ema_12,
+                    ema_26,
+                    macd_line,
+                    macd_signal,
+                    macd_hist
+                FROM feature_price_trend_daily
+            ),
+            v AS (
+                SELECT
+                    instrument_id,
+                    symbol,
+                    as_of_date,
+                    close AS vol_close,
+                    atr_14,
+                    volatility_20
+                FROM feature_price_volatility_daily
+            ),
+            s AS (
+                SELECT
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    short_interest,
+                    days_to_cover,
+                    short_volume_ratio,
+                    short_interest_change_pct,
+                    short_squeeze_score,
+                    short_pressure_zscore,
+                    days_to_cover_zscore
+                FROM feature_short_daily
             )
             SELECT
-                p.instrument_id,
-                s.company_id,
-                p.symbol,
-                p.as_of_date,
-                p.close,
-                p.returns_1d,
-                p.returns_5d,
-                p.returns_20d,
-                p.sma_20,
-                p.sma_50,
-                p.sma_200,
-                p.close_to_sma_20,
-                p.rsi_14,
-                p.atr_14,
-                p.volatility_20,
+                COALESCE(m.instrument_id, t.instrument_id, v.instrument_id, s.instrument_id) AS instrument_id,
+                COALESCE(m.company_id, t.company_id, s.company_id) AS company_id,
+                COALESCE(m.symbol, t.symbol, v.symbol, s.symbol) AS symbol,
+                COALESCE(m.as_of_date, t.as_of_date, v.as_of_date, s.as_of_date) AS as_of_date,
+
+                COALESCE(m.close, t.trend_close, v.vol_close) AS close,
+
+                m.returns_1d,
+                m.returns_5d,
+                m.returns_10d,
+                m.returns_20d,
+                m.returns_60d,
+                m.rsi_14,
+                m.williams_r_14,
+                m.distance_from_252d_high,
+
+                t.sma_20,
+                t.sma_50,
+                t.sma_200,
+                t.close_to_sma_20,
+                t.close_to_sma_50,
+                t.close_to_sma_200,
+                t.ema_12,
+                t.ema_26,
+                t.macd_line,
+                t.macd_signal,
+                t.macd_hist,
+
+                v.atr_14,
+                v.volatility_20,
+
                 s.short_interest,
                 s.days_to_cover,
                 s.short_volume_ratio,
                 s.short_interest_change_pct,
                 s.short_squeeze_score,
                 s.short_pressure_zscore,
-                s.days_to_cover_zscore,
-                'build_research_features_daily.py' AS source_name,
-                CURRENT_TIMESTAMP AS created_at
-            FROM price_base p
-            LEFT JOIN short_features_daily s
-              ON UPPER(TRIM(s.symbol)) = UPPER(TRIM(p.symbol))
-             AND s.as_of_date = p.as_of_date
-            WHERE p.symbol IS NOT NULL
-              AND p.as_of_date IS NOT NULL
-            """,
-            [target_window_start],
+                s.days_to_cover_zscore
+
+            FROM m
+            FULL OUTER JOIN t
+                ON m.symbol = t.symbol
+               AND m.as_of_date = t.as_of_date
+            FULL OUTER JOIN v
+                ON COALESCE(m.symbol, t.symbol) = v.symbol
+               AND COALESCE(m.as_of_date, t.as_of_date) = v.as_of_date
+            FULL OUTER JOIN s
+                ON COALESCE(m.symbol, t.symbol, v.symbol) = s.symbol
+               AND COALESCE(m.as_of_date, t.as_of_date, v.as_of_date) = s.as_of_date
+            """
         )
-
-        stage_rows = table_count(con, "tmp_research_features_stage")
-
-        deleted_rows = con.execute(
-            """
-            DELETE FROM research_features_daily
-            WHERE as_of_date >= CAST(? AS DATE)
-            """,
-            [target_window_start],
-        ).fetchone()[0]
-
-        inserted_rows = con.execute(
-            """
-            INSERT INTO research_features_daily (
-                instrument_id,
-                company_id,
-                symbol,
-                as_of_date,
-                close,
-                returns_1d,
-                returns_5d,
-                returns_20d,
-                sma_20,
-                sma_50,
-                sma_200,
-                close_to_sma_20,
-                rsi_14,
-                atr_14,
-                volatility_20,
-                short_interest,
-                days_to_cover,
-                short_volume_ratio,
-                short_interest_change_pct,
-                short_squeeze_score,
-                short_pressure_zscore,
-                days_to_cover_zscore,
-                source_name,
-                created_at
-            )
-            SELECT
-                instrument_id,
-                company_id,
-                symbol,
-                as_of_date,
-                close,
-                returns_1d,
-                returns_5d,
-                returns_20d,
-                sma_20,
-                sma_50,
-                sma_200,
-                close_to_sma_20,
-                rsi_14,
-                atr_14,
-                volatility_20,
-                short_interest,
-                days_to_cover,
-                short_volume_ratio,
-                short_interest_change_pct,
-                short_squeeze_score,
-                short_pressure_zscore,
-                days_to_cover_zscore,
-                source_name,
-                created_at
-            FROM tmp_research_features_stage
-            """
-        ).fetchone()[0]
 
         row = con.execute(
             """
             SELECT
-                COUNT(*) AS total_rows,
+                COUNT(*) AS rows,
                 COUNT(close) AS close_rows,
                 COUNT(returns_1d) AS returns_1d_rows,
                 COUNT(rsi_14) AS rsi_14_rows,
@@ -316,17 +186,12 @@ def main() -> int:
                     "short_volume_ratio_rows": int(row[10]),
                     "min_date": str(row[11]) if row[11] is not None else None,
                     "max_date": str(row[12]) if row[12] is not None else None,
-                    "target_rows_before": int(target_rows_before),
-                    "target_window_start": str(target_window_start) if target_window_start is not None else None,
-                    "stage_rows": int(stage_rows),
-                    "deleted_rows": int(deleted_rows),
-                    "inserted_rows": int(inserted_rows),
+                    "mode": "full_rebuild",
                 },
                 indent=2,
             ),
             flush=True,
         )
-
         return 0
     finally:
         con.close()
