@@ -3,15 +3,13 @@ from __future__ import annotations
 
 """
 Build research_training_dataset from:
-- research_features_daily  (X)
-- research_labels          (y)
+- research_features_daily (X)
+- research_labels (y)
 
-Design:
-- SQL-first
-- no leakage
-- configurable horizon
-- strict target filtering
-- keeps one row per (symbol, as_of_date)
+This version hardens the label join:
+- joins on instrument_id + as_of_date
+- does not rely on symbol-only identity
+- keeps the existing SQL-first style
 """
 
 import argparse
@@ -19,7 +17,6 @@ import json
 from pathlib import Path
 
 import duckdb
-
 
 ALLOWED_HORIZONS = {
     "5d": ("return_fwd_5d", "target_up_5d"),
@@ -58,7 +55,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
-
     return_col, class_col = ALLOWED_HORIZONS[args.horizon]
 
     date_filters = []
@@ -83,6 +79,11 @@ def main() -> int:
     try:
         con.execute("DROP TABLE IF EXISTS research_training_dataset")
 
+        # ---------------------------------------------------------------------
+        # Important hardening change:
+        # - join on instrument_id + as_of_date
+        # - retain symbol as a descriptive field, but not as the primary join key
+        # ---------------------------------------------------------------------
         sql = f"""
         CREATE TABLE research_training_dataset AS
         WITH joined AS (
@@ -152,12 +153,10 @@ def main() -> int:
                 -- Labels
                 l.{return_col} AS target_return,
                 l.{class_col} AS target_class
-
             FROM research_features_daily f
             INNER JOIN research_labels l
-                ON f.symbol = l.symbol
+                ON f.instrument_id = l.instrument_id
                AND f.as_of_date = l.as_of_date
-
             WHERE l.{return_col} IS NOT NULL
               AND l.{class_col} IS NOT NULL
               {where_sql}
