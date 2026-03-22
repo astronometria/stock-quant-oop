@@ -39,3 +39,21 @@ logs/
 docs/
 docs_backup_*/
 
+
+# === TEMP / BACKUPS ===
+*.bak
+*.bak*
+*.tmp
+
+# === LOGS ===
+logs/
+*.log
+
+# === LOCAL DOC / EXPORT ===
+docs/
+docs_backup_*/
+
+# === PYTHON CACHE ===
+__pycache__/
+*.pyc
+

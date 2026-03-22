@@ -1,3 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+mkdir -p logs
+timestamp="$(date +%Y%m%d_%H%M%S)"
+log_file="logs/converge_build_prices_pipeline_${timestamp}.log"
+exec > >(tee "${log_file}") 2>&1
+
+echo "===== DATE ====="
+date
+echo "===== PROJECT_ROOT ====="
+pwd
+
+# ---------------------------------------------------------------------------
+# Backups locaux avant réécriture
+# ---------------------------------------------------------------------------
+for f in \
+  stock_quant/pipelines/build_prices_pipeline.py \
+  stock_quant/pipelines/prices_pipeline.py
+do
+  if [ -f "$f" ]; then
+    cp "$f" "$f.bak9"
+    echo "BACKUP: $f -> $f.bak9"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# build_prices_pipeline.py
+# ---------------------------------------------------------------------------
+cat > stock_quant/pipelines/build_prices_pipeline.py <<'PYEOF'
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -124,3 +157,74 @@ __all__ = [
     "BuildPricesPipeline",
     "PricesPipeline",
 ]
+PYEOF
+
+echo "REWROTE: stock_quant/pipelines/build_prices_pipeline.py"
+
+# ---------------------------------------------------------------------------
+# prices_pipeline.py
+# ---------------------------------------------------------------------------
+cat > stock_quant/pipelines/prices_pipeline.py <<'PYEOF'
+"""
+Compatibility wrapper for the prices pipeline.
+
+Historique
+----------
+Le pipeline canonique a été renommé pour suivre la convention :
+build_*_pipeline.py
+
+Ancien fichier :
+prices_pipeline.py
+
+Nouveau fichier :
+build_prices_pipeline.py
+
+Ce wrapper reste présent temporairement pour éviter de casser
+les imports existants dans l'orchestrateur prix et dans les CLI.
+"""
+
+from __future__ import annotations
+
+from stock_quant.pipelines.build_prices_pipeline import (
+    BuildPricesPipeline,
+    PricesPipeline,
+)
+
+__all__ = [
+    "BuildPricesPipeline",
+    "PricesPipeline",
+]
+PYEOF
+
+echo "REWROTE: stock_quant/pipelines/prices_pipeline.py"
+
+# ---------------------------------------------------------------------------
+# Test de garde
+# ---------------------------------------------------------------------------
+cat > tests/unit/pipelines/test_build_prices_pipeline_converged.py <<'PYEOF'
+from pathlib import Path
+
+
+def test_build_prices_pipeline_no_longer_uses_special_result_contract() -> None:
+    text = Path("stock_quant/pipelines/build_prices_pipeline.py").read_text(encoding="utf-8")
+
+    assert "BuildPricesPipelineResult" not in text
+    assert "PricesPipelineResult" not in text
+    assert "return run_pipeline(" in text
+    assert "def _to_payload(" in text
+    assert "\"written_price_history_rows\"" in text
+    assert "\"price_latest_rows_after_refresh\"" in text
+
+
+def test_prices_pipeline_wrapper_only_reexports_pipeline_classes() -> None:
+    text = Path("stock_quant/pipelines/prices_pipeline.py").read_text(encoding="utf-8")
+
+    assert "BuildPricesPipelineResult" not in text
+    assert "PricesPipelineResult" not in text
+    assert "BuildPricesPipeline" in text
+    assert "PricesPipeline" in text
+PYEOF
+
+echo "WROTE: tests/unit/pipelines/test_build_prices_pipeline_converged.py"
+
+echo "===== DONE ====="
