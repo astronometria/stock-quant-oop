@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--db-path",
-        default="~/stock-quant-oop/market.duckdb",
+        default="~/stock-quant-oop-runtime/db/market.duckdb",
         help="DuckDB path.",
     )
     parser.add_argument(

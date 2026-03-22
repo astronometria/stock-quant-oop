@@ -27,11 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-path", required=True)
     parser.add_argument(
         "--model-path",
-        default="/home/marty/stock-quant-oop/models/lgbm_ranker_20d_aligned.pkl",
+        default="~/stock-quant-oop-runtime/models/lgbm_ranker_20d_aligned.pkl",
     )
     parser.add_argument(
         "--metrics-path",
-        default="/home/marty/stock-quant-oop/models/lgbm_ranker_20d_aligned_metrics.json",
+        default="~/stock-quant-oop-runtime/models/lgbm_ranker_20d_aligned_metrics.json",
     )
     parser.add_argument("--min-price", type=float, default=5.0)
     parser.add_argument("--min-dollar-volume", type=float, default=1_000_000.0)

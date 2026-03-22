@@ -8,7 +8,7 @@ import duckdb
 import joblib
 import pandas as pd
 
-DB_PATH = "/home/marty/stock-quant-oop/market.duckdb"
+DB_PATH = "~/stock-quant-oop-runtime/db/market.duckdb"
 MODEL_PATH = "/home/marty/stock-quant-oop/models/lgbm_ranker_20d_quality.pkl"
 
 AUM = 1_000_000.0

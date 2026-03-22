@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--default-root",
-        default="/home/marty/stock-quant-oop/data/raw/finra/daily_short_sale_volume",
+        default="~/stock-quant-oop-raw/data/raw/finra/daily_short_sale_volume",
         help="Default disk root scanned when no explicit --source is supplied.",
     )
     parser.add_argument(
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=6, help="DuckDB threads.")
     parser.add_argument(
         "--temp-dir",
-        default="/home/marty/stock-quant-oop/tmp",
+        default="~/stock-quant-oop-runtime/tmp",
         help="DuckDB temp directory.",
     )
     parser.add_argument("--verbose", action="store_true")
@@ -567,7 +567,7 @@ def main() -> int:
     args = parse_args()
 
     db_path = str(Path(args.db_path).expanduser().resolve())
-    repo_root = Path("/home/marty/stock-quant-oop")
+    repo_root = Path(__file__).resolve().parents[2]
     logs_dir = repo_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     bad_files_log = logs_dir / "finra_daily_short_volume_bad_files.json"

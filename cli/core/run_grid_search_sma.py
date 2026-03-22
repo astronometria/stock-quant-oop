@@ -12,7 +12,7 @@ Objectif:
 import subprocess
 import json
 
-DB_PATH = "/home/marty/stock-quant-oop/market.duckdb"
+DB_PATH = "~/stock-quant-oop-runtime/db/market.duckdb"
 DATASET_ID = "research_snapshot_short_equities_20260318T155506Z_split_20260318T204144Z_dataset_20260321T003602Z"
 SPLIT_ID = "split_20260318T204144Z"
 

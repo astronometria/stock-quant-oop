@@ -17,11 +17,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-path", required=True)
     parser.add_argument(
         "--model-path",
-        default="/home/marty/stock-quant-oop/models/lgbm_ranker_20d_quality.pkl",
+        default="~/stock-quant-oop-runtime/models/lgbm_ranker_20d_quality.pkl",
     )
     parser.add_argument(
         "--metrics-path",
-        default="/home/marty/stock-quant-oop/models/lgbm_ranker_20d_quality_metrics.json",
+        default="~/stock-quant-oop-runtime/models/lgbm_ranker_20d_quality_metrics.json",
     )
     parser.add_argument("--n-estimators", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.03)

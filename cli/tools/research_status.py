@@ -10,7 +10,7 @@ import duckdb
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Show research pipeline operational status.")
-    parser.add_argument("--db-path", default="~/stock-quant-oop/market.duckdb")
+    parser.add_argument("--db-path", default="~/stock-quant-oop-runtime/db/market.duckdb")
     return parser.parse_args()
 
 

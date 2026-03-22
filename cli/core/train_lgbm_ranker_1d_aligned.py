@@ -34,12 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-path", required=True, help="Path to DuckDB database.")
     parser.add_argument(
         "--model-path",
-        default="/home/marty/stock-quant-oop/models/lgbm_ranker.pkl",
+        default="~/stock-quant-oop-runtime/models/lgbm_ranker.pkl",
         help="Output path for the trained LightGBM model.",
     )
     parser.add_argument(
         "--metrics-path",
-        default="/home/marty/stock-quant-oop/models/lgbm_ranker_1d_metrics.json",
+        default="~/stock-quant-oop-runtime/models/lgbm_ranker_1d_metrics.json",
         help="Output path for training metrics JSON.",
     )
     parser.add_argument(

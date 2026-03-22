@@ -7,7 +7,7 @@ import joblib
 from tqdm import tqdm
 import json
 
-DB_PATH = "/home/marty/stock-quant-oop/market.duckdb"
+DB_PATH = "~/stock-quant-oop-runtime/db/market.duckdb"
 
 
 def run():

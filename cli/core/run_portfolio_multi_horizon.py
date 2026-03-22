@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db-path", default="/home/marty/stock-quant-oop/market.duckdb")
+    parser.add_argument("--db-path", default="~/stock-quant-oop-runtime/db/market.duckdb")
     parser.add_argument("--horizon", type=int, choices=[5, 10, 20], required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--cost-bps", type=float, default=10.0)

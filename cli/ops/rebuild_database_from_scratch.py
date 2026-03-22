@@ -145,12 +145,12 @@ def parse_args() -> argparse.Namespace:
     # ----------------------------------------------------------------------
     parser.add_argument(
         "--project-root",
-        default="/home/marty/stock-quant-oop",
+        default="~/stock-quant-oop",
         help="Root of the stock-quant-oop project.",
     )
     parser.add_argument(
         "--db-path",
-        default="/home/marty/stock-quant-oop/market.duckdb",
+        default="~/stock-quant-oop-runtime/db/market.duckdb",
         help="DuckDB database path.",
     )
     parser.add_argument(
@@ -175,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--temp-dir",
-        default="/home/marty/stock-quant-oop/tmp",
+        default="~/stock-quant-oop-runtime/tmp",
         help="DuckDB temp spill directory propagated to child scripts when supported.",
     )
     parser.add_argument(
@@ -218,7 +218,7 @@ def parse_args() -> argparse.Namespace:
     # ----------------------------------------------------------------------
     parser.add_argument(
         "--finra-output-dir",
-        default="/home/marty/stock-quant-oop/data/raw/finra",
+        default="~/stock-quant-oop-raw/data/raw/finra",
         help="Directory used by FINRA refresh workflow.",
     )
     parser.add_argument(
@@ -633,6 +633,45 @@ def main() -> int:
         steps.append(_skip_step("LOAD SYMBOL REFERENCE SOURCE RAW", "requested by --skip-symbol-reference-load"))
     else:
         cmd, _ = build_child_cmd("cli/raw/load_symbol_reference_source_raw.py")
+
+        # ===== FIX: resolve real raw source files for symbol reference =====
+        # NOTE:
+        # Path.glob("**/pattern*") échoue si "**" n'est pas un composant seul.
+        # On utilise donc rglob("*") puis on filtre explicitement les noms.
+        raw_root = Path("~/stock-quant-oop/data/symbol_sources").expanduser()
+        # symbol_sources are stored inside repo under data/symbol_sources
+
+        # Mots-clés permissifs pour retrouver les fichiers réellement téléchargés.
+        # On reste volontairement simple et lisible pour les autres développeurs.
+        keyword_groups = [
+            ("sec", "company", "ticker"),
+            ("nasdaq", "symbol"),
+            ("nasdaq", "directory"),
+        ]
+
+        symbol_source_paths = []
+        for candidate in raw_root.rglob("*"):
+            if not candidate.is_file():
+                continue
+
+            candidate_name = candidate.name.lower()
+
+            # On ajoute le fichier si son nom contient tous les mots-clés
+            # d'au moins un groupe attendu.
+            for keywords in keyword_groups:
+                if all(keyword in candidate_name for keyword in keywords):
+                    symbol_source_paths.append(candidate.resolve())
+                    break
+
+        # Déduplication stable, triée pour reproductibilité.
+        symbol_sources = sorted({str(path) for path in symbol_source_paths})
+
+        if not symbol_sources:
+            raise SystemExit(f"No symbol source files found under {raw_root}")
+
+        for src in symbol_sources:
+            cmd.extend(["--source", src])
+
         cmd.extend(["--db-path", str(db_path)])
         steps.append(_run_step("LOAD SYMBOL REFERENCE SOURCE RAW", cmd))
 
@@ -701,7 +740,7 @@ def main() -> int:
         cmd, help_text = build_child_cmd("cli/core/build_prices.py")
         cmd.extend([
             "--db-path", str(db_path),
-            "--mode", "backfill",
+            "--start-date", "1960-01-01",
         ])
         cmd = _extend_with_optional_price_filters(cmd, help_text, args)
         steps.append(_run_step("BUILD PRICES BACKFILL", cmd))

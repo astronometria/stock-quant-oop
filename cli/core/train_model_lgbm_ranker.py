@@ -7,7 +7,7 @@ import lightgbm as lgb
 import joblib
 import json
 
-DB_PATH = "/home/marty/stock-quant-oop/market.duckdb"
+DB_PATH = "~/stock-quant-oop-runtime/db/market.duckdb"
 
 
 def add_relevance_by_date(df: pd.DataFrame, n_bins: int = 5) -> pd.DataFrame:
