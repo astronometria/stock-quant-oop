@@ -45,9 +45,9 @@ def main() -> int:
     con = duckdb.connect(str(db_path))
     try:
         # ---------------------------------------------------------------------
-        # Important:
-        # - whitelist table is static by symbol only
-        # - daily execution fields and 20d forward target come from prices
+        # PIT universe:
+        # - research_universe_whitelist_20d_pit is date-aware
+        # - must join on symbol + as_of_date
         # ---------------------------------------------------------------------
         df = con.execute("""
         WITH split_calendar AS (
@@ -84,8 +84,9 @@ def main() -> int:
                     ELSE (p.adj_close_fwd_20 / p.adj_close) - 1
                 END AS target_return_20d
             FROM research_features_daily f
-            INNER JOIN research_universe_whitelist_20d_final q
+            INNER JOIN research_universe_whitelist_20d_pit q
                 ON f.symbol = q.symbol
+               AND f.as_of_date = q.as_of_date
             INNER JOIN split_calendar sc
                 ON f.as_of_date = sc.as_of_date
             INNER JOIN future_prices p
@@ -112,7 +113,7 @@ def main() -> int:
     progress.update(1)
 
     if df.empty:
-        raise RuntimeError("Training frame is empty after whitelist filtering.")
+        raise RuntimeError("Training frame is empty after PIT whitelist filtering.")
 
     train_df = df[df["dataset_split"] == "train"].copy()
     val_df = df[df["dataset_split"] == "val"].copy()
@@ -179,6 +180,7 @@ def main() -> int:
 
     metrics = {
         "trainer": "train_lgbm_ranker_20d_quality.py",
+        "universe_table": "research_universe_whitelist_20d_pit",
         "rows_train": int(len(train_df)),
         "rows_val": int(len(val_df)),
         "rows_test": int(len(test_df)),
@@ -196,6 +198,7 @@ def main() -> int:
     print(json.dumps({
         "model_path": str(model_path),
         "metrics_path": str(metrics_path),
+        "universe_table": metrics["universe_table"],
         "rows_train": metrics["rows_train"],
         "rows_val": metrics["rows_val"],
         "rows_test": metrics["rows_test"],

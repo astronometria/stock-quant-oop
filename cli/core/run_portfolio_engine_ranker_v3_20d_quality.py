@@ -23,6 +23,11 @@ def main() -> None:
     model = joblib.load(MODEL_PATH)
     con = duckdb.connect(DB_PATH)
 
+    # -------------------------------------------------------------------------
+    # PIT universe:
+    # - join on symbol + as_of_date
+    # - realized 20d return comes from canonical adjusted prices
+    # -------------------------------------------------------------------------
     df = con.execute(f"""
     WITH future_prices AS (
         SELECT
@@ -50,8 +55,9 @@ def main() -> None:
             ELSE (p.adj_close_fwd / p.adj_close) - 1
         END AS realized_return_20d
     FROM research_split_dataset r
-    INNER JOIN research_universe_whitelist_20d_final q
+    INNER JOIN research_universe_whitelist_20d_pit q
         ON r.symbol = q.symbol
+       AND r.as_of_date = q.as_of_date
     INNER JOIN future_prices p
         ON r.symbol = p.symbol
        AND r.as_of_date = p.bar_date
@@ -111,14 +117,20 @@ def main() -> None:
 
     sleeve_df = pd.DataFrame(sleeves)
     if sleeve_df.empty:
-        raise RuntimeError("No sleeves produced in final whitelist backtest.")
+        raise RuntimeError("No sleeves produced in PIT whitelist backtest.")
 
     pnl_by_day = defaultdict(float)
+
     for _, row in sleeve_df.iterrows():
         start_idx = date_to_idx[row["date"]]
-        # Each sleeve should only consume 1/HOLD_DAYS of portfolio capital.
-        # Without this extra division, overlapping sleeves create implicit ~20x leverage.
+
+        # ---------------------------------------------------------------------
+        # Each sleeve uses only 1/HOLD_DAYS of portfolio capital.
+        # And its 20d return is amortized over HOLD_DAYS days.
+        # This avoids implicit ~20x leverage from overlapping sleeves.
+        # ---------------------------------------------------------------------
         daily_net = float(row["net_20d"]) / (HOLD_DAYS * HOLD_DAYS)
+
         for offset in range(HOLD_DAYS):
             idx = start_idx + offset
             if idx >= len(unique_dates):
@@ -141,8 +153,9 @@ def main() -> None:
 
     print("===== PORTFOLIO V3 20D QUALITY =====")
     print(json.dumps({
-        "mode": "20d_aligned_final_whitelist",
+        "mode": "20d_aligned_pit_whitelist",
         "model_path": MODEL_PATH,
+        "universe_table": "research_universe_whitelist_20d_pit",
         "final_capital": float(eq["capital"].iloc[-1]),
         "total_return": float(eq["capital"].iloc[-1] / AUM - 1.0),
         "mean_daily": mean_daily,
