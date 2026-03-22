@@ -2,542 +2,206 @@
 from __future__ import annotations
 
 """
-Incremental, SQL-first, memory-safe builder for research_training_dataset.
+Build research_training_dataset from:
+- research_features_daily  (X)
+- research_labels          (y)
 
-Objectif
---------
-Construire research_training_dataset à partir de research_features_daily
-en mode:
-- chunké par mois
-- résumable / incrémental par dataset_id
-- PIT-safe
-- memory-safe
-
-Pourquoi cette version
-----------------------
-L'ancienne logique faisait un as-of backward join sur un gros historique
-de features à chaque chunk mensuel, ce qui faisait exploser la mémoire.
-
-La bonne logique ici est:
-- research_features_daily est déjà le feature store quotidien canonique
-- le dataset d'entraînement n'est qu'une projection de cette table
-- on lit seulement le mois demandé
-- on saute les mois déjà chargés pour un dataset_id donné
-
-Notes importantes
------------------
-- pour reprendre un dataset interrompu, il faut réutiliser le même dataset_id
-- si un mois est partiellement chargé, on supprime ce mois puis on le reconstruit
+Design:
+- SQL-first
+- no leakage
+- configurable horizon
+- strict target filtering
+- keeps one row per (symbol, as_of_date)
 """
 
 import argparse
 import json
-from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
-from dateutil.relativedelta import relativedelta
-from tqdm import tqdm
-
-from stock_quant.infrastructure.db.research_training_dataset_schema import (
-    ResearchTrainingDatasetSchemaManager,
-)
 
 
-TARGET_FEATURE_COLUMNS: list[tuple[str, str]] = [
-    ("close", "DOUBLE"),
-    ("returns_1d", "DOUBLE"),
-    ("returns_5d", "DOUBLE"),
-    ("returns_20d", "DOUBLE"),
-    ("sma_20", "DOUBLE"),
-    ("sma_50", "DOUBLE"),
-    ("sma_200", "DOUBLE"),
-    ("close_to_sma_20", "DOUBLE"),
-    ("rsi_14", "DOUBLE"),
-    ("atr_14", "DOUBLE"),
-    ("volatility_20", "DOUBLE"),
-    ("short_volume_ratio", "DOUBLE"),
-]
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _dataset_id(snapshot_id: str, split_id: str) -> str:
-    stamp = _now_utc().strftime("%Y%m%dT%H%M%SZ")
-    return f"{snapshot_id}_{split_id}_dataset_{stamp}"
-
-
-def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
-    row = con.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE lower(table_name) = lower(?)
-        """,
-        [table_name],
-    ).fetchone()
-    return bool(row and int(row[0]) > 0)
-
-
-def _month_range(start: date, end: date):
-    cur = start.replace(day=1)
-    while cur <= end:
-        nxt = (cur + relativedelta(months=1)) - timedelta(days=1)
-        yield cur, min(nxt, end)
-        cur = cur + relativedelta(months=1)
-
-
-def _sql_symbol_type_case(symbol_expr: str) -> str:
-    return f"""
-        CASE
-            WHEN UPPER(TRIM({symbol_expr})) IN ('ZVZZT')
-                THEN 'TEST_OR_SPECIAL'
-            WHEN regexp_matches(UPPER(TRIM({symbol_expr})), '.*W$')
-                THEN 'LIKELY_WARRANT'
-            WHEN regexp_matches(UPPER(TRIM({symbol_expr})), '.*R$')
-                THEN 'LIKELY_RIGHT'
-            WHEN regexp_matches(UPPER(TRIM({symbol_expr})), '.*U$')
-                THEN 'LIKELY_UNIT'
-            ELSE 'COMMON_OR_OTHER'
-        END
-    """
-
-
-def _sql_allowed_symbol_predicate(symbol_expr: str, symbol_filter_mode: str) -> str:
-    if symbol_filter_mode == "all":
-        return "TRUE"
-
-    if symbol_filter_mode == "common_only":
-        return f"({_sql_symbol_type_case(symbol_expr)}) = 'COMMON_OR_OTHER'"
-
-    raise ValueError(f"unsupported symbol_filter_mode={symbol_filter_mode}")
-
-
-def _ensure_dataset_schema_has_feature_columns(con: duckdb.DuckDBPyConnection) -> None:
-    """
-    Garde la compatibilité avec le schema manager existant, puis ajoute les
-    colonnes de features nécessaires si elles manquent.
-    """
-    ResearchTrainingDatasetSchemaManager(con).ensure_tables()
-
-    existing_columns = {
-        str(row[1]).strip()
-        for row in con.execute("PRAGMA table_info('research_training_dataset')").fetchall()
-    }
-
-    for column_name, column_type in TARGET_FEATURE_COLUMNS:
-        if column_name not in existing_columns:
-            con.execute(
-                f"ALTER TABLE research_training_dataset ADD COLUMN {column_name} {column_type}"
-            )
-
-
-def _target_feature_columns_from_source(
-    con: duckdb.DuckDBPyConnection,
-) -> list[str]:
-    """
-    Retourne uniquement les colonnes features présentes à la fois dans la source
-    research_features_daily et dans la cible research_training_dataset.
-    """
-    source_columns = {
-        str(row[1]).strip()
-        for row in con.execute("PRAGMA table_info('research_features_daily')").fetchall()
-    }
-    target_columns = {
-        str(row[1]).strip()
-        for row in con.execute("PRAGMA table_info('research_training_dataset')").fetchall()
-    }
-
-    selected = [
-        col_name
-        for col_name, _col_type in TARGET_FEATURE_COLUMNS
-        if col_name in source_columns and col_name in target_columns
-    ]
-    return selected
+ALLOWED_HORIZONS = {
+    "5d": ("return_fwd_5d", "target_up_5d"),
+    "10d": ("return_fwd_10d", "target_up_10d"),
+    "20d": ("return_fwd_20d", "target_up_20d"),
+}
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--db-path", required=True)
-    p.add_argument("--snapshot-id", required=True)
-    p.add_argument("--split-id", required=True)
-    p.add_argument(
-        "--dataset-id",
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db-path", required=True)
+    parser.add_argument(
+        "--horizon",
+        choices=sorted(ALLOWED_HORIZONS.keys()),
+        default="20d",
+        help="Forward label horizon to use.",
+    )
+    parser.add_argument(
+        "--min-date",
         default=None,
-        help="Reuse an existing dataset_id to resume an interrupted build incrementally.",
+        help="Optional lower bound inclusive for as_of_date (YYYY-MM-DD).",
     )
-    p.add_argument("--memory-limit", default="24GB")
-    p.add_argument("--threads", type=int, default=6)
-    p.add_argument("--temp-dir", default="/home/marty/stock-quant-oop/tmp")
-    p.add_argument(
-        "--symbol-filter-mode",
-        default="common_only",
-        choices=["all", "common_only"],
+    parser.add_argument(
+        "--max-date",
+        default=None,
+        help="Optional upper bound inclusive for as_of_date (YYYY-MM-DD).",
     )
-    p.add_argument("--verbose", action="store_true")
-    return p.parse_args()
+    parser.add_argument(
+        "--drop-null-short",
+        action="store_true",
+        help="If set, require short features to be present.",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
 
-    print(f"[build_research_training_dataset] db_path={db_path}", flush=True)
+    return_col, class_col = ALLOWED_HORIZONS[args.horizon]
+
+    date_filters = []
+    params: list[object] = []
+
+    if args.min_date:
+        date_filters.append("f.as_of_date >= CAST(? AS DATE)")
+        params.append(args.min_date)
+
+    if args.max_date:
+        date_filters.append("f.as_of_date <= CAST(? AS DATE)")
+        params.append(args.max_date)
+
+    if args.drop_null_short:
+        date_filters.append("f.short_volume_ratio IS NOT NULL")
+
+    where_sql = ""
+    if date_filters:
+        where_sql = "AND " + " AND ".join(date_filters)
 
     con = duckdb.connect(str(db_path))
     try:
-        # --------------------------------------------------------------
-        # DuckDB runtime aligné avec le reste du codebase research.
-        # --------------------------------------------------------------
-        con.execute(f"PRAGMA memory_limit='{args.memory_limit}'")
-        con.execute(f"PRAGMA threads={args.threads}")
-        con.execute("PRAGMA preserve_insertion_order=false")
+        con.execute("DROP TABLE IF EXISTS research_training_dataset")
 
-        temp_dir_path = Path(args.temp_dir).expanduser().resolve()
-        temp_dir_path.mkdir(parents=True, exist_ok=True)
-        temp_dir_sql = str(temp_dir_path).replace("'", "''")
-        con.execute(f"PRAGMA temp_directory='{temp_dir_sql}'")
+        sql = f"""
+        CREATE TABLE research_training_dataset AS
+        WITH joined AS (
+            SELECT
+                f.instrument_id,
+                f.company_id,
+                f.symbol,
+                f.as_of_date,
 
-        # --------------------------------------------------------------
-        # Validation source.
-        # --------------------------------------------------------------
-        if not _table_exists(con, "research_features_daily"):
-            raise RuntimeError("research_features_daily does not exist")
+                -- =========================
+                -- MASTER PRICE FEATURE SET
+                -- =========================
+                f.close,
 
-        source_feature_rows = int(
-            con.execute("SELECT COUNT(*) FROM research_features_daily").fetchone()[0]
+                -- Momentum
+                f.returns_1d,
+                f.returns_5d,
+                f.returns_10d,
+                f.returns_20d,
+                f.returns_60d,
+                f.returns_log_1d,
+                f.momentum_20d,
+                f.momentum_acceleration_20d,
+                f.rsi_14,
+                f.williams_r_14,
+                f.stoch_k_14,
+                f.distance_from_252d_high,
+
+                -- Trend
+                f.sma_20,
+                f.sma_50,
+                f.sma_200,
+                f.close_to_sma_20,
+                f.close_to_sma_50,
+                f.close_to_sma_200,
+                f.ema_12,
+                f.ema_26,
+                f.macd_line,
+                f.macd_signal,
+                f.macd_hist,
+                f.slope_20d,
+                f.slope_50d,
+                f.trend_strength,
+
+                -- Volatility
+                f.atr_14,
+                f.atr_pct_14,
+                f.volatility_5,
+                f.volatility_10,
+                f.volatility_20,
+                f.volatility_60,
+                f.realized_vol_20d,
+                f.parkinson_vol_20d,
+                f.garman_klass_vol_20d,
+                f.bollinger_zscore_20,
+                f.bollinger_bandwidth_20,
+
+                -- Short
+                f.short_interest,
+                f.days_to_cover,
+                f.short_volume_ratio,
+                f.short_interest_change_pct,
+                f.short_squeeze_score,
+                f.short_pressure_zscore,
+                f.days_to_cover_zscore,
+
+                -- Labels
+                l.{return_col} AS target_return,
+                l.{class_col} AS target_class
+
+            FROM research_features_daily f
+            INNER JOIN research_labels l
+                ON f.symbol = l.symbol
+               AND f.as_of_date = l.as_of_date
+
+            WHERE l.{return_col} IS NOT NULL
+              AND l.{class_col} IS NOT NULL
+              {where_sql}
         )
-        if source_feature_rows == 0:
-            raise RuntimeError(
-                "research_features_daily is empty; build/populate features before building the training dataset"
-            )
+        SELECT *
+        FROM joined
+        """
 
-        # --------------------------------------------------------------
-        # Préparation schéma cible.
-        # --------------------------------------------------------------
-        _ensure_dataset_schema_has_feature_columns(con)
+        con.execute(sql, params)
 
-        # --------------------------------------------------------------
-        # Snapshot manifest.
-        # --------------------------------------------------------------
-        snapshot = con.execute(
-            """
-            SELECT snapshot_id, status
-            FROM research_dataset_manifest
-            WHERE snapshot_id = ?
-            """,
-            [args.snapshot_id],
-        ).fetchone()
-
-        if snapshot is None:
-            raise RuntimeError("snapshot_id not found")
-        if snapshot[1] != "completed":
-            raise RuntimeError("snapshot not completed")
-
-        # --------------------------------------------------------------
-        # Split manifest.
-        # --------------------------------------------------------------
-        split = con.execute(
+        row = con.execute(
             """
             SELECT
-                split_id,
-                train_start, train_end,
-                valid_start, valid_end,
-                test_start, test_end,
-                embargo_days
-            FROM research_split_manifest
-            WHERE split_id = ?
-            """,
-            [args.split_id],
+                COUNT(*) AS rows,
+                COUNT(DISTINCT symbol) AS symbols,
+                MIN(as_of_date) AS min_date,
+                MAX(as_of_date) AS max_date,
+                COUNT(target_return) AS target_return_rows,
+                COUNT(target_class) AS target_class_rows,
+                AVG(target_return) AS avg_target_return,
+                AVG(CAST(target_class AS DOUBLE)) AS positive_class_rate
+            FROM research_training_dataset
+            """
         ).fetchone()
 
-        if split is None:
-            raise RuntimeError("split_id not found")
-
-        (
-            split_id,
-            train_start,
-            train_end,
-            valid_start,
-            valid_end,
-            test_start,
-            test_end,
-            embargo_days,
-        ) = split
-
-        dataset_id = args.dataset_id or _dataset_id(args.snapshot_id, args.split_id)
-        target_feature_columns = _target_feature_columns_from_source(con)
-
-        if not target_feature_columns:
-            raise RuntimeError(
-                "No overlapping feature columns found between research_features_daily and research_training_dataset"
-            )
-
-        print(f"[builder] dataset_id={dataset_id}", flush=True)
-        print(f"[builder] snapshot_id={args.snapshot_id}", flush=True)
-        print(f"[builder] split_id={args.split_id}", flush=True)
-        print(f"[builder] source_feature_rows={source_feature_rows}", flush=True)
-        print(f"[builder] target_feature_columns={target_feature_columns}", flush=True)
-        print(f"[builder] memory_limit={args.memory_limit}", flush=True)
-        print(f"[builder] threads={args.threads}", flush=True)
-        print(f"[builder] temp_dir={temp_dir_sql}", flush=True)
-        print(f"[builder] embargo_days={embargo_days}", flush=True)
-        print(f"[builder] symbol_filter_mode={args.symbol_filter_mode}", flush=True)
-        print(f"[builder] verbose={args.verbose}", flush=True)
-
-        partitions = [
-            ("train", train_start, train_end),
-            ("valid", valid_start, valid_end),
-            ("test", test_start, test_end),
-        ]
-
-        allowed_symbol_predicate = _sql_allowed_symbol_predicate(
-            "symbol",
-            args.symbol_filter_mode,
-        )
-
-        # Colonnes dynamiques pour projection source -> cible.
-        feature_select_sql = ",\n                            ".join(
-            [f"f.{col}" for col in target_feature_columns]
-        )
-        feature_insert_sql = ",\n                            ".join(target_feature_columns)
-
-        inserted_rows_total = 0
-        skipped_rows_total = 0
-
-        for partition_name, partition_start, partition_end in partitions:
-            if partition_start is None or partition_end is None:
-                print(f"[partition_skip] {partition_name} reason=missing_dates", flush=True)
-                continue
-
-            month_windows = list(_month_range(partition_start, partition_end))
-
-            print(
-                f"\n===== PARTITION {partition_name} {partition_start} -> {partition_end} =====",
-                flush=True,
-            )
-
-            for month_start, month_end in tqdm(
-                month_windows,
-                desc=f"{partition_name} months",
-                dynamic_ncols=True,
-            ):
-                print(
-                    f"[chunk] partition={partition_name} start={month_start} end={month_end}",
-                    flush=True,
-                )
-
-                # ------------------------------------------------------
-                # Source chunk = seulement les lignes du mois.
-                # C'est le point clé anti-OOM.
-                # ------------------------------------------------------
-                con.execute("DROP TABLE IF EXISTS tmp_feature_chunk")
-                con.execute(
-                    f"""
-                    CREATE TEMP TABLE tmp_feature_chunk AS
-                    SELECT
-                        UPPER(TRIM(symbol)) AS symbol,
-                        as_of_date,
-                        {", ".join(target_feature_columns)},
-                        {_sql_symbol_type_case("symbol")} AS symbol_type
-                    FROM research_features_daily
-                    WHERE as_of_date BETWEEN ? AND ?
-                      AND as_of_date IS NOT NULL
-                      AND symbol IS NOT NULL
-                      AND TRIM(symbol) <> ''
-                      AND {allowed_symbol_predicate}
-                    """,
-                    [month_start, month_end],
-                )
-
-                source_month_rows = int(
-                    con.execute("SELECT COUNT(*) FROM tmp_feature_chunk").fetchone()[0]
-                )
-
-                if args.verbose:
-                    mix_rows = con.execute(
-                        """
-                        SELECT
-                            symbol_type,
-                            COUNT(DISTINCT symbol) AS distinct_symbols,
-                            COUNT(*) AS row_count
-                        FROM tmp_feature_chunk
-                        GROUP BY symbol_type
-                        ORDER BY row_count DESC, symbol_type
-                        """
-                    ).fetchall()
-                    print(
-                        f"[feature_chunk_mix] partition={partition_name} start={month_start} end={month_end} mix={mix_rows}",
-                        flush=True,
-                    )
-
-                if source_month_rows == 0:
-                    print(
-                        f"[chunk_done] partition={partition_name} start={month_start} end={month_end} inserted_rows=0 reason=no_feature_rows",
-                        flush=True,
-                    )
-                    continue
-
-                # ------------------------------------------------------
-                # Mode incremental / resume:
-                # - si le mois est déjà complet pour ce dataset_id, on skip
-                # - s'il est partiel, on le delete et on le reconstruit
-                # ------------------------------------------------------
-                existing_month_rows = int(
-                    con.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM research_training_dataset
-                        WHERE dataset_id = ?
-                          AND as_of_date BETWEEN ? AND ?
-                        """,
-                        [dataset_id, month_start, month_end],
-                    ).fetchone()[0]
-                )
-
-                if existing_month_rows == source_month_rows:
-                    skipped_rows_total += existing_month_rows
-                    print(
-                        f"[chunk_skip] partition={partition_name} start={month_start} end={month_end} "
-                        f"existing_rows={existing_month_rows} reason=already_complete",
-                        flush=True,
-                    )
-                    continue
-
-                if existing_month_rows > 0:
-                    con.execute(
-                        """
-                        DELETE FROM research_training_dataset
-                        WHERE dataset_id = ?
-                          AND as_of_date BETWEEN ? AND ?
-                        """,
-                        [dataset_id, month_start, month_end],
-                    )
-                    print(
-                        f"[chunk_reset] partition={partition_name} start={month_start} end={month_end} "
-                        f"deleted_partial_rows={existing_month_rows}",
-                        flush=True,
-                    )
-
-                con.execute(
-                    f"""
-                    INSERT INTO research_training_dataset (
-                        dataset_id,
-                        snapshot_id,
-                        symbol,
-                        as_of_date,
-                        {feature_insert_sql}
-                    )
-                    SELECT
-                        ? AS dataset_id,
-                        ? AS snapshot_id,
-                        f.symbol,
-                        f.as_of_date,
-                        {feature_select_sql}
-                    FROM tmp_feature_chunk f
-                    """,
-                    [dataset_id, args.snapshot_id],
-                )
-
-                inserted_rows_total += source_month_rows
-
-                current_rows = int(
-                    con.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM research_training_dataset
-                        WHERE dataset_id = ?
-                        """,
-                        [dataset_id],
-                    ).fetchone()[0]
-                )
-
-                print(
-                    f"[chunk_done] partition={partition_name} start={month_start} end={month_end} "
-                    f"source_rows={source_month_rows} dataset_rows={current_rows}",
-                    flush=True,
-                )
-
-            partition_probe = con.execute(
-                """
-                SELECT
-                    COUNT(*) AS rows,
-                    MIN(as_of_date) AS min_date,
-                    MAX(as_of_date) AS max_date
-                FROM research_training_dataset
-                WHERE dataset_id = ?
-                  AND as_of_date BETWEEN ? AND ?
-                """,
-                [dataset_id, partition_start, partition_end],
-            ).fetchone()
-
-            print(
-                f"[partition_done] {partition_name} rows={partition_probe[0]} "
-                f"min_date={partition_probe[1]} max_date={partition_probe[2]}",
-                flush=True,
-            )
-
-        row_count = int(
-            con.execute(
-                """
-                SELECT COUNT(*)
-                FROM research_training_dataset
-                WHERE dataset_id = ?
-                """,
-                [dataset_id],
-            ).fetchone()[0]
-        )
-
-        symbol_mix_final = con.execute(
-            f"""
-            WITH typed AS (
-                SELECT
-                    {_sql_symbol_type_case("symbol")} AS symbol_type,
-                    symbol
-                FROM research_training_dataset
-                WHERE dataset_id = ?
-            )
-            SELECT
-                symbol_type,
-                COUNT(DISTINCT symbol) AS distinct_symbols,
-                COUNT(*) AS row_count
-            FROM typed
-            GROUP BY symbol_type
-            ORDER BY row_count DESC, symbol_type
-            """,
-            [dataset_id],
-        ).fetchall()
-
-        output = {
-            "dataset_id": dataset_id,
-            "snapshot_id": args.snapshot_id,
-            "split_id": args.split_id,
-            "row_count": row_count,
-            "used_research_features_daily": True,
-            "source_feature_rows": source_feature_rows,
-            "inserted_rows_total": inserted_rows_total,
-            "skipped_rows_total": skipped_rows_total,
-            "join_mode": "direct_monthly_projection_incremental",
-            "date_window": {
-                "start": str(train_start),
-                "end": str(test_end),
-            },
-            "symbol_filter_mode": args.symbol_filter_mode,
-            "target_feature_columns": target_feature_columns,
-            "symbol_mix_final": [
+        print(
+            json.dumps(
                 {
-                    "symbol_type": row[0],
-                    "distinct_symbols": int(row[1]),
-                    "row_count": int(row[2]),
-                }
-                for row in symbol_mix_final
-            ],
-        }
-
-        print("\n===== BUILD COMPLETE =====", flush=True)
-        print(json.dumps(output, indent=2), flush=True)
+                    "table_name": "research_training_dataset",
+                    "horizon": args.horizon,
+                    "rows": int(row[0]),
+                    "symbols": int(row[1]),
+                    "min_date": str(row[2]) if row[2] is not None else None,
+                    "max_date": str(row[3]) if row[3] is not None else None,
+                    "target_return_rows": int(row[4]),
+                    "target_class_rows": int(row[5]),
+                    "avg_target_return": float(row[6]) if row[6] is not None else None,
+                    "positive_class_rate": float(row[7]) if row[7] is not None else None,
+                    "drop_null_short": bool(args.drop_null_short),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
         return 0
     finally:
         con.close()
