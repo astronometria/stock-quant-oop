@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-Build research_features_daily as a robust full rebuild.
-
-Objectif:
-- assembler les familles de features dans une seule table
-- éviter toute logique incrémentale fragile tant que la convergence du repo
-  n'est pas terminée
-"""
-
 import argparse
 import json
 from pathlib import Path
@@ -57,7 +48,6 @@ def main() -> int:
                     company_id,
                     symbol,
                     as_of_date,
-                    close AS trend_close,
                     sma_20,
                     sma_50,
                     sma_200,
@@ -76,7 +66,6 @@ def main() -> int:
                     instrument_id,
                     symbol,
                     as_of_date,
-                    close AS vol_close,
                     atr_14,
                     volatility_20
                 FROM feature_price_volatility_daily
@@ -97,12 +86,11 @@ def main() -> int:
                 FROM feature_short_daily
             )
             SELECT
-                COALESCE(m.instrument_id, t.instrument_id, v.instrument_id, s.instrument_id) AS instrument_id,
-                COALESCE(m.company_id, t.company_id, s.company_id) AS company_id,
-                COALESCE(m.symbol, t.symbol, v.symbol, s.symbol) AS symbol,
-                COALESCE(m.as_of_date, t.as_of_date, v.as_of_date, s.as_of_date) AS as_of_date,
-
-                COALESCE(m.close, t.trend_close, v.vol_close) AS close,
+                m.instrument_id,
+                m.company_id,
+                m.symbol,
+                m.as_of_date,
+                m.close,
 
                 m.returns_1d,
                 m.returns_5d,
@@ -137,15 +125,15 @@ def main() -> int:
                 s.days_to_cover_zscore
 
             FROM m
-            FULL OUTER JOIN t
-                ON m.symbol = t.symbol
-               AND m.as_of_date = t.as_of_date
-            FULL OUTER JOIN v
-                ON COALESCE(m.symbol, t.symbol) = v.symbol
-               AND COALESCE(m.as_of_date, t.as_of_date) = v.as_of_date
-            FULL OUTER JOIN s
-                ON COALESCE(m.symbol, t.symbol, v.symbol) = s.symbol
-               AND COALESCE(m.as_of_date, t.as_of_date, v.as_of_date) = s.as_of_date
+            LEFT JOIN t
+              ON m.symbol = t.symbol
+             AND m.as_of_date = t.as_of_date
+            LEFT JOIN v
+              ON m.symbol = v.symbol
+             AND m.as_of_date = v.as_of_date
+            LEFT JOIN s
+              ON m.symbol = s.symbol
+             AND m.as_of_date = s.as_of_date
             """
         )
 
@@ -153,6 +141,7 @@ def main() -> int:
             """
             SELECT
                 COUNT(*) AS rows,
+                COUNT(DISTINCT symbol) AS symbols,
                 COUNT(close) AS close_rows,
                 COUNT(returns_1d) AS returns_1d_rows,
                 COUNT(rsi_14) AS rsi_14_rows,
@@ -174,19 +163,20 @@ def main() -> int:
                 {
                     "table_name": "research_features_daily",
                     "rows": int(row[0]),
-                    "close_rows": int(row[1]),
-                    "returns_1d_rows": int(row[2]),
-                    "rsi_14_rows": int(row[3]),
-                    "sma_20_rows": int(row[4]),
-                    "sma_50_rows": int(row[5]),
-                    "sma_200_rows": int(row[6]),
-                    "close_to_sma_20_rows": int(row[7]),
-                    "atr_14_rows": int(row[8]),
-                    "volatility_20_rows": int(row[9]),
-                    "short_volume_ratio_rows": int(row[10]),
-                    "min_date": str(row[11]) if row[11] is not None else None,
-                    "max_date": str(row[12]) if row[12] is not None else None,
-                    "mode": "full_rebuild",
+                    "symbols": int(row[1]),
+                    "close_rows": int(row[2]),
+                    "returns_1d_rows": int(row[3]),
+                    "rsi_14_rows": int(row[4]),
+                    "sma_20_rows": int(row[5]),
+                    "sma_50_rows": int(row[6]),
+                    "sma_200_rows": int(row[7]),
+                    "close_to_sma_20_rows": int(row[8]),
+                    "atr_14_rows": int(row[9]),
+                    "volatility_20_rows": int(row[10]),
+                    "short_volume_ratio_rows": int(row[11]),
+                    "min_date": str(row[12]) if row[12] is not None else None,
+                    "max_date": str(row[13]) if row[13] is not None else None,
+                    "mode": "price_master_left_join",
                 },
                 indent=2,
             ),

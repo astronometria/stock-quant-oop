@@ -1,0 +1,180 @@
+========================================
+STOCK-QUANT-OOP PIPELINE WALKTHROUGH
+========================================
+
+OBJECTIF
+--------
+Construire une table finale:
+    research_features_daily
+
+Cette table est:
+- alignée sur les prix (univers investissable)
+- enrichie avec momentum, trend, volatility, short
+- sans duplication
+- sans leakage
+
+----------------------------------------
+PIPELINE GLOBAL
+----------------------------------------
+
+symbol sources (Nasdaq + SEC)
+        ↓
+symbol_reference_source_raw
+        ↓
+symbol_reference
+        ↓
+market_universe (common stock only)
+        ↓
+price_source_daily_raw_all (stooq)
+        ↓
+price_source_daily_raw (filtered universe)
+        ↓
+price_history (compat legacy)
+        ↓
+price_bars_unadjusted
+        ↓
+price_bars_adjusted
+        ↓
+instrument_master
+        ↓
+feature_price_momentum_daily
+feature_price_trend_daily
+feature_price_volatility_daily
+feature_short_daily
+        ↓
+research_features_daily (FINAL TABLE)
+
+----------------------------------------
+ETAPE 1 — LOAD SYMBOL SOURCES
+----------------------------------------
+
+python3 cli/raw/load_symbol_reference_source_raw.py \
+  --db-path ~/stock-quant-oop/market.duckdb \
+  --source data/symbol_sources/nasdaq/nasdaqlisted_2026-03-16.csv \
+  --source data/symbol_sources/nasdaq/otherlisted_2026-03-16.csv \
+  --source data/symbol_sources/sec/sec_company_tickers_2026-03-16.csv \
+  --truncate
+
+----------------------------------------
+ETAPE 2 — BUILD SYMBOL REFERENCE
+----------------------------------------
+
+python3 cli/core/build_symbol_reference.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+----------------------------------------
+ETAPE 3 — BUILD MARKET UNIVERSE
+(common stocks only)
+----------------------------------------
+
+python3 cli/core/build_market_universe.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+Résultat attendu:
+- ~6k symbols
+- ETF / ADR / warrants exclus
+
+----------------------------------------
+ETAPE 4 — FILTER PRICE RAW
+----------------------------------------
+
+python3 cli/raw/filter_price_source_daily_raw_from_all.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+Résultat:
+price_source_daily_raw = prix filtrés sur univers
+
+----------------------------------------
+ETAPE 5 — BUILD PRICE HISTORY (COMPAT)
+----------------------------------------
+
+python3 stock_quant/prices/canonical/build_price_history_compat.py
+
+----------------------------------------
+ETAPE 6 — BUILD CANONICAL PRICE TABLES
+----------------------------------------
+
+python3 stock_quant/prices/canonical/build_price_bars_unadjusted.py
+python3 stock_quant/prices/canonical/build_price_bars_adjusted.py
+python3 stock_quant/prices/canonical/build_instrument_master.py
+
+----------------------------------------
+ETAPE 7 — BUILD FEATURES
+----------------------------------------
+
+Momentum:
+python3 cli/core/build_feature_price_momentum.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+Trend:
+python3 cli/core/build_feature_price_trend.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+Volatility:
+python3 cli/core/build_feature_price_volatility.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+Short:
+python3 cli/core/build_feature_short.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+----------------------------------------
+ETAPE 8 — BUILD FINAL TABLE
+----------------------------------------
+
+python3 cli/core/build_research_features_daily.py \
+  --db-path ~/stock-quant-oop/market.duckdb
+
+IMPORTANT:
+- momentum = table maître
+- LEFT JOIN trend / volatility / short
+- aucune duplication
+- aucune inflation de lignes
+
+----------------------------------------
+VERIFICATION
+----------------------------------------
+
+python3 <<'PY'
+import duckdb
+con = duckdb.connect("~/stock-quant-oop/market.duckdb")
+
+row = con.execute("""
+SELECT
+    COUNT(*) AS rows,
+    COUNT(DISTINCT symbol) AS symbols,
+    MIN(as_of_date),
+    MAX(as_of_date)
+FROM research_features_daily
+""").fetchone()
+
+print(row)
+con.close()
+PY
+
+Résultat attendu:
+- ~17M rows
+- ~5.8k symbols
+- dates alignées avec les prix
+
+----------------------------------------
+NOTES IMPORTANTES
+----------------------------------------
+
+1. Univers maître = PRIX
+   → garantit cohérence backtest
+
+2. Short = enrichissement
+   → LEFT JOIN uniquement
+
+3. Aucun FULL OUTER JOIN
+   → sinon explosion du nombre de lignes
+
+4. Pipeline SQL-first
+   → reproductible
+   → scalable
+
+----------------------------------------
+FIN
+----------------------------------------
+
