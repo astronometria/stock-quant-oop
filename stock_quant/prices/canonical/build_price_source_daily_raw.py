@@ -1,68 +1,49 @@
 """
-Builder de la couche raw canonique Yahoo-only.
+Builder de la couche raw canonique Yahoo-only / raw-only.
 
 Objectif:
-- créer / peupler price_source_daily_raw à partir de price_history
-  ou d'une table raw Yahoo existante
-- imposer un schéma brut propre et stable pour les étapes aval
-
-Important:
-- ce script ne calcule aucune feature
-- ce script ne dépend que d'une seule source provider: Yahoo
-- ce script garde la logique SQL-first
+- créer / peupler price_source_daily_raw à partir de la meilleure source raw disponible
+- priorité:
+    1. price_source_daily_raw_yahoo si peuplée
+    2. price_source_daily_raw_all si peuplée
+- ne PAS retomber automatiquement sur price_history, car price_history peut être
+  un mini sous-ensemble fixture et non la vraie source raw complète
 """
 
 from __future__ import annotations
 
 import json
-
 import duckdb
+
+
+def table_exists(connection: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND table_name = ?
+        """,
+        [table_name],
+    ).fetchone()
+    return bool(row and row[0] > 0)
+
+
+def table_row_count(connection: duckdb.DuckDBPyConnection, table_name: str) -> int:
+    if not table_exists(connection, table_name):
+        return 0
+    row = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+    return int(row[0]) if row else 0
 
 
 def build_price_source_daily_raw(
     connection: duckdb.DuckDBPyConnection,
 ) -> dict[str, object]:
     """
-    Construit price_source_daily_raw.
-
-    Stratégie actuelle:
-    - si la table price_source_daily_raw_yahoo existe et contient des lignes,
-      elle devient la source prioritaire
-    - sinon on retombe sur price_history comme source intermédiaire legacy,
-      uniquement pour réaligner le schéma dans la nouvelle canonical layer
-
-    Cette approche permet de corriger progressivement la situation du repo
-    sans casser les pipelines existants.
+    Construit price_source_daily_raw à partir de la meilleure source raw disponible.
     """
-    yahoo_exists = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-          AND table_name = 'price_source_daily_raw_yahoo'
-        """
-    ).fetchone()[0] > 0
-
-    yahoo_rows = 0
-    if yahoo_exists:
-        yahoo_rows = connection.execute(
-            "SELECT COUNT(*) FROM price_source_daily_raw_yahoo"
-        ).fetchone()[0]
-
-    price_history_exists = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-          AND table_name = 'price_history'
-        """
-    ).fetchone()[0] > 0
-
-    price_history_rows = 0
-    if price_history_exists:
-        price_history_rows = connection.execute(
-            "SELECT COUNT(*) FROM price_history"
-        ).fetchone()[0]
+    yahoo_rows = table_row_count(connection, "price_source_daily_raw_yahoo")
+    all_rows = table_row_count(connection, "price_source_daily_raw_all")
 
     connection.execute("DROP TABLE IF EXISTS price_source_daily_raw")
 
@@ -82,7 +63,7 @@ def build_price_source_daily_raw(
         FROM price_source_daily_raw_yahoo
         """
         source_mode = "price_source_daily_raw_yahoo"
-    elif price_history_rows > 0:
+    elif all_rows > 0:
         source_sql = """
         SELECT
             symbol,
@@ -95,13 +76,13 @@ def build_price_source_daily_raw(
             volume,
             source_name,
             ingested_at
-        FROM price_history
+        FROM price_source_daily_raw_all
         """
-        source_mode = "price_history_legacy_bridge"
+        source_mode = "price_source_daily_raw_all"
     else:
         raise RuntimeError(
-            "No usable Yahoo raw price source found. "
-            "Expected price_source_daily_raw_yahoo or price_history."
+            "No usable raw price source found. Expected populated "
+            "price_source_daily_raw_yahoo or price_source_daily_raw_all."
         )
 
     connection.execute(
@@ -153,9 +134,6 @@ def build_price_source_daily_raw(
 
 
 def main() -> None:
-    """
-    Exécution standalone pratique pour debug ponctuel.
-    """
     connection = duckdb.connect("market.duckdb")
     try:
         metrics = build_price_source_daily_raw(connection)
