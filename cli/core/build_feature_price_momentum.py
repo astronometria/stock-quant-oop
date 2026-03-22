@@ -2,22 +2,10 @@
 """
 Builder modulaire pour feature_price_momentum_daily.
 
-Objectif du refactor
---------------------
-Ce script ne doit plus devenir un gros fichier monolithique rempli
-d'indicateurs hardcodés. Il doit rester un orchestrateur mince qui:
-
-1. ouvre la base DuckDB
-2. vérifie la présence des tables source minimales
-3. charge le registre modulaire des indicateurs momentum
-4. assemble dynamiquement les expressions SQL
-5. construit / remplit feature_price_momentum_daily
-
-Principes
----------
-- garder la logique indicateur dans stock_quant.features.price_momentum.*
-- garder ici surtout l'orchestration, les validations, et l'I/O SQL
-- beaucoup de commentaires pour rendre le code facile à maintenir
+Version corrigée:
+- source canonique depuis price_bars_unadjusted / price_bars_adjusted / instrument_master
+- pas de nested window functions
+- RSI calculé en plusieurs étapes SQL compatibles DuckDB
 """
 
 from __future__ import annotations
@@ -32,12 +20,6 @@ from stock_quant.features.price_momentum.registry import ALL_SPECS
 
 
 def parse_args() -> argparse.Namespace:
-    """
-    Parse les arguments CLI.
-
-    On garde une interface simple et stable pour rester compatible avec
-    le reste du repo et les scripts existants.
-    """
     parser = argparse.ArgumentParser(
         description="Build modular feature_price_momentum_daily table."
     )
@@ -49,26 +31,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_source_table_exists(connection: duckdb.DuckDBPyConnection) -> None:
-    """
-    Vérifie que la table source utilisée par le builder existe.
-
-    Ici on part de l'hypothèse que le repo alimente price_history.
-    Si ton repo utilise un autre nom canonique plus tard, ce point sera
-    facile à adapter à un seul endroit.
-    """
+def table_exists(connection: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     row = connection.execute(
-        """
+        f"""
         SELECT COUNT(*)
         FROM information_schema.tables
-        WHERE table_name = 'price_history'
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND table_name = '{table_name}'
         """
     ).fetchone()
+    return bool(row and row[0] > 0)
 
-    if not row or row[0] == 0:
-        raise RuntimeError(
-            "Missing required source table: price_history"
-        )
+
+def ensure_required_tables_exist(connection: duckdb.DuckDBPyConnection) -> None:
+    required_tables = [
+        "price_bars_unadjusted",
+        "price_bars_adjusted",
+        "instrument_master",
+    ]
+    missing = [name for name in required_tables if not table_exists(connection, name)]
+    if missing:
+        raise RuntimeError(f"Missing required source tables: {missing}")
+
+
+def get_table_columns(
+    connection: duckdb.DuckDBPyConnection,
+    table_name: str,
+) -> set[str]:
+    rows = connection.execute(
+        f"""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND table_name = '{table_name}'
+        """
+    ).fetchall()
+    return {row[0] for row in rows}
 
 
 def ensure_required_columns_exist(
@@ -76,36 +74,53 @@ def ensure_required_columns_exist(
     table_name: str,
     required_columns: set[str],
 ) -> None:
-    """
-    Vérifie que les colonnes requises existent dans la table source.
-
-    C'est important pour échouer tôt et clairement si un indicateur
-    modulaire demande une colonne absente.
-    """
-    rows = connection.execute(
-        f"""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = '{table_name}'
-        """
-    ).fetchall()
-
-    existing = {row[0] for row in rows}
+    existing = get_table_columns(connection, table_name)
     missing = sorted(required_columns - existing)
-
     if missing:
-        raise RuntimeError(
-            f"Missing required columns in {table_name}: {missing}"
-        )
+        raise RuntimeError(f"Missing required columns in {table_name}: {missing}")
 
 
-def collect_required_columns() -> set[str]:
-    """
-    Agrège toutes les colonnes nécessaires aux specs momentum.
+def ensure_required_schema(connection: duckdb.DuckDBPyConnection) -> None:
+    ensure_required_tables_exist(connection)
 
-    On ajoute aussi les colonnes d'identité minimales requises par la table
-    de sortie.
-    """
+    ensure_required_columns_exist(
+        connection=connection,
+        table_name="price_bars_unadjusted",
+        required_columns={
+            "instrument_id",
+            "symbol",
+            "bar_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        },
+    )
+
+    ensure_required_columns_exist(
+        connection=connection,
+        table_name="price_bars_adjusted",
+        required_columns={
+            "instrument_id",
+            "symbol",
+            "bar_date",
+            "adj_close",
+        },
+    )
+
+    ensure_required_columns_exist(
+        connection=connection,
+        table_name="instrument_master",
+        required_columns={
+            "instrument_id",
+            "company_id",
+            "symbol",
+        },
+    )
+
+
+def collect_required_columns_for_base_source() -> set[str]:
     required = {
         "instrument_id",
         "company_id",
@@ -113,59 +128,73 @@ def collect_required_columns() -> set[str]:
         "as_of_date",
         "close",
     }
-
     for spec in ALL_SPECS:
         required.update(spec.required_input_columns)
-
     return required
 
 
 def build_dynamic_indicator_sql() -> str:
-    """
-    Construit le bloc SQL dynamique des indicateurs modulaires.
-
-    Chaque spec publie une ou plusieurs expressions SQL déjà aliasées.
-    On les concatène ici proprement.
-    """
     expressions: list[str] = []
-
     for spec in ALL_SPECS:
         for expression in spec.sql_select_expressions:
             expressions.append(expression)
-
-    # On indente légèrement pour garder un SQL lisible dans les logs/debug.
     return ",\n        ".join(expressions)
 
 
 def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
-    """
-    Construit complètement la table feature_price_momentum_daily.
+    ensure_required_schema(connection)
 
-    Stratégie simple:
-    - drop/create pour un premier refactor clair et robuste
-    - on pourra optimiser en incrémental plus tard quand la structure sera stable
-    """
-    ensure_source_table_exists(connection)
-
-    required_columns = collect_required_columns()
-    ensure_required_columns_exist(
-        connection=connection,
-        table_name="price_history",
-        required_columns=required_columns,
+    produced_base_columns = {
+        "instrument_id",
+        "company_id",
+        "symbol",
+        "as_of_date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "returns_1d",
+        "returns_5d",
+        "returns_20d",
+        "rsi_14",
+    }
+    missing_from_builder_contract = sorted(
+        collect_required_columns_for_base_source() - produced_base_columns
     )
+    if missing_from_builder_contract:
+        raise RuntimeError(
+            "The modular momentum specs require columns not yet produced by "
+            f"this builder contract: {missing_from_builder_contract}"
+        )
 
     dynamic_indicator_sql = build_dynamic_indicator_sql()
 
     connection.execute("DROP TABLE IF EXISTS feature_price_momentum_daily")
 
-    # Notes importantes:
-    # - "price_w" est utilisé par plusieurs specs modulaires
-    # - on calcule ici des colonnes de base déjà existantes dans l'ancien monde
-    #   (returns_1d, returns_5d, returns_20d, rsi_14) + les nouvelles via registre
-    # - cette version privilégie la clarté à l'optimisation maximale
     sql = f"""
     CREATE TABLE feature_price_momentum_daily AS
-    WITH base AS (
+    WITH canonical_prices AS (
+        SELECT
+            u.instrument_id AS instrument_id,
+            im.company_id AS company_id,
+            u.symbol AS symbol,
+            u.bar_date AS as_of_date,
+            u.open AS open,
+            u.high AS high,
+            u.low AS low,
+            COALESCE(a.adj_close, u.close) AS close,
+            u.volume AS volume
+        FROM price_bars_unadjusted u
+        LEFT JOIN price_bars_adjusted a
+            ON u.instrument_id = a.instrument_id
+           AND u.symbol = a.symbol
+           AND u.bar_date = a.bar_date
+        LEFT JOIN instrument_master im
+            ON u.instrument_id = im.instrument_id
+    ),
+
+    lagged AS (
         SELECT
             instrument_id,
             company_id,
@@ -177,49 +206,88 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
             close,
             volume,
 
-            CASE
-                WHEN LAG(close, 1) OVER price_w IS NULL
-                  OR LAG(close, 1) OVER price_w = 0
-                THEN NULL
-                ELSE (close / LAG(close, 1) OVER price_w) - 1
-            END AS returns_1d,
+            LAG(close, 1) OVER price_w AS prev_close,
+            LAG(close, 5) OVER price_w AS close_lag_5,
+            LAG(close, 20) OVER price_w AS close_lag_20
 
-            CASE
-                WHEN LAG(close, 5) OVER price_w IS NULL
-                  OR LAG(close, 5) OVER price_w = 0
-                THEN NULL
-                ELSE (close / LAG(close, 5) OVER price_w) - 1
-            END AS returns_5d,
-
-            CASE
-                WHEN LAG(close, 20) OVER price_w IS NULL
-                  OR LAG(close, 20) OVER price_w = 0
-                THEN NULL
-                ELSE (close / LAG(close, 20) OVER price_w) - 1
-            END AS returns_20d,
-
-            AVG(
-                GREATEST(close - LAG(close, 1) OVER price_w, 0)
-            ) OVER (
-                PARTITION BY symbol
-                ORDER BY as_of_date
-                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
-            ) AS avg_gain_14,
-
-            AVG(
-                GREATEST(LAG(close, 1) OVER price_w - close, 0)
-            ) OVER (
-                PARTITION BY symbol
-                ORDER BY as_of_date
-                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
-            ) AS avg_loss_14
-
-        FROM price_history
+        FROM canonical_prices
         WINDOW price_w AS (
             PARTITION BY symbol
             ORDER BY as_of_date
         )
     ),
+
+    returns_stage AS (
+        SELECT
+            instrument_id,
+            company_id,
+            symbol,
+            as_of_date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            prev_close,
+
+            CASE
+                WHEN prev_close IS NULL OR prev_close = 0 THEN NULL
+                ELSE (close / prev_close) - 1
+            END AS returns_1d,
+
+            CASE
+                WHEN close_lag_5 IS NULL OR close_lag_5 = 0 THEN NULL
+                ELSE (close / close_lag_5) - 1
+            END AS returns_5d,
+
+            CASE
+                WHEN close_lag_20 IS NULL OR close_lag_20 = 0 THEN NULL
+                ELSE (close / close_lag_20) - 1
+            END AS returns_20d,
+
+            CASE
+                WHEN prev_close IS NULL THEN NULL
+                ELSE GREATEST(close - prev_close, 0)
+            END AS gain_1d,
+
+            CASE
+                WHEN prev_close IS NULL THEN NULL
+                ELSE GREATEST(prev_close - close, 0)
+            END AS loss_1d
+
+        FROM lagged
+    ),
+
+    rsi_stage AS (
+        SELECT
+            instrument_id,
+            company_id,
+            symbol,
+            as_of_date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            returns_1d,
+            returns_5d,
+            returns_20d,
+
+            AVG(gain_1d) OVER (
+                PARTITION BY symbol
+                ORDER BY as_of_date
+                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+            ) AS avg_gain_14,
+
+            AVG(loss_1d) OVER (
+                PARTITION BY symbol
+                ORDER BY as_of_date
+                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
+            ) AS avg_loss_14
+
+        FROM returns_stage
+    ),
+
     enriched AS (
         SELECT
             instrument_id,
@@ -229,7 +297,6 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
             close,
             high,
             low,
-
             returns_1d,
             returns_5d,
             returns_20d,
@@ -241,13 +308,15 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
                 ELSE 100 - (100 / (1 + (avg_gain_14 / avg_loss_14)))
             END AS rsi_14
 
-        FROM base
+        FROM rsi_stage
     )
+
     SELECT
         instrument_id,
         company_id,
         symbol,
         as_of_date,
+        close,
         returns_1d,
         returns_5d,
         returns_20d,
@@ -268,7 +337,8 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
             COUNT(*) AS rows_written,
             MIN(as_of_date) AS min_date,
             MAX(as_of_date) AS max_date,
-            COUNT(DISTINCT symbol) AS symbol_count
+            COUNT(DISTINCT symbol) AS symbol_count,
+            COUNT(DISTINCT instrument_id) AS instrument_count
         FROM feature_price_momentum_daily
         """
     ).fetchone()
@@ -279,6 +349,14 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
         "min_date": str(metrics_row[1]) if metrics_row[1] is not None else None,
         "max_date": str(metrics_row[2]) if metrics_row[2] is not None else None,
         "symbol_count": metrics_row[3],
+        "instrument_count": metrics_row[4],
+        "source_contract": {
+            "price_source_unadjusted": "price_bars_unadjusted",
+            "price_source_adjusted": "price_bars_adjusted",
+            "identity_source": "instrument_master",
+            "date_column": "bar_date -> as_of_date",
+            "close_rule": "COALESCE(adj_close, close)",
+        },
         "indicators_loaded": [spec.name for spec in ALL_SPECS],
         "output_columns_added": [
             column_name
@@ -289,9 +367,6 @@ def build_table(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
 
 
 def main() -> None:
-    """
-    Point d'entrée principal du builder.
-    """
     args = parse_args()
     db_path = Path(args.db_path)
 
