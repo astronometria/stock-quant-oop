@@ -24,4 +24,4 @@ data/
 logs/*
 !logs/.gitkeep
 !logs/*rebuild*
-!logs/*audit*
+!logs/*audit**.bak2*.bak3*.bak4*.bak5*.bak6*.bak7*.bak8

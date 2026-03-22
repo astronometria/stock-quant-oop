@@ -178,7 +178,7 @@ class BuildShortInterestPipeline:
 
         return False, "already_up_to_date"
 
-    def _build_payload(
+        def _build_payload(
         self,
         *,
         status: str,
@@ -188,7 +188,7 @@ class BuildShortInterestPipeline:
         rows_written: int,
         error_message: str | None,
         metrics: dict[str, Any],
-        ) -> dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Construit un payload canonique pour run_pipeline(...).
 
@@ -198,13 +198,13 @@ class BuildShortInterestPipeline:
         - le runner partagé convertit ensuite ce payload en PipelineResult
         """
         return {
-        "status": status,
-        "rows_read": rows_read,
-        "rows_written": rows_written,
-        "rows_skipped": 0,
-        "warnings": [],
-        "metrics": metrics,
-        "error_message": error_message,
+            "status": status,
+            "rows_read": rows_read,
+            "rows_written": rows_written,
+            "rows_skipped": 0,
+            "warnings": [],
+            "metrics": metrics,
+            "error_message": error_message,
         }
 
     def _run_impl(self) -> dict[str, Any]:

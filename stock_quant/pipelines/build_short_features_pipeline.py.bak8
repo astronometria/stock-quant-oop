@@ -78,7 +78,7 @@ class BuildShortFeaturesPipeline:
         except Exception:
             return None
 
-    def _build_payload(
+        def _build_payload(
         self,
         *,
         status: str,
@@ -88,7 +88,7 @@ class BuildShortFeaturesPipeline:
         rows_written: int,
         error_message: str | None,
         metrics: dict[str, Any],
-        ) -> dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Construit un payload canonique pour run_pipeline(...).
 
@@ -98,13 +98,13 @@ class BuildShortFeaturesPipeline:
         - le runner partagé convertit ensuite ce payload en PipelineResult
         """
         return {
-        "status": status,
-        "rows_read": rows_read,
-        "rows_written": rows_written,
-        "rows_skipped": 0,
-        "warnings": [],
-        "metrics": metrics,
-        "error_message": error_message,
+            "status": status,
+            "rows_read": rows_read,
+            "rows_written": rows_written,
+            "rows_skipped": 0,
+            "warnings": [],
+            "metrics": metrics,
+            "error_message": error_message,
         }
 
     def _table_columns(self, table_name: str) -> set[str]:

@@ -75,7 +75,7 @@ class BuildDailyShortVolumePipeline:
                     f"ALTER TABLE daily_short_volume_history ADD COLUMN {column_name} {column_type}"
                 )
 
-    def _build_payload(
+        def _build_payload(
         self,
         *,
         status: str,
@@ -85,7 +85,7 @@ class BuildDailyShortVolumePipeline:
         rows_written: int,
         error_message: str | None,
         metrics: dict[str, Any],
-        ) -> dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Construit un payload canonique pour run_pipeline(...).
 
@@ -95,13 +95,13 @@ class BuildDailyShortVolumePipeline:
         - le runner partagé convertit ensuite ce payload en PipelineResult
         """
         return {
-        "status": status,
-        "rows_read": rows_read,
-        "rows_written": rows_written,
-        "rows_skipped": 0,
-        "warnings": [],
-        "metrics": metrics,
-        "error_message": error_message,
+            "status": status,
+            "rows_read": rows_read,
+            "rows_written": rows_written,
+            "rows_skipped": 0,
+            "warnings": [],
+            "metrics": metrics,
+            "error_message": error_message,
         }
 
     def _run_impl(self) -> dict[str, Any]:
