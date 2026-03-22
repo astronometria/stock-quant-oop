@@ -1,13 +1,15 @@
 """
-Indicateur distance_from_252d_high.
+Momentum indicator: distance_from_252d_high.
 """
 
 from __future__ import annotations
 
-from stock_quant.features.price_momentum.base import momentum_spec
+from stock_quant.features.contracts import IndicatorSpec
 
-SPEC = momentum_spec(
+SPEC = IndicatorSpec(
     name="distance_from_252d_high",
+    group_name="price_momentum",
+    required_columns=["close"],
     output_columns=["distance_from_252d_high"],
     sql_select_expressions=[
         """
@@ -26,5 +28,4 @@ SPEC = momentum_spec(
         END AS distance_from_252d_high
         """.strip()
     ],
-    required_input_columns=["symbol", "as_of_date", "close"],
 )

@@ -1,26 +1,24 @@
 """
-Indicateur returns_10d.
-
-Hypothèse:
-- la table source contient déjà close et les lignes sont une série journalière
-  par symbole triées par as_of_date.
-- le calcul final sera injecté dans une requête SQL window.
+Momentum indicator: returns_10d.
 """
 
 from __future__ import annotations
 
-from stock_quant.features.price_momentum.base import momentum_spec
+from stock_quant.features.contracts import IndicatorSpec
 
-SPEC = momentum_spec(
+SPEC = IndicatorSpec(
     name="returns_10d",
+    group_name="price_momentum",
+    required_columns=["close"],
     output_columns=["returns_10d"],
     sql_select_expressions=[
         """
         CASE
-            WHEN LAG(close, 10) OVER price_w IS NULL OR LAG(close, 10) OVER price_w = 0 THEN NULL
+            WHEN LAG(close, 10) OVER price_w IS NULL
+              OR LAG(close, 10) OVER price_w = 0
+            THEN NULL
             ELSE (close / LAG(close, 10) OVER price_w) - 1
         END AS returns_10d
         """.strip()
     ],
-    required_input_columns=["symbol", "as_of_date", "close"],
 )

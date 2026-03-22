@@ -1,13 +1,15 @@
 """
-Indicateur williams_r_14.
+Momentum indicator: williams_r_14.
 """
 
 from __future__ import annotations
 
-from stock_quant.features.price_momentum.base import momentum_spec
+from stock_quant.features.contracts import IndicatorSpec
 
-SPEC = momentum_spec(
+SPEC = IndicatorSpec(
     name="williams_r_14",
+    group_name="price_momentum",
+    required_columns=["high", "low", "close"],
     output_columns=["williams_r_14"],
     sql_select_expressions=[
         """
@@ -46,5 +48,4 @@ SPEC = momentum_spec(
         END AS williams_r_14
         """.strip()
     ],
-    required_input_columns=["symbol", "as_of_date", "high", "low", "close"],
 )

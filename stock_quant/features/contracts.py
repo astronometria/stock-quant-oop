@@ -1,11 +1,16 @@
 """
 Contrats communs pour les indicateurs modulaires.
 
-Le but est d'avoir une petite interface stable:
-- nom technique de l'indicateur
-- nom de la colonne produite
-- expression SQL à projeter
-- dépendances éventuelles
+On garde un contrat très simple :
+- nom stable de l'indicateur
+- groupe fonctionnel
+- colonnes nécessaires en entrée
+- colonnes produites en sortie
+- expressions SQL à injecter dans le builder
+
+Le but est de permettre à un builder de groupe
+(momentum / trend / volatility / short / etc.)
+de lire un registre unique et d'assembler sa projection SQL.
 """
 
 from __future__ import annotations
@@ -15,54 +20,61 @@ from typing import Iterable, Sequence
 
 
 @dataclass(frozen=True)
-class FeatureIndicatorSpec:
+class IndicatorSpec:
     """
-    Décrit un indicateur modulaire.
+    Décrit un indicateur modulaire calculé par SQL.
 
     name:
-        Nom interne stable de l'indicateur.
+        Nom technique unique et stable.
+    group_name:
+        Nom du groupe logique, ex: price_momentum.
+    required_columns:
+        Colonnes attendues dans le dataset de travail du builder.
     output_columns:
-        Colonnes produites par l'indicateur.
+        Colonnes produites par cet indicateur.
     sql_select_expressions:
-        Expressions SQL à injecter dans un SELECT.
-        Chaque entrée doit déjà contenir son alias SQL final.
-    required_input_columns:
-        Colonnes minimales attendues dans la source.
+        Expressions SQL déjà aliasées, injectées dans un SELECT.
     """
     name: str
+    group_name: str
+    required_columns: Sequence[str]
     output_columns: Sequence[str]
-    sql_select_expressions: Sequence[str]
-    required_input_columns: Sequence[str] = field(default_factory=tuple)
+    sql_select_expressions: Sequence[str] = field(default_factory=tuple)
 
     def validate(self) -> None:
         """
-        Validation minimale défensive pour éviter de casser l'orchestrateur.
+        Validation défensive minimale.
         """
-        if not self.name.strip():
-            raise ValueError("FeatureIndicatorSpec.name cannot be empty")
+        if not self.name or not self.name.strip():
+            raise ValueError("IndicatorSpec.name cannot be empty")
+        if not self.group_name or not self.group_name.strip():
+            raise ValueError(f"{self.name}: group_name cannot be empty")
         if not self.output_columns:
             raise ValueError(f"{self.name}: output_columns cannot be empty")
         if not self.sql_select_expressions:
             raise ValueError(f"{self.name}: sql_select_expressions cannot be empty")
 
 
-def validate_specs(specs: Iterable[FeatureIndicatorSpec]) -> list[FeatureIndicatorSpec]:
+def validate_indicator_specs(specs: Iterable[IndicatorSpec]) -> list[IndicatorSpec]:
     """
-    Valide une liste de specs et retourne une liste matérialisée.
+    Valide une liste de specs et détecte les doublons dangereux.
     """
     materialized = list(specs)
     seen_names: set[str] = set()
-    seen_outputs: set[str] = set()
+    seen_output_columns: set[str] = set()
 
     for spec in materialized:
         spec.validate()
+
         if spec.name in seen_names:
-            raise ValueError(f"Duplicate indicator name: {spec.name}")
+            raise ValueError(f"Duplicate indicator name detected: {spec.name}")
         seen_names.add(spec.name)
 
-        for output in spec.output_columns:
-            if output in seen_outputs:
-                raise ValueError(f"Duplicate output column: {output}")
-            seen_outputs.add(output)
+        for column_name in spec.output_columns:
+            if column_name in seen_output_columns:
+                raise ValueError(
+                    f"Duplicate output column detected: {column_name}"
+                )
+            seen_output_columns.add(column_name)
 
     return materialized

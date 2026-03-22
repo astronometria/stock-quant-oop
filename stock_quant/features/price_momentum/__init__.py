@@ -1,3 +1,3 @@
 """
-Groupe d'indicateurs de momentum prix.
+Momentum indicators package.
 """

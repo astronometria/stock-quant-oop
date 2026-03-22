@@ -1,21 +1,24 @@
 """
-Indicateur returns_60d.
+Momentum indicator: returns_60d.
 """
 
 from __future__ import annotations
 
-from stock_quant.features.price_momentum.base import momentum_spec
+from stock_quant.features.contracts import IndicatorSpec
 
-SPEC = momentum_spec(
+SPEC = IndicatorSpec(
     name="returns_60d",
+    group_name="price_momentum",
+    required_columns=["close"],
     output_columns=["returns_60d"],
     sql_select_expressions=[
         """
         CASE
-            WHEN LAG(close, 60) OVER price_w IS NULL OR LAG(close, 60) OVER price_w = 0 THEN NULL
+            WHEN LAG(close, 60) OVER price_w IS NULL
+              OR LAG(close, 60) OVER price_w = 0
+            THEN NULL
             ELSE (close / LAG(close, 60) OVER price_w) - 1
         END AS returns_60d
         """.strip()
     ],
-    required_input_columns=["symbol", "as_of_date", "close"],
 )
