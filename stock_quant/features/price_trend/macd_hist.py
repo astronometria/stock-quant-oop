@@ -1,21 +1,22 @@
 """
-Indicateur macd_hist.
-
-Note:
-- ce fichier prépare seulement l'expression finale.
-- si le pipeline ne calcule pas encore ema_12 / ema_26 / macd_signal, il faudra
-  les ajouter dans la requête amont du builder trend.
+Trend indicator: macd_hist.
 """
 
 from __future__ import annotations
 
-from stock_quant.features.price_trend.base import trend_spec
+from stock_quant.features.contracts import IndicatorSpec
 
-SPEC = trend_spec(
+SPEC = IndicatorSpec(
     name="macd_hist",
+    group_name="price_trend",
+    required_columns=["macd_line", "macd_signal"],
     output_columns=["macd_hist"],
     sql_select_expressions=[
-        "(macd_line - macd_signal) AS macd_hist"
+        """
+        CASE
+            WHEN macd_line IS NULL OR macd_signal IS NULL THEN NULL
+            ELSE macd_line - macd_signal
+        END AS macd_hist
+        """.strip()
     ],
-    required_input_columns=["macd_line", "macd_signal"],
 )

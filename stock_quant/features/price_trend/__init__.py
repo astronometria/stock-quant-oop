@@ -1,3 +1,3 @@
 """
-Groupe d'indicateurs de trend prix.
+Trend indicators package.
 """
