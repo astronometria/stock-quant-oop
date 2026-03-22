@@ -1,8 +1,0 @@
-===== DATE =====
-Mon 16 Mar 2026 06:52:20 PM EDT
-===== COMPILE TARGET =====
-
-===== IMPORT CHECK =====
-pipeline OK: <class 'stock_quant.pipelines.build_sec_fact_normalized_pipeline.BuildSecFactNormalizedPipeline'>
-cli OK: <function main at 0x770a8615b6d0>
-===== DONE =====
