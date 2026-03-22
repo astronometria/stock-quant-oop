@@ -1,0 +1,673 @@
+from __future__ import annotations
+
+"""
+Canonical SQL-first builder for short_features_daily.
+
+Version incrémentale
+--------------------
+Objectif:
+- lire les sources canoniques:
+    - daily_short_volume_history
+    - finra_short_interest_history
+- recalculer uniquement une fenêtre récente
+- upsert cette fenêtre dans short_features_daily
+
+Pourquoi une fenêtre de recouvrement
+------------------------------------
+Les features short utilisent:
+- des rolling windows 20 jours
+- des as-of joins PIT-safe sur short interest
+
+Donc un mode "strict > max(as_of_date)" serait fragile.
+On recalcule une fenêtre glissante suffisamment large pour:
+- laisser respirer les rolling metrics
+- absorber les arrivées tardives / corrections
+- garder le job quotidien rapide
+
+Convention
+----------
+- overlap_days = 45
+  Couvre largement:
+  - rolling 20 jours
+  - quelques jours de correction / retard
+"""
+
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from stock_quant.app.dto.pipeline_result import PipelineResult
+from stock_quant.shared.pipeline_runner import run_pipeline
+
+
+class BuildShortFeaturesPipeline:
+    pipeline_name = "build_short_features"
+    overlap_days = 45
+
+    def __init__(self, con) -> None:
+        self.con = con
+        self._progress_total_steps = 6
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _log_step(self, step_no: int, label: str) -> None:
+        print(
+            f"[build_short_features] step {step_no}/{self._progress_total_steps}: {label}",
+            flush=True,
+        )
+
+    def _safe_scalar(self, sql: str, default: int = 0) -> int:
+        try:
+            row = self.con.execute(sql).fetchone()
+            if not row:
+                return default
+            value = row[0]
+            if value is None:
+                return default
+            return int(value)
+        except Exception:
+            return default
+
+    def _safe_optional_scalar(self, sql: str) -> Any:
+        try:
+            row = self.con.execute(sql).fetchone()
+            if not row:
+                return None
+            return row[0]
+        except Exception:
+            return None
+
+        def _build_payload(
+        self,
+        *,
+        status: str,
+        started_at: datetime,
+        finished_at: datetime,
+        rows_read: int,
+        rows_written: int,
+        error_message: str | None,
+        metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Construit un payload canonique pour run_pipeline(...).
+
+        IMPORTANT:
+        - aucune construction directe de PipelineResult ici
+        - les statuts métier comme noop/skipped restent visibles
+        - le runner partagé convertit ensuite ce payload en PipelineResult
+        """
+        return {
+            "status": status,
+            "rows_read": rows_read,
+            "rows_written": rows_written,
+            "rows_skipped": 0,
+            "warnings": [],
+            "metrics": metrics,
+            "error_message": error_message,
+        }
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        rows = self.con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+        return {str(row[1]).strip().lower() for row in rows}
+
+    def _ensure_required_tables(self) -> None:
+        required = {
+            "daily_short_volume_history",
+            "finra_short_interest_history",
+            "short_features_daily",
+        }
+        existing = {
+            str(row[0]).strip().lower()
+            for row in self.con.execute("SHOW TABLES").fetchall()
+        }
+        missing = [name for name in required if name.lower() not in existing]
+        if missing:
+            raise RuntimeError(f"missing required tables: {', '.join(sorted(missing))}")
+
+    def _has_symbol_normalization(self) -> bool:
+        existing = {
+            str(row[0]).strip().lower()
+            for row in self.con.execute("SHOW TABLES").fetchall()
+        }
+        return "symbol_normalization" in existing
+
+    def _window_start_date(self) -> Any:
+        """
+        Si short_features_daily est vide -> full rebuild.
+        Sinon on repart de max(as_of_date) - overlap_days.
+        """
+        return self.con.execute(
+            f"""
+            SELECT
+                CASE
+                    WHEN MAX(as_of_date) IS NULL THEN DATE '1900-01-01'
+                    ELSE CAST(MAX(as_of_date) - INTERVAL '{self.overlap_days} days' AS DATE)
+                END AS window_start_date
+            FROM short_features_daily
+            """
+        ).fetchone()[0]
+
+    def _create_temp_daily_enriched(self, window_start_date: Any) -> int:
+        """
+        Phase 1:
+        - agrège daily_short_volume_history à grain (symbol normalisé, as_of_date)
+        - calcule les rolling metrics
+        - conserve max_source_available_at pour le PIT join
+        - limite la source à la fenêtre utile
+        """
+        self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_daily_enriched")
+
+        if self._has_symbol_normalization():
+            norm_map_cte = """
+            norm_map AS (
+                SELECT
+                    UPPER(TRIM(raw_symbol)) AS raw_symbol,
+                    UPPER(TRIM(normalized_symbol)) AS normalized_symbol
+                FROM symbol_normalization
+                WHERE is_active = TRUE
+            ),
+            """
+            daily_symbol_expr = "COALESCE(n.normalized_symbol, UPPER(TRIM(d.symbol)))"
+            norm_join = "LEFT JOIN norm_map AS n ON UPPER(TRIM(d.symbol)) = n.raw_symbol"
+        else:
+            norm_map_cte = ""
+            daily_symbol_expr = "UPPER(TRIM(d.symbol))"
+            norm_join = ""
+
+        self.con.execute(
+            f"""
+            CREATE TEMP TABLE tmp_short_feature_daily_enriched AS
+            WITH
+            {norm_map_cte}
+            daily_agg AS (
+                SELECT
+                    {daily_symbol_expr} AS symbol,
+                    d.trade_date AS as_of_date,
+                    SUM(COALESCE(d.short_volume, 0.0)) AS short_volume,
+                    SUM(COALESCE(d.short_exempt_volume, 0.0)) AS short_exempt_volume,
+                    SUM(COALESCE(d.total_volume, 0.0)) AS total_volume,
+                    MAX(d.available_at) AS max_source_available_at
+                FROM daily_short_volume_history AS d
+                {norm_join}
+                WHERE d.symbol IS NOT NULL
+                  AND TRIM(d.symbol) <> ''
+                  AND d.trade_date IS NOT NULL
+                  AND d.trade_date >= CAST(? AS DATE)
+                GROUP BY {daily_symbol_expr}, d.trade_date
+            ),
+            daily_roll AS (
+                SELECT
+                    a.symbol,
+                    a.as_of_date,
+                    a.short_volume,
+                    a.short_exempt_volume,
+                    a.total_volume,
+                    CASE
+                        WHEN a.total_volume > 0 THEN a.short_volume / a.total_volume
+                        ELSE NULL
+                    END AS short_volume_ratio,
+                    AVG(a.short_volume) OVER (
+                        PARTITION BY a.symbol
+                        ORDER BY a.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS short_volume_20d_avg,
+                    AVG(
+                        CASE
+                            WHEN a.total_volume > 0 THEN a.short_volume / a.total_volume
+                            ELSE NULL
+                        END
+                    ) OVER (
+                        PARTITION BY a.symbol
+                        ORDER BY a.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS short_volume_ratio_20d_avg,
+                    STDDEV_SAMP(
+                        CASE
+                            WHEN a.total_volume > 0 THEN a.short_volume / a.total_volume
+                            ELSE NULL
+                        END
+                    ) OVER (
+                        PARTITION BY a.symbol
+                        ORDER BY a.as_of_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS short_volume_ratio_20d_std,
+                    a.max_source_available_at
+                FROM daily_agg AS a
+            )
+            SELECT
+                symbol,
+                as_of_date,
+                short_volume,
+                short_exempt_volume,
+                total_volume,
+                short_volume_ratio,
+                short_volume_20d_avg,
+                short_volume_ratio_20d_avg,
+                short_volume_ratio_20d_std,
+                max_source_available_at
+            FROM daily_roll
+            """,
+            [window_start_date],
+        )
+
+        return self._safe_scalar(
+            "SELECT COUNT(*) FROM tmp_short_feature_daily_enriched",
+            0,
+        )
+
+    def _create_temp_short_interest_norm(self) -> None:
+        """
+        Normalise short interest une seule fois pour éviter de répéter la logique.
+        """
+        self.con.execute("DROP TABLE IF EXISTS tmp_short_interest_norm")
+
+        if self._has_symbol_normalization():
+            self.con.execute(
+                """
+                CREATE TEMP TABLE tmp_short_interest_norm AS
+                WITH norm_map AS (
+                    SELECT
+                        UPPER(TRIM(raw_symbol)) AS raw_symbol,
+                        UPPER(TRIM(normalized_symbol)) AS normalized_symbol
+                    FROM symbol_normalization
+                    WHERE is_active = TRUE
+                )
+                SELECT
+                    COALESCE(n.normalized_symbol, UPPER(TRIM(s.symbol))) AS symbol,
+                    s.settlement_date,
+                    s.short_interest,
+                    s.previous_short_interest,
+                    s.avg_daily_volume,
+                    s.days_to_cover,
+                    s.shares_float,
+                    s.short_interest_pct_float,
+                    s.ingested_at
+                FROM finra_short_interest_history AS s
+                LEFT JOIN norm_map AS n
+                  ON UPPER(TRIM(s.symbol)) = n.raw_symbol
+                WHERE s.symbol IS NOT NULL
+                  AND TRIM(s.symbol) <> ''
+                  AND s.settlement_date IS NOT NULL
+                """
+            )
+        else:
+            self.con.execute(
+                """
+                CREATE TEMP TABLE tmp_short_interest_norm AS
+                SELECT
+                    UPPER(TRIM(s.symbol)) AS symbol,
+                    s.settlement_date,
+                    s.short_interest,
+                    s.previous_short_interest,
+                    s.avg_daily_volume,
+                    s.days_to_cover,
+                    s.shares_float,
+                    s.short_interest_pct_float,
+                    s.ingested_at
+                FROM finra_short_interest_history AS s
+                WHERE s.symbol IS NOT NULL
+                  AND TRIM(s.symbol) <> ''
+                  AND s.settlement_date IS NOT NULL
+                """
+            )
+
+    def _month_starts(self) -> list[Any]:
+        rows = self.con.execute(
+            """
+            SELECT DISTINCT date_trunc('month', as_of_date)::DATE AS month_start
+            FROM tmp_short_feature_daily_enriched
+            ORDER BY month_start
+            """
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def _delete_target_window(self, window_start_date: Any) -> int:
+        before = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        self.con.execute(
+            """
+            DELETE FROM short_features_daily
+            WHERE as_of_date >= CAST(? AS DATE)
+            """,
+            [window_start_date],
+        )
+        after = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+        return max(0, before - after)
+
+    def _insert_window_months(self) -> dict[str, int]:
+        """
+        Phase 2:
+        - insertion batchée par mois pour la seule fenêtre recalculée
+        """
+        inserted_total = 0
+        month_starts = self._month_starts()
+        month_batch_count = len(month_starts)
+
+        for idx, month_start in enumerate(month_starts, start=1):
+            if idx == 1 or idx == month_batch_count or idx % 12 == 0:
+                print(
+                    f"[build_short_features] month_batch {idx}/{month_batch_count}: {month_start}",
+                    flush=True,
+                )
+
+            before_batch = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+
+            self.con.execute(
+                """
+                INSERT INTO short_features_daily (
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    short_volume,
+                    short_exempt_volume,
+                    total_volume,
+                    short_volume_ratio,
+                    short_interest,
+                    previous_short_interest,
+                    avg_daily_volume,
+                    days_to_cover,
+                    shares_float,
+                    short_interest_pct_float,
+                    short_interest_change,
+                    short_interest_change_pct,
+                    short_volume_20d_avg,
+                    short_volume_ratio_20d_avg,
+                    days_to_cover_zscore,
+                    short_pressure_zscore,
+                    short_squeeze_score,
+                    max_source_available_at,
+                    created_at,
+                    updated_at
+                )
+                WITH month_daily AS (
+                    SELECT *
+                    FROM tmp_short_feature_daily_enriched
+                    WHERE date_trunc('month', as_of_date)::DATE = ?
+                ),
+                short_interest_asof AS (
+                    SELECT
+                        d.symbol,
+                        d.as_of_date,
+                        d.max_source_available_at,
+                        s.short_interest,
+                        s.previous_short_interest,
+                        s.avg_daily_volume,
+                        s.days_to_cover,
+                        s.shares_float,
+                        s.short_interest_pct_float,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY d.symbol, d.as_of_date
+                            ORDER BY s.settlement_date DESC, s.ingested_at DESC
+                        ) AS rn
+                    FROM month_daily AS d
+                    LEFT JOIN tmp_short_interest_norm AS s
+                      ON s.symbol = d.symbol
+                     AND s.settlement_date <= d.as_of_date
+                     AND s.ingested_at <= d.max_source_available_at
+                ),
+                joined AS (
+                    SELECT
+                        d.symbol,
+                        d.as_of_date,
+                        d.short_volume,
+                        d.short_exempt_volume,
+                        d.total_volume,
+                        d.short_volume_ratio,
+                        d.short_volume_20d_avg,
+                        d.short_volume_ratio_20d_avg,
+                        d.short_volume_ratio_20d_std,
+                        d.max_source_available_at,
+                        s.short_interest,
+                        s.previous_short_interest,
+                        s.avg_daily_volume,
+                        s.days_to_cover,
+                        s.shares_float,
+                        s.short_interest_pct_float
+                    FROM month_daily AS d
+                    LEFT JOIN short_interest_asof AS s
+                      ON d.symbol = s.symbol
+                     AND d.as_of_date = s.as_of_date
+                     AND s.rn = 1
+                ),
+                scored AS (
+                    SELECT
+                        CAST(NULL AS VARCHAR) AS instrument_id,
+                        CAST(NULL AS VARCHAR) AS company_id,
+                        j.symbol,
+                        j.as_of_date,
+                        j.short_volume,
+                        j.short_exempt_volume,
+                        j.total_volume,
+                        j.short_volume_ratio,
+                        j.short_interest,
+                        j.previous_short_interest,
+                        j.avg_daily_volume,
+                        j.days_to_cover,
+                        j.shares_float,
+                        j.short_interest_pct_float,
+                        CASE
+                            WHEN j.short_interest IS NOT NULL
+                             AND j.previous_short_interest IS NOT NULL
+                            THEN j.short_interest - j.previous_short_interest
+                            ELSE NULL
+                        END AS short_interest_change,
+                        CASE
+                            WHEN j.short_interest IS NOT NULL
+                             AND j.previous_short_interest IS NOT NULL
+                             AND j.previous_short_interest <> 0
+                            THEN (j.short_interest - j.previous_short_interest) / j.previous_short_interest
+                            ELSE NULL
+                        END AS short_interest_change_pct,
+                        j.short_volume_20d_avg,
+                        j.short_volume_ratio_20d_avg,
+                        CASE
+                            WHEN j.days_to_cover IS NULL THEN NULL
+                            ELSE (
+                                j.days_to_cover
+                                - AVG(j.days_to_cover) OVER (
+                                    PARTITION BY j.symbol
+                                    ORDER BY j.as_of_date
+                                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                                )
+                            ) / NULLIF(
+                                STDDEV_SAMP(j.days_to_cover) OVER (
+                                    PARTITION BY j.symbol
+                                    ORDER BY j.as_of_date
+                                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                                ),
+                                0
+                            )
+                        END AS days_to_cover_zscore,
+                        CASE
+                            WHEN j.short_volume_ratio IS NULL THEN NULL
+                            ELSE (
+                                j.short_volume_ratio - j.short_volume_ratio_20d_avg
+                            ) / NULLIF(j.short_volume_ratio_20d_std, 0)
+                        END AS short_pressure_zscore,
+                        CASE
+                            WHEN j.days_to_cover IS NULL
+                             AND j.short_volume_ratio IS NULL
+                            THEN NULL
+                            ELSE
+                                COALESCE(
+                                    (
+                                        j.short_volume_ratio - j.short_volume_ratio_20d_avg
+                                    ) / NULLIF(j.short_volume_ratio_20d_std, 0),
+                                    0
+                                )
+                                +
+                                COALESCE(
+                                    (
+                                        j.days_to_cover
+                                        - AVG(j.days_to_cover) OVER (
+                                            PARTITION BY j.symbol
+                                            ORDER BY j.as_of_date
+                                            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                                        )
+                                    ) / NULLIF(
+                                        STDDEV_SAMP(j.days_to_cover) OVER (
+                                            PARTITION BY j.symbol
+                                            ORDER BY j.as_of_date
+                                            ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                                        ),
+                                        0
+                                    ),
+                                    0
+                                )
+                        END AS short_squeeze_score,
+                        j.max_source_available_at,
+                        CURRENT_TIMESTAMP AS created_at,
+                        CURRENT_TIMESTAMP AS updated_at
+                    FROM joined AS j
+                )
+                SELECT
+                    instrument_id,
+                    company_id,
+                    symbol,
+                    as_of_date,
+                    short_volume,
+                    short_exempt_volume,
+                    total_volume,
+                    short_volume_ratio,
+                    short_interest,
+                    previous_short_interest,
+                    avg_daily_volume,
+                    days_to_cover,
+                    shares_float,
+                    short_interest_pct_float,
+                    short_interest_change,
+                    short_interest_change_pct,
+                    short_volume_20d_avg,
+                    short_volume_ratio_20d_avg,
+                    days_to_cover_zscore,
+                    short_pressure_zscore,
+                    short_squeeze_score,
+                    max_source_available_at,
+                    created_at,
+                    updated_at
+                FROM scored
+                """,
+                [month_start],
+            )
+
+            after_batch = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+            inserted_total += max(0, after_batch - before_batch)
+
+        return {
+            "month_batch_count": int(month_batch_count),
+            "short_features_rows_inserted": int(inserted_total),
+        }
+
+    def _run_impl(self) -> dict[str, Any]:
+        started_at = self._now()
+        rows_read = 0
+        rows_written = 0
+        metrics: dict[str, Any] = {}
+
+        try:
+            self._ensure_required_tables()
+
+            self._log_step(1, "inspect canonical short source tables")
+
+            daily_count = self._safe_scalar("SELECT COUNT(*) FROM daily_short_volume_history", 0)
+            short_interest_count = self._safe_scalar("SELECT COUNT(*) FROM finra_short_interest_history", 0)
+            short_features_before = self._safe_scalar("SELECT COUNT(*) FROM short_features_daily", 0)
+
+            metrics["daily_short_volume_history_count"] = int(daily_count)
+            metrics["finra_short_interest_history_count"] = int(short_interest_count)
+            metrics["short_features_rows_before"] = int(short_features_before)
+
+            rows_read = int(daily_count + short_interest_count)
+
+            if daily_count == 0:
+                metrics["build_decision"] = "noop_missing_daily_short_volume_history"
+                return self._build_payload(
+                    status="noop",
+                    started_at=started_at,
+                    finished_at=self._now(),
+                    rows_read=rows_read,
+                    rows_written=0,
+                    error_message=None,
+                    metrics=metrics,
+                )
+
+            self._log_step(2, "compute incremental window")
+            window_start_date = self._window_start_date()
+            metrics["overlap_days"] = self.overlap_days
+            metrics["window_start_date"] = None if window_start_date is None else str(window_start_date)
+
+            self._log_step(3, "create incremental daily short enriched stage")
+            temp_daily_rows = self._create_temp_daily_enriched(window_start_date)
+            metrics["temp_daily_enriched_rows"] = int(temp_daily_rows)
+
+            if temp_daily_rows == 0:
+                metrics["build_decision"] = "noop_no_incremental_rows"
+                metrics["short_features_rows_after"] = short_features_before
+                metrics["max_short_features_as_of_date"] = str(
+                    self._safe_optional_scalar("SELECT MAX(as_of_date) FROM short_features_daily")
+                )
+                return self._build_payload(
+                    status="noop",
+                    started_at=started_at,
+                    finished_at=self._now(),
+                    rows_read=rows_read,
+                    rows_written=0,
+                    error_message=None,
+                    metrics=metrics,
+                )
+
+            self._log_step(4, "normalize short interest once for PIT-safe joins")
+            self._create_temp_short_interest_norm()
+
+            self._log_step(5, "delete overlapping target window then insert recalculated months")
+            deleted_rows = self._delete_target_window(window_start_date)
+            metrics["short_features_rows_deleted_window"] = int(deleted_rows)
+
+            insert_result = self._insert_window_months()
+            metrics.update(insert_result)
+            rows_written = int(insert_result.get("short_features_rows_inserted", 0))
+
+            self._log_step(6, "collect final short feature state")
+
+            self.con.execute("DROP TABLE IF EXISTS tmp_short_feature_daily_enriched")
+            self.con.execute("DROP TABLE IF EXISTS tmp_short_interest_norm")
+
+            metrics["short_features_rows_after"] = self._safe_scalar(
+                "SELECT COUNT(*) FROM short_features_daily",
+                0,
+            )
+            metrics["max_short_features_as_of_date"] = str(
+                self._safe_optional_scalar("SELECT MAX(as_of_date) FROM short_features_daily")
+            )
+
+            return self._build_payload(
+                status="success",
+                started_at=started_at,
+                finished_at=self._now(),
+                rows_read=rows_read,
+                rows_written=rows_written,
+                error_message=None,
+                metrics=metrics,
+            )
+
+        except Exception as exc:
+            return self._build_payload(
+                status="failed",
+                started_at=started_at,
+                finished_at=self._now(),
+                rows_read=rows_read,
+                rows_written=rows_written,
+                error_message=str(exc),
+                metrics=metrics,
+            )
+
+    def run(self) -> PipelineResult:
+        """
+        Point d'entrée canonique.
+
+        La logique SQL/PIT reste dans _run_impl().
+        Le runner partagé construit le PipelineResult canonique.
+        """
+        return run_pipeline(self.pipeline_name, self._run_impl)
+
