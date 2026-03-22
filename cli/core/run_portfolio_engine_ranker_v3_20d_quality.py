@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-# =============================================================================
-# 20D aligned backtest on quality universe only.
-# =============================================================================
-
 import json
 from collections import defaultdict
 
@@ -33,6 +29,7 @@ def main() -> None:
             symbol,
             bar_date,
             adj_close,
+            volume,
             LEAD(adj_close, {HOLD_DAYS}) OVER (
                 PARTITION BY symbol
                 ORDER BY bar_date
@@ -40,20 +37,21 @@ def main() -> None:
         FROM price_bars_adjusted
         WHERE adj_close IS NOT NULL
           AND adj_close > 0
+          AND volume IS NOT NULL
+          AND volume > 0
     )
     SELECT
         r.*,
-        q.exec_close,
-        q.exec_volume,
-        q.exec_dollar_volume,
+        p.adj_close AS exec_close,
+        p.volume AS exec_volume,
+        (p.adj_close * p.volume) AS exec_dollar_volume,
         CASE
             WHEN p.adj_close_fwd IS NULL OR p.adj_close <= 0 OR p.adj_close_fwd <= 0 THEN NULL
             ELSE (p.adj_close_fwd / p.adj_close) - 1
         END AS realized_return_20d
     FROM research_split_dataset r
-    INNER JOIN research_universe_quality_20d q
-        ON r.instrument_id = q.instrument_id
-       AND r.as_of_date = q.as_of_date
+    INNER JOIN research_universe_whitelist_20d_final q
+        ON r.symbol = q.symbol
     INNER JOIN future_prices p
         ON r.symbol = p.symbol
        AND r.as_of_date = p.bar_date
@@ -65,9 +63,17 @@ def main() -> None:
     df["realized_return_20d"] = df["realized_return_20d"].clip(-REALIZED_RET_CAP, REALIZED_RET_CAP)
 
     drop_cols = [
-        "symbol","instrument_id","company_id","as_of_date",
-        "target_return","target_class","dataset_split",
-        "exec_close","exec_volume","exec_dollar_volume","realized_return_20d"
+        "symbol",
+        "instrument_id",
+        "company_id",
+        "as_of_date",
+        "target_return",
+        "target_class",
+        "dataset_split",
+        "exec_close",
+        "exec_volume",
+        "exec_dollar_volume",
+        "realized_return_20d",
     ]
     X = df.drop(columns=drop_cols, errors="ignore")
     X = X.reindex(columns=model.booster_.feature_name())
@@ -80,11 +86,14 @@ def main() -> None:
     for date, g in df.groupby("as_of_date"):
         if len(g) < 50:
             continue
+
         g = g.copy().sort_values("score")
         k = max(int(len(g) * BUCKET_PCT), 1)
+
         long = g.tail(k).copy()
         long["weight"] = 1.0 / len(long)
         long["weight"] = long["weight"].clip(upper=MAX_WEIGHT)
+
         wsum = float(long["weight"].sum())
         if wsum <= 0:
             continue
@@ -97,14 +106,19 @@ def main() -> None:
             "date": pd.to_datetime(date),
             "gross_20d": gross_20d,
             "net_20d": net_20d,
+            "names": int(len(long)),
         })
 
     sleeve_df = pd.DataFrame(sleeves)
-    pnl_by_day = defaultdict(float)
+    if sleeve_df.empty:
+        raise RuntimeError("No sleeves produced in final whitelist backtest.")
 
+    pnl_by_day = defaultdict(float)
     for _, row in sleeve_df.iterrows():
         start_idx = date_to_idx[row["date"]]
-        daily_net = float(row["net_20d"]) / HOLD_DAYS
+        # Each sleeve should only consume 1/HOLD_DAYS of portfolio capital.
+        # Without this extra division, overlapping sleeves create implicit ~20x leverage.
+        daily_net = float(row["net_20d"]) / (HOLD_DAYS * HOLD_DAYS)
         for offset in range(HOLD_DAYS):
             idx = start_idx + offset
             if idx >= len(unique_dates):
@@ -127,7 +141,7 @@ def main() -> None:
 
     print("===== PORTFOLIO V3 20D QUALITY =====")
     print(json.dumps({
-        "mode": "20d_aligned_quality_universe",
+        "mode": "20d_aligned_final_whitelist",
         "model_path": MODEL_PATH,
         "final_capital": float(eq["capital"].iloc[-1]),
         "total_return": float(eq["capital"].iloc[-1] / AUM - 1.0),
@@ -140,6 +154,7 @@ def main() -> None:
         "median_sleeve_gross_20d": float(sleeve_df["gross_20d"].median()),
         "avg_sleeve_net_20d": float(sleeve_df["net_20d"].mean()),
         "median_sleeve_net_20d": float(sleeve_df["net_20d"].median()),
+        "avg_names": float(sleeve_df["names"].mean()),
     }, indent=2))
     print("\n===== DAILY RETURN DISTRIBUTION =====")
     print(eq["return"].describe(percentiles=[0.01,0.05,0.25,0.5,0.75,0.95,0.99]).to_string())

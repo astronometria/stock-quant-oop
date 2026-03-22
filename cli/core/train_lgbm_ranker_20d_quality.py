@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-# =============================================================================
-# Train a 20D ranker on the stricter quality universe.
-# =============================================================================
-
 import argparse
 import json
 from pathlib import Path
@@ -48,6 +44,11 @@ def main() -> int:
 
     con = duckdb.connect(str(db_path))
     try:
+        # ---------------------------------------------------------------------
+        # Important:
+        # - whitelist table is static by symbol only
+        # - daily execution fields and 20d forward target come from prices
+        # ---------------------------------------------------------------------
         df = con.execute("""
         WITH split_calendar AS (
             SELECT DISTINCT
@@ -60,6 +61,7 @@ def main() -> int:
                 symbol,
                 bar_date,
                 adj_close,
+                volume,
                 LEAD(adj_close, 20) OVER (
                     PARTITION BY symbol
                     ORDER BY bar_date
@@ -67,22 +69,23 @@ def main() -> int:
             FROM price_bars_adjusted
             WHERE adj_close IS NOT NULL
               AND adj_close > 0
+              AND volume IS NOT NULL
+              AND volume > 0
         ),
         labeled AS (
             SELECT
                 f.*,
                 sc.dataset_split,
-                q.exec_close,
-                q.exec_volume,
-                q.exec_dollar_volume,
+                p.adj_close AS exec_close,
+                p.volume AS exec_volume,
+                (p.adj_close * p.volume) AS exec_dollar_volume,
                 CASE
                     WHEN p.adj_close_fwd_20 IS NULL OR p.adj_close <= 0 OR p.adj_close_fwd_20 <= 0 THEN NULL
                     ELSE (p.adj_close_fwd_20 / p.adj_close) - 1
                 END AS target_return_20d
             FROM research_features_daily f
-            INNER JOIN research_universe_quality_20d q
-                ON f.instrument_id = q.instrument_id
-               AND f.as_of_date = q.as_of_date
+            INNER JOIN research_universe_whitelist_20d_final q
+                ON f.symbol = q.symbol
             INNER JOIN split_calendar sc
                 ON f.as_of_date = sc.as_of_date
             INNER JOIN future_prices p
@@ -108,10 +111,16 @@ def main() -> int:
         con.close()
     progress.update(1)
 
+    if df.empty:
+        raise RuntimeError("Training frame is empty after whitelist filtering.")
+
     train_df = df[df["dataset_split"] == "train"].copy()
     val_df = df[df["dataset_split"] == "val"].copy()
     test_df = df[df["dataset_split"] == "test"].copy()
     progress.update(1)
+
+    if train_df.empty or val_df.empty:
+        raise RuntimeError("Train or validation split is empty.")
 
     drop_cols = [
         "symbol",
@@ -129,6 +138,7 @@ def main() -> int:
 
     X_train = train_df[feature_cols].copy()
     y_train = train_df["relevance_20d"].astype(int)
+
     X_val = val_df[feature_cols].copy()
     y_val = val_df["relevance_20d"].astype(int)
 

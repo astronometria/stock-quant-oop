@@ -1,8 +1,8 @@
 {
   "trainer": "train_lgbm_ranker_20d_quality.py",
-  "rows_train": 3160676,
-  "rows_val": 1348576,
-  "rows_test": 1680953,
+  "rows_train": 1679195,
+  "rows_val": 345659,
+  "rows_test": 365041,
   "features": 45,
   "feature_names": [
     "close",
@@ -51,12 +51,12 @@
     "short_pressure_zscore",
     "days_to_cover_zscore"
   ],
-  "best_iteration_": 3,
+  "best_iteration_": 153,
   "best_score_": {
     "valid_0": {
-      "ndcg@10": 0.40724418392582945,
-      "ndcg@25": 0.4036063762419671,
-      "ndcg@50": 0.4014468550589676
+      "ndcg@10": 0.461996104291327,
+      "ndcg@25": 0.44304238888363223,
+      "ndcg@50": 0.42313285521418204
     }
   },
   "model_path": "/home/marty/stock-quant-oop/models/lgbm_ranker_20d_quality.pkl"
