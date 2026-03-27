@@ -130,12 +130,14 @@ class DuckDbListingHistoryRepository:
                 return f"TRIM(CAST({col} AS VARCHAR))"
             return fallback_sql
 
-        cik_expr = f"NULLIF({expr('cik', "''")}, '')"
-        company_name_expr = f"COALESCE({expr('company_name', "''")}, '')"
-        company_name_clean_raw_expr = f"COALESCE({expr('company_name_clean', "''")}, '')"
-        exchange_expr = f"NULLIF({expr('exchange', "''")}, '')"
-        security_type_expr = f"NULLIF({expr('security_type', "''")}, '')"
-        source_name_expr = f"COALESCE({expr('source_name', "''")}, '')"
+        blank_sql = "''"
+
+        cik_expr = f"NULLIF({expr('cik', blank_sql)}, '')"
+        company_name_expr = f"COALESCE({expr('company_name', blank_sql)}, '')"
+        company_name_clean_raw_expr = f"COALESCE({expr('company_name_clean', blank_sql)}, '')"
+        exchange_expr = f"NULLIF({expr('exchange', blank_sql)}, '')"
+        security_type_expr = f"NULLIF({expr('security_type', blank_sql)}, '')"
+        source_name_expr = f"COALESCE({expr('source_name', blank_sql)}, '')"
 
         if "as_of_date" in cols:
             as_of_date_expr = "as_of_date"
