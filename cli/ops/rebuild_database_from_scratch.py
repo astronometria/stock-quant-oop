@@ -332,6 +332,7 @@ def main() -> int:
         "build_listing_history": build_child_path(project_root, "cli/core/build_listing_history.py").exists(),
         "build_market_universe_history": build_child_path(project_root, "cli/core/build_market_universe_history.py").exists(),
         "build_symbol_reference_history": build_child_path(project_root, "cli/core/build_symbol_reference_history.py").exists(),
+        "build_universe_membership_history_from_market_universe_history": build_child_path(project_root, "cli/core/build_universe_membership_history_from_market_universe_history.py").exists(),
     }
 
     preflight = {
@@ -644,6 +645,7 @@ def main() -> int:
             ("BUILD LISTING HISTORY", "cli/core/build_listing_history.py"),
             ("BUILD MARKET UNIVERSE HISTORY", "cli/core/build_market_universe_history.py"),
             ("BUILD SYMBOL REFERENCE HISTORY", "cli/core/build_symbol_reference_history.py"),
+            ("BUILD UNIVERSE MEMBERSHIP HISTORY", "cli/core/build_universe_membership_history_from_market_universe_history.py"),
         ]
         for step_name, rel in history_steps:
             cmd = [
@@ -657,7 +659,8 @@ def main() -> int:
         steps.append(skip_step("BUILD LISTING HISTORY", "requested by absence of --build-history"))
         steps.append(skip_step("BUILD MARKET UNIVERSE HISTORY", "requested by absence of --build-history"))
         steps.append(skip_step("BUILD SYMBOL REFERENCE HISTORY", "requested by absence of --build-history"))
-    progress.update(3)
+        steps.append(skip_step("BUILD UNIVERSE MEMBERSHIP HISTORY", "requested by absence of --build-history"))
+    progress.update(4)
 
     history_metrics_after = python_duckdb_metrics(db_path)
     depth_ok_after, depth_detail_after = history_depth_is_sufficient(
