@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     """
     Parse les arguments CLI.
 
-    Notes :
+    Notes:
     - include_adr : permet d'inclure les ADR/ADS dans l'univers si désiré
     - allowed_exchanges : liste d'exchanges éligibles
     """
@@ -60,16 +60,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """
     Point d'entrée principal.
-
-    Pattern standard :
-    - config
-    - session factory
-    - unit of work
-    - schema init
-    - repositories
-    - service
-    - pipeline
-    - JSON result
     """
     args = parse_args()
 
@@ -91,12 +81,160 @@ def main() -> int:
             allowed_exchanges=tuple(args.allowed_exchanges),
             rule_version=args.rule_version,
         )
-
         pipeline = BuildMarketUniverseHistoryPipeline(service)
         result = pipeline.run()
 
-    print(json.dumps(result.summary_dict(), indent=2))
-    return 0 if result.status == "SUCCESS" else 1
+        # Dédup SQL-first en sortie:
+        # plusieurs listing_id actifs peuvent pointer vers le même listing économique.
+        # On garde une seule ligne par clé logique historisée.
+        uow.connection.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE tmp_market_universe_history_dedup AS
+            WITH ranked AS (
+                SELECT
+                    listing_id,
+                    company_id,
+                    symbol,
+                    cik,
+                    exchange,
+                    security_type,
+                    eligible_flag,
+                    eligible_reason,
+                    rule_version,
+                    effective_from,
+                    effective_to,
+                    is_active,
+                    created_at,
+                    updated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            UPPER(TRIM(COALESCE(symbol, ''))),
+                            COALESCE(effective_from, DATE '1900-01-01'),
+                            COALESCE(effective_to, DATE '9999-12-31'),
+                            COALESCE(is_active, FALSE),
+                            COALESCE(eligible_flag, FALSE),
+                            UPPER(TRIM(COALESCE(eligible_reason, ''))),
+                            UPPER(TRIM(COALESCE(rule_version, '')))
+                        ORDER BY
+                            CASE WHEN COALESCE(cik, '') <> '' THEN 0 ELSE 1 END,
+                            CASE WHEN COALESCE(company_id, '') <> '' THEN 0 ELSE 1 END,
+                            updated_at DESC NULLS LAST,
+                            created_at DESC NULLS LAST,
+                            COALESCE(exchange, '') DESC,
+                            COALESCE(security_type, '') DESC,
+                            listing_id DESC
+                    ) AS rn
+                FROM market_universe_history
+            )
+            SELECT
+                listing_id,
+                company_id,
+                symbol,
+                cik,
+                exchange,
+                security_type,
+                eligible_flag,
+                eligible_reason,
+                rule_version,
+                effective_from,
+                effective_to,
+                is_active,
+                created_at,
+                updated_at
+            FROM ranked
+            WHERE rn = 1
+            """
+        )
+
+        before_rows = uow.connection.execute(
+            "SELECT COUNT(*) FROM market_universe_history"
+        ).fetchone()[0]
+
+        dup_groups = uow.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    UPPER(TRIM(COALESCE(symbol, ''))) AS symbol_key,
+                    COALESCE(effective_from, DATE '1900-01-01') AS effective_from_key,
+                    COALESCE(effective_to, DATE '9999-12-31') AS effective_to_key,
+                    COALESCE(is_active, FALSE) AS is_active_key,
+                    COUNT(*) AS dup_count
+                FROM market_universe_history
+                GROUP BY 1,2,3,4
+                HAVING COUNT(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+
+        uow.connection.execute("DELETE FROM market_universe_history")
+        uow.connection.execute(
+            """
+            INSERT INTO market_universe_history (
+                listing_id,
+                company_id,
+                symbol,
+                cik,
+                exchange,
+                security_type,
+                eligible_flag,
+                eligible_reason,
+                rule_version,
+                effective_from,
+                effective_to,
+                is_active,
+                created_at,
+                updated_at
+            )
+            SELECT
+                listing_id,
+                company_id,
+                symbol,
+                cik,
+                exchange,
+                security_type,
+                eligible_flag,
+                eligible_reason,
+                rule_version,
+                effective_from,
+                effective_to,
+                is_active,
+                created_at,
+                updated_at
+            FROM tmp_market_universe_history_dedup
+            """
+        )
+
+        after_rows = uow.connection.execute(
+            "SELECT COUNT(*) FROM market_universe_history"
+        ).fetchone()[0]
+
+        dup_groups_after = uow.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    UPPER(TRIM(COALESCE(symbol, ''))) AS symbol_key,
+                    COALESCE(effective_from, DATE '1900-01-01') AS effective_from_key,
+                    COALESCE(effective_to, DATE '9999-12-31') AS effective_to_key,
+                    COALESCE(is_active, FALSE) AS is_active_key,
+                    COUNT(*) AS dup_count
+                FROM market_universe_history
+                GROUP BY 1,2,3,4
+                HAVING COUNT(*) > 1
+            ) d
+            """
+        ).fetchone()[0]
+
+        summary = result.summary_dict()
+        summary.setdefault("metrics", {})
+        summary["metrics"]["dedup_rows_before"] = int(before_rows)
+        summary["metrics"]["dedup_rows_after"] = int(after_rows)
+        summary["metrics"]["dedup_duplicate_groups_before"] = int(dup_groups)
+        summary["metrics"]["dedup_duplicate_groups_after"] = int(dup_groups_after)
+
+    print(json.dumps(summary, indent=2))
+    return 0 if summary.get("status") == "SUCCESS" else 1
 
 
 if __name__ == "__main__":
