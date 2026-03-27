@@ -111,10 +111,7 @@ def main() -> int:
                             UPPER(TRIM(COALESCE(symbol, ''))),
                             COALESCE(effective_from, DATE '1900-01-01'),
                             COALESCE(effective_to, DATE '9999-12-31'),
-                            COALESCE(is_active, FALSE),
-                            COALESCE(eligible_flag, FALSE),
-                            UPPER(TRIM(COALESCE(eligible_reason, ''))),
-                            UPPER(TRIM(COALESCE(rule_version, '')))
+                            COALESCE(is_active, FALSE)
                         ORDER BY
                             CASE WHEN COALESCE(cik, '') <> '' THEN 0 ELSE 1 END,
                             CASE WHEN COALESCE(company_id, '') <> '' THEN 0 ELSE 1 END,
