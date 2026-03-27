@@ -99,41 +99,89 @@ class DuckDbListingHistoryRepository:
         """
         Charge les observations source pour une date métier donnée.
 
-        Hypothèse :
-        - symbol_reference_source_raw contient les snapshots bruts append-only
-        - on prend les lignes de la date demandée
+        Réparation importante:
+        - évite toute auto-référence d'alias SQL autour de company_name_clean
+        - choisit dynamiquement la meilleure source disponible
+        - préfère symbol_reference_source_raw si présent
         """
         self._require_connection()
 
-        rows = self.con.execute(
-            """
+        tables = {
+            row[0]
+            for row in self.con.execute("SHOW TABLES").fetchall()
+        }
+
+        if "symbol_reference_source_raw" in tables:
+            source_table = "symbol_reference_source_raw"
+        elif "symbol_reference" in tables:
+            source_table = "symbol_reference"
+        else:
+            raise RuntimeError(
+                "missing source table: expected symbol_reference_source_raw or symbol_reference"
+            )
+
+        cols = {
+            row[0]
+            for row in self.con.execute(f"DESCRIBE {source_table}").fetchall()
+        }
+
+        def expr(col: str, fallback_sql: str) -> str:
+            if col in cols:
+                return f"TRIM(CAST({col} AS VARCHAR))"
+            return fallback_sql
+
+        cik_expr = f"NULLIF({expr('cik', "''")}, '')"
+        company_name_expr = f"COALESCE({expr('company_name', "''")}, '')"
+        company_name_clean_raw_expr = f"COALESCE({expr('company_name_clean', "''")}, '')"
+        exchange_expr = f"NULLIF({expr('exchange', "''")}, '')"
+        security_type_expr = f"NULLIF({expr('security_type', "''")}, '')"
+        source_name_expr = f"COALESCE({expr('source_name', "''")}, '')"
+
+        if "as_of_date" in cols:
+            as_of_date_expr = "as_of_date"
+        elif "created_at" in cols:
+            as_of_date_expr = "CAST(created_at AS DATE)"
+        else:
+            raise RuntimeError(
+                f"{source_table} must expose as_of_date or created_at"
+            )
+
+        if "ingested_at" in cols:
+            ingested_at_expr = "ingested_at"
+        elif "created_at" in cols:
+            ingested_at_expr = "created_at"
+        else:
+            ingested_at_expr = "CURRENT_TIMESTAMP"
+
+        sql = f"""
             SELECT
                 TRIM(CAST(symbol AS VARCHAR)) AS symbol,
-                NULLIF(TRIM(CAST(cik AS VARCHAR)), '') AS cik,
-                COALESCE(TRIM(CAST(company_name AS VARCHAR)), '') AS company_name,
-                COALESCE(TRIM(CAST(company_name_clean AS VARCHAR)), '') AS company_name_clean,
-                NULLIF(TRIM(CAST(exchange AS VARCHAR)), '') AS exchange,
-                NULLIF(TRIM(CAST(security_type AS VARCHAR)), '') AS security_type,
-                COALESCE(TRIM(CAST(source_name AS VARCHAR)), '') AS source_name,
-                as_of_date,
-                ingested_at
-            FROM symbol_reference_source_raw
-            WHERE as_of_date = ?
+                {cik_expr} AS cik,
+                {company_name_expr} AS company_name,
+                {company_name_clean_raw_expr} AS company_name_clean_raw,
+                {exchange_expr} AS exchange,
+                {security_type_expr} AS security_type,
+                {source_name_expr} AS source_name,
+                {as_of_date_expr} AS as_of_date,
+                {ingested_at_expr} AS ingested_at
+            FROM {source_table}
+            WHERE {as_of_date_expr} = ?
               AND symbol IS NOT NULL
               AND TRIM(CAST(symbol AS VARCHAR)) <> ''
-            ORDER BY symbol, exchange, security_type, source_name
-            """,
-            [as_of_date],
-        ).fetchall()
+            ORDER BY 1, 5, 6, 7
+        """
+
+        rows = self.con.execute(sql, [as_of_date]).fetchall()
 
         observations: list[ListingObservation] = []
         for row in rows:
-            company_name_clean = row[3] or row[2].strip().upper()
+            company_name = row[2] or ""
+            company_name_clean = (row[3] or "").strip().upper() or company_name.strip().upper()
             observations.append(
                 ListingObservation(
                     symbol=row[0],
                     cik=row[1],
-                    company_name=row[2],
+                    company_name=company_name,
                     company_name_clean=company_name_clean,
                     exchange=row[4],
                     security_type=row[5],
@@ -142,10 +190,58 @@ class DuckDbListingHistoryRepository:
                     ingested_at=row[8],
                 )
             )
-
         return observations
 
     def load_available_as_of_dates(self) -> list[date]:
+        """
+        Retourne toutes les dates disponibles dans la source staging.
+
+        Réparation:
+        - préfère symbol_reference_source_raw
+        - fallback sur symbol_reference si nécessaire
+        """
+        self._require_connection()
+
+        tables = {
+            row[0]
+            for row in self.con.execute("SHOW TABLES").fetchall()
+        }
+
+        if "symbol_reference_source_raw" in tables:
+            source_table = "symbol_reference_source_raw"
+        elif "symbol_reference" in tables:
+            source_table = "symbol_reference"
+        else:
+            raise RuntimeError(
+                "missing source table: expected symbol_reference_source_raw or symbol_reference"
+            )
+
+        cols = {
+            row[0]
+            for row in self.con.execute(f"DESCRIBE {source_table}").fetchall()
+        }
+
+        if "as_of_date" in cols:
+            date_expr = "as_of_date"
+        elif "created_at" in cols:
+            date_expr = "CAST(created_at AS DATE)"
+        else:
+            raise RuntimeError(
+                f"{source_table} must expose as_of_date or created_at"
+            )
+
+        rows = self.con.execute(
+            f"""
+            SELECT DISTINCT {date_expr} AS as_of_date
+            FROM {source_table}
+            WHERE {date_expr} IS NOT NULL
+            ORDER BY as_of_date
+            """
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def find_active_listing_version_by_identity_key(self, identity_key: str,) -> ListingVersion | None:
+
         """
         Retourne toutes les dates disponibles dans la staging source.
         """
