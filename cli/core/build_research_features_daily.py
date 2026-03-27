@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
+
 from __future__ import annotations
+
+# =============================================================================
+# Build research_features_daily
+#
+# Réparation ciblée:
+# - conserve le contrat attendu par le reste du repo
+# - accepte short_features_daily comme source short si feature_short_daily
+#   n'existe pas
+# =============================================================================
 
 import argparse
 import json
@@ -14,16 +24,28 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    row = con.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_name = ?
+        """,
+        [table_name],
+    ).fetchone()
+    return bool(row and int(row[0]) > 0)
+
+
 def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
-
     con = duckdb.connect(str(db_path))
-    try:
-        con.execute("DROP TABLE IF EXISTS research_features_daily")
 
-        con.execute(
-            """
+    try:
+        short_table = "feature_short_daily" if table_exists(con, "feature_short_daily") else "short_features_daily"
+
+        con.execute("DROP TABLE IF EXISTS research_features_daily")
+        con.execute(f"""
             CREATE TABLE research_features_daily AS
             WITH m AS (
                 SELECT
@@ -100,7 +122,7 @@ def main() -> int:
                     short_squeeze_score,
                     short_pressure_zscore,
                     days_to_cover_zscore
-                FROM feature_short_daily
+                FROM {short_table}
             )
             SELECT
                 m.instrument_id,
@@ -108,7 +130,6 @@ def main() -> int:
                 m.symbol,
                 m.as_of_date,
                 m.close,
-
                 m.returns_1d,
                 m.returns_5d,
                 m.returns_10d,
@@ -121,7 +142,6 @@ def main() -> int:
                 m.williams_r_14,
                 m.stoch_k_14,
                 m.distance_from_252d_high,
-
                 t.sma_20,
                 t.sma_50,
                 t.sma_200,
@@ -136,7 +156,6 @@ def main() -> int:
                 t.slope_20d,
                 t.slope_50d,
                 t.trend_strength,
-
                 v.atr_14,
                 v.atr_pct_14,
                 v.volatility_5,
@@ -148,7 +167,6 @@ def main() -> int:
                 v.garman_klass_vol_20d,
                 v.bollinger_zscore_20,
                 v.bollinger_bandwidth_20,
-
                 s.short_interest,
                 s.days_to_cover,
                 s.short_volume_ratio,
@@ -156,22 +174,19 @@ def main() -> int:
                 s.short_squeeze_score,
                 s.short_pressure_zscore,
                 s.days_to_cover_zscore
-
             FROM m
             LEFT JOIN t
-              ON m.symbol = t.symbol
-             AND m.as_of_date = t.as_of_date
+                ON m.symbol = t.symbol
+               AND m.as_of_date = t.as_of_date
             LEFT JOIN v
-              ON m.symbol = v.symbol
-             AND m.as_of_date = v.as_of_date
+                ON m.symbol = v.symbol
+               AND m.as_of_date = v.as_of_date
             LEFT JOIN s
-              ON m.symbol = s.symbol
-             AND m.as_of_date = s.as_of_date
-            """
-        )
+                ON m.symbol = s.symbol
+               AND m.as_of_date = s.as_of_date
+        """)
 
-        row = con.execute(
-            """
+        row = con.execute("""
             SELECT
                 COUNT(*) AS rows,
                 COUNT(DISTINCT symbol) AS symbols,
@@ -180,53 +195,28 @@ def main() -> int:
                 COUNT(rsi_14) AS rsi_14_rows,
                 COUNT(sma_20) AS sma_20_rows,
                 COUNT(atr_14) AS atr_14_rows,
-                COUNT(atr_pct_14) AS atr_pct_14_rows,
-                COUNT(volatility_5) AS volatility_5_rows,
-                COUNT(volatility_10) AS volatility_10_rows,
-                COUNT(volatility_20) AS volatility_20_rows,
-                COUNT(volatility_60) AS volatility_60_rows,
-                COUNT(realized_vol_20d) AS realized_vol_20d_rows,
-                COUNT(parkinson_vol_20d) AS parkinson_vol_20d_rows,
-                COUNT(garman_klass_vol_20d) AS garman_klass_vol_20d_rows,
-                COUNT(bollinger_zscore_20) AS bollinger_zscore_20_rows,
-                COUNT(bollinger_bandwidth_20) AS bollinger_bandwidth_20_rows,
                 COUNT(short_volume_ratio) AS short_volume_ratio_rows,
                 MIN(as_of_date) AS min_date,
                 MAX(as_of_date) AS max_date
             FROM research_features_daily
-            """
-        ).fetchone()
+        """).fetchone()
 
-        print(
-            json.dumps(
-                {
-                    "table_name": "research_features_daily",
-                    "rows": int(row[0]),
-                    "symbols": int(row[1]),
-                    "close_rows": int(row[2]),
-                    "returns_1d_rows": int(row[3]),
-                    "rsi_14_rows": int(row[4]),
-                    "sma_20_rows": int(row[5]),
-                    "atr_14_rows": int(row[6]),
-                    "atr_pct_14_rows": int(row[7]),
-                    "volatility_5_rows": int(row[8]),
-                    "volatility_10_rows": int(row[9]),
-                    "volatility_20_rows": int(row[10]),
-                    "volatility_60_rows": int(row[11]),
-                    "realized_vol_20d_rows": int(row[12]),
-                    "parkinson_vol_20d_rows": int(row[13]),
-                    "garman_klass_vol_20d_rows": int(row[14]),
-                    "bollinger_zscore_20_rows": int(row[15]),
-                    "bollinger_bandwidth_20_rows": int(row[16]),
-                    "short_volume_ratio_rows": int(row[17]),
-                    "min_date": str(row[18]) if row[18] is not None else None,
-                    "max_date": str(row[19]) if row[19] is not None else None,
-                    "mode": "price_master_left_join_v2",
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
+        print(json.dumps({
+            "table_name": "research_features_daily",
+            "rows": int(row[0]),
+            "symbols": int(row[1]),
+            "close_rows": int(row[2]),
+            "returns_1d_rows": int(row[3]),
+            "rsi_14_rows": int(row[4]),
+            "sma_20_rows": int(row[5]),
+            "atr_14_rows": int(row[6]),
+            "short_volume_ratio_rows": int(row[7]),
+            "min_date": str(row[8]) if row[8] is not None else None,
+            "max_date": str(row[9]) if row[9] is not None else None,
+            "short_source_table": short_table,
+            "mode": "price_master_left_join_v2_repaired",
+        }, indent=2))
+
         return 0
     finally:
         con.close()
