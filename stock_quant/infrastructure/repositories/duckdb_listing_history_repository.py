@@ -227,14 +227,13 @@ class DuckDbListingHistoryRepository:
                 FROM normalized
                 QUALIFY ROW_NUMBER() OVER (
                     PARTITION BY
-                        CASE
-                            WHEN cik_key <> '' THEN 'CIK:' || cik_key
-                            ELSE 'FALLBACK:' || symbol_key || '|' || company_name_key
-                        END,
+                        symbol_key,
                         exchange_key,
                         security_type_key,
                         snapshot_as_of_date
                     ORDER BY
+                        CASE WHEN cik_key <> '' THEN 0 ELSE 1 END,
+                        CASE WHEN company_name_key <> '' THEN 0 ELSE 1 END,
                         snapshot_ingested_at DESC NULLS LAST,
                         source_name_raw DESC
                 ) = 1
