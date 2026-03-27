@@ -171,20 +171,85 @@ class DuckDbListingHistoryRepository:
 
         rows = self.con.execute(
             f"""
+            WITH source_rows AS (
+                SELECT
+                    TRIM(CAST(symbol AS VARCHAR)) AS symbol,
+                    {cik_expr} AS cik,
+                    {company_name_expr} AS company_name,
+                    {company_name_clean_expr} AS company_name_clean_raw,
+                    {exchange_expr} AS exchange_raw,
+                    {security_type_expr} AS security_type_raw,
+                    {source_name_expr} AS source_name_raw,
+                    {as_of_date_expr} AS snapshot_as_of_date,
+                    {ingested_at_expr} AS snapshot_ingested_at
+                FROM {source_table}
+                WHERE {as_of_date_expr} = ?
+                  AND symbol IS NOT NULL
+                  AND TRIM(CAST(symbol AS VARCHAR)) <> ''
+            ),
+            normalized AS (
+                SELECT
+                    symbol,
+                    cik,
+                    company_name,
+                    company_name_clean_raw,
+                    exchange_raw,
+                    security_type_raw,
+                    source_name_raw,
+                    snapshot_as_of_date,
+                    snapshot_ingested_at,
+                    UPPER(TRIM(COALESCE(symbol, ''))) AS symbol_key,
+                    UPPER(TRIM(COALESCE(cik, ''))) AS cik_key,
+                    UPPER(
+                        TRIM(
+                            COALESCE(
+                                NULLIF(company_name_clean_raw, ''),
+                                company_name,
+                                ''
+                            )
+                        )
+                    ) AS company_name_key,
+                    UPPER(TRIM(COALESCE(exchange_raw, ''))) AS exchange_key,
+                    UPPER(TRIM(COALESCE(security_type_raw, ''))) AS security_type_key
+                FROM source_rows
+            ),
+            deduped AS (
+                SELECT
+                    symbol,
+                    cik,
+                    company_name,
+                    company_name_clean_raw,
+                    exchange_raw,
+                    security_type_raw,
+                    source_name_raw,
+                    snapshot_as_of_date,
+                    snapshot_ingested_at
+                FROM normalized
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY
+                        CASE
+                            WHEN cik_key <> '' THEN 'CIK:' || cik_key
+                            ELSE 'FALLBACK:' || symbol_key || '|' || company_name_key
+                        END,
+                        exchange_key,
+                        security_type_key,
+                        snapshot_as_of_date
+                    ORDER BY
+                        snapshot_ingested_at DESC NULLS LAST,
+                        source_name_raw DESC
+                ) = 1
+            )
             SELECT
-                TRIM(CAST(symbol AS VARCHAR)) AS symbol,
-                {cik_expr} AS cik,
-                {company_name_expr} AS company_name,
-                {company_name_clean_expr} AS company_name_clean_raw,
-                {exchange_expr} AS exchange_raw,
-                {security_type_expr} AS security_type_raw,
-                {source_name_expr} AS source_name_raw,
-                {as_of_date_expr} AS snapshot_as_of_date,
-                {ingested_at_expr} AS snapshot_ingested_at
-            FROM {source_table}
-            WHERE {as_of_date_expr} = ?
-              AND symbol IS NOT NULL
-              AND TRIM(CAST(symbol AS VARCHAR)) <> ''
+                symbol,
+                cik,
+                company_name,
+                company_name_clean_raw,
+                exchange_raw,
+                security_type_raw,
+                source_name_raw,
+                snapshot_as_of_date,
+                snapshot_ingested_at
+            FROM deduped
             ORDER BY
                 1, 5, 6, 7
             """,
