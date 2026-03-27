@@ -5,9 +5,7 @@ Repository DuckDB pour la table historisée listing_status_history.
 
 Philosophie
 -----------
-
 Ce repository est volontairement SQL-first :
-
 - lectures bulk en SQL
 - filtres et recherches en SQL
 - écritures simples via INSERT / UPDATE
@@ -17,17 +15,14 @@ Le repository gère surtout la persistance et les requêtes ciblées.
 
 Important
 ---------
-
 Pour rester cohérent avec le codebase existant, ce repository prend
 directement une connexion DuckDB active, pas un UnitOfWork.
-
-Le CLI / pipeline devra donc injecter `uow.connection`.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Iterable
+from typing import Any
 
 from stock_quant.domain.entities.listing_observation import ListingObservation
 from stock_quant.domain.entities.listing_version import ListingVersion
@@ -99,95 +94,114 @@ class DuckDbListingHistoryRepository:
         """
         Charge les observations source pour une date métier donnée.
 
-        Réparation importante:
-        - évite toute auto-référence d'alias SQL autour de company_name_clean
-        - choisit dynamiquement la meilleure source disponible
-        - préfère symbol_reference_source_raw si présent
+        Règles:
+        - on préfère symbol_reference_source_raw si disponible
+        - fallback sur symbol_reference si nécessaire
+        - on évite toute auto-référence d'alias SQL dans le SELECT
+        - le nettoyage de company_name_clean est finalisé en Python
         """
         self._require_connection()
 
-        tables = {
-            row[0]
-            for row in self.con.execute("SHOW TABLES").fetchall()
-        }
+        tables = {row[0] for row in self.con.execute("SHOW TABLES").fetchall()}
 
         if "symbol_reference_source_raw" in tables:
             source_table = "symbol_reference_source_raw"
         elif "symbol_reference" in tables:
             source_table = "symbol_reference"
         else:
-            raise RuntimeError(
-                "missing source table: expected symbol_reference_source_raw or symbol_reference"
+            raise RepositoryError(
+                "Missing source table: expected symbol_reference_source_raw or symbol_reference"
             )
 
-        cols = {
-            row[0]
-            for row in self.con.execute(f"DESCRIBE {source_table}").fetchall()
-        }
+        cols = {row[0] for row in self.con.execute(f"DESCRIBE {source_table}").fetchall()}
 
-        def expr(col: str, fallback_sql: str) -> str:
-            if col in cols:
-                return f"TRIM(CAST({col} AS VARCHAR))"
-            return fallback_sql
+        def has_col(name: str) -> bool:
+            return name in cols
 
-        blank_sql = "''"
-
-        cik_expr = f"NULLIF({expr('cik', blank_sql)}, '')"
-        company_name_expr = f"COALESCE({expr('company_name', blank_sql)}, '')"
-        company_name_clean_raw_expr = f"COALESCE({expr('company_name_clean', blank_sql)}, '')"
-        exchange_expr = f"NULLIF({expr('exchange', blank_sql)}, '')"
-        security_type_expr = f"NULLIF({expr('security_type', blank_sql)}, '')"
-        source_name_expr = f"COALESCE({expr('source_name', blank_sql)}, '')"
-
-        if "as_of_date" in cols:
+        if has_col("as_of_date"):
             as_of_date_expr = "as_of_date"
-        elif "created_at" in cols:
+        elif has_col("created_at"):
             as_of_date_expr = "CAST(created_at AS DATE)"
         else:
-            raise RuntimeError(
-                f"{source_table} must expose as_of_date or created_at"
+            raise RepositoryError(
+                f"{source_table} must expose as_of_date or created_at for listing history build"
             )
 
-        if "ingested_at" in cols:
+        if has_col("ingested_at"):
             ingested_at_expr = "ingested_at"
-        elif "created_at" in cols:
+        elif has_col("created_at"):
             ingested_at_expr = "created_at"
         else:
             ingested_at_expr = "CURRENT_TIMESTAMP"
 
-        sql = f"""
+        cik_expr = "NULLIF(TRIM(CAST(cik AS VARCHAR)), '')" if has_col("cik") else "NULL"
+        company_name_expr = (
+            "COALESCE(TRIM(CAST(company_name AS VARCHAR)), '')"
+            if has_col("company_name")
+            else "''"
+        )
+        company_name_clean_expr = (
+            "COALESCE(TRIM(CAST(company_name_clean AS VARCHAR)), '')"
+            if has_col("company_name_clean")
+            else "''"
+        )
+        exchange_expr = (
+            "NULLIF(TRIM(CAST(exchange AS VARCHAR)), '')"
+            if has_col("exchange")
+            else "NULL"
+        )
+        security_type_expr = (
+            "NULLIF(TRIM(CAST(security_type AS VARCHAR)), '')"
+            if has_col("security_type")
+            else "NULL"
+        )
+        source_name_expr = (
+            "COALESCE(TRIM(CAST(source_name AS VARCHAR)), '')"
+            if has_col("source_name")
+            else f"'{source_table}'"
+        )
+
+        rows = self.con.execute(
+            f"""
             SELECT
                 TRIM(CAST(symbol AS VARCHAR)) AS symbol,
                 {cik_expr} AS cik,
                 {company_name_expr} AS company_name,
-                {company_name_clean_raw_expr} AS company_name_clean_raw,
-                {exchange_expr} AS exchange,
-                {security_type_expr} AS security_type,
-                {source_name_expr} AS source_name,
-                {as_of_date_expr} AS as_of_date,
-                {ingested_at_expr} AS ingested_at
+                {company_name_clean_expr} AS company_name_clean_raw,
+                {exchange_expr} AS exchange_raw,
+                {security_type_expr} AS security_type_raw,
+                {source_name_expr} AS source_name_raw,
+                {as_of_date_expr} AS snapshot_as_of_date,
+                {ingested_at_expr} AS snapshot_ingested_at
             FROM {source_table}
             WHERE {as_of_date_expr} = ?
               AND symbol IS NOT NULL
               AND TRIM(CAST(symbol AS VARCHAR)) <> ''
-            ORDER BY 1, 5, 6, 7
-        """
-
-        rows = self.con.execute(sql, [as_of_date]).fetchall()
+            ORDER BY
+                TRIM(CAST(symbol AS VARCHAR)),
+                COALESCE(TRIM(CAST(exchange AS VARCHAR)), ''),
+                COALESCE(TRIM(CAST(security_type AS VARCHAR)), ''),
+                COALESCE(TRIM(CAST(source_name AS VARCHAR)), '')
+            """,
+            [as_of_date],
+        ).fetchall()
 
         observations: list[ListingObservation] = []
         for row in rows:
             company_name = row[2] or ""
-            company_name_clean = (row[3] or "").strip().upper() or company_name.strip().upper()
+            company_name_clean = (row[3] or "").strip().upper()
+            if not company_name_clean:
+                company_name_clean = company_name.strip().upper()
+
             observations.append(
                 ListingObservation(
                     symbol=row[0],
                     cik=row[1],
                     company_name=company_name,
                     company_name_clean=company_name_clean,
-                    exchange=row[4],
-                    security_type=row[5],
-                    source_name=row[6],
+                    exchange=(row[4] or None),
+                    security_type=(row[5] or None),
+                    source_name=(row[6] or ""),
                     as_of_date=row[7],
                     ingested_at=row[8],
                 )
@@ -196,39 +210,33 @@ class DuckDbListingHistoryRepository:
 
     def load_available_as_of_dates(self) -> list[date]:
         """
-        Retourne toutes les dates disponibles dans la source staging.
+        Retourne toutes les dates disponibles dans la staging source.
 
-        Réparation:
+        Règles:
         - préfère symbol_reference_source_raw
-        - fallback sur symbol_reference si nécessaire
+        - fallback sur symbol_reference
         """
         self._require_connection()
 
-        tables = {
-            row[0]
-            for row in self.con.execute("SHOW TABLES").fetchall()
-        }
+        tables = {row[0] for row in self.con.execute("SHOW TABLES").fetchall()}
 
         if "symbol_reference_source_raw" in tables:
             source_table = "symbol_reference_source_raw"
         elif "symbol_reference" in tables:
             source_table = "symbol_reference"
         else:
-            raise RuntimeError(
-                "missing source table: expected symbol_reference_source_raw or symbol_reference"
+            raise RepositoryError(
+                "Missing source table: expected symbol_reference_source_raw or symbol_reference"
             )
 
-        cols = {
-            row[0]
-            for row in self.con.execute(f"DESCRIBE {source_table}").fetchall()
-        }
+        cols = {row[0] for row in self.con.execute(f"DESCRIBE {source_table}").fetchall()}
 
         if "as_of_date" in cols:
             date_expr = "as_of_date"
         elif "created_at" in cols:
             date_expr = "CAST(created_at AS DATE)"
         else:
-            raise RuntimeError(
+            raise RepositoryError(
                 f"{source_table} must expose as_of_date or created_at"
             )
 
@@ -242,24 +250,6 @@ class DuckDbListingHistoryRepository:
         ).fetchall()
         return [row[0] for row in rows]
 
-    def find_active_listing_version_by_identity_key(self, identity_key: str,) -> ListingVersion | None:
-
-        """
-        Retourne toutes les dates disponibles dans la staging source.
-        """
-        self._require_connection()
-
-        rows = self.con.execute(
-            """
-            SELECT DISTINCT as_of_date
-            FROM symbol_reference_source_raw
-            WHERE as_of_date IS NOT NULL
-            ORDER BY as_of_date
-            """
-        ).fetchall()
-
-        return [row[0] for row in rows]
-
     # -------------------------------------------------------------------------
     # Active versions
     # -------------------------------------------------------------------------
@@ -269,11 +259,6 @@ class DuckDbListingHistoryRepository:
     ) -> ListingVersion | None:
         """
         Recherche une version active par identité société.
-
-        Convention :
-        - si identity_key commence par CIK:, on cherche par CIK
-        - si identity_key commence par COMPANY:, on cherche par company_id
-        - si fallback, on essaie un matching faible sur company_name_clean
         """
         self._require_connection()
 
@@ -282,24 +267,10 @@ class DuckDbListingHistoryRepository:
             row = self.con.execute(
                 """
                 SELECT
-                    listing_id,
-                    company_id,
-                    cik,
-                    symbol,
-                    company_name,
-                    company_name_clean,
-                    exchange,
-                    security_type,
-                    source_name,
-                    listing_status,
-                    status_reason,
-                    first_seen_at,
-                    last_seen_at,
-                    effective_from,
-                    effective_to,
-                    is_active,
-                    created_at,
-                    updated_at
+                    listing_id, company_id, cik, symbol, company_name, company_name_clean,
+                    exchange, security_type, source_name, listing_status, status_reason,
+                    first_seen_at, last_seen_at, effective_from, effective_to,
+                    is_active, created_at, updated_at
                 FROM listing_status_history
                 WHERE is_active = TRUE
                   AND effective_to IS NULL
@@ -316,24 +287,10 @@ class DuckDbListingHistoryRepository:
             row = self.con.execute(
                 """
                 SELECT
-                    listing_id,
-                    company_id,
-                    cik,
-                    symbol,
-                    company_name,
-                    company_name_clean,
-                    exchange,
-                    security_type,
-                    source_name,
-                    listing_status,
-                    status_reason,
-                    first_seen_at,
-                    last_seen_at,
-                    effective_from,
-                    effective_to,
-                    is_active,
-                    created_at,
-                    updated_at
+                    listing_id, company_id, cik, symbol, company_name, company_name_clean,
+                    exchange, security_type, source_name, listing_status, status_reason,
+                    first_seen_at, last_seen_at, effective_from, effective_to,
+                    is_active, created_at, updated_at
                 FROM listing_status_history
                 WHERE is_active = TRUE
                   AND effective_to IS NULL
@@ -354,24 +311,10 @@ class DuckDbListingHistoryRepository:
             row = self.con.execute(
                 """
                 SELECT
-                    listing_id,
-                    company_id,
-                    cik,
-                    symbol,
-                    company_name,
-                    company_name_clean,
-                    exchange,
-                    security_type,
-                    source_name,
-                    listing_status,
-                    status_reason,
-                    first_seen_at,
-                    last_seen_at,
-                    effective_from,
-                    effective_to,
-                    is_active,
-                    created_at,
-                    updated_at
+                    listing_id, company_id, cik, symbol, company_name, company_name_clean,
+                    exchange, security_type, source_name, listing_status, status_reason,
+                    first_seen_at, last_seen_at, effective_from, effective_to,
+                    is_active, created_at, updated_at
                 FROM listing_status_history
                 WHERE is_active = TRUE
                   AND effective_to IS NULL
@@ -391,35 +334,19 @@ class DuckDbListingHistoryRepository:
         Charge toutes les versions actives.
         """
         self._require_connection()
-
         rows = self.con.execute(
             """
             SELECT
-                listing_id,
-                company_id,
-                cik,
-                symbol,
-                company_name,
-                company_name_clean,
-                exchange,
-                security_type,
-                source_name,
-                listing_status,
-                status_reason,
-                first_seen_at,
-                last_seen_at,
-                effective_from,
-                effective_to,
-                is_active,
-                created_at,
-                updated_at
+                listing_id, company_id, cik, symbol, company_name, company_name_clean,
+                exchange, security_type, source_name, listing_status, status_reason,
+                first_seen_at, last_seen_at, effective_from, effective_to,
+                is_active, created_at, updated_at
             FROM listing_status_history
             WHERE is_active = TRUE
               AND effective_to IS NULL
             ORDER BY symbol, exchange, security_type, effective_from
             """
         ).fetchall()
-
         return [self._row_to_listing_version(row) for row in rows]
 
     # -------------------------------------------------------------------------
@@ -429,11 +356,7 @@ class DuckDbListingHistoryRepository:
         self,
         version: ListingVersion,
     ) -> None:
-        """
-        Insère une nouvelle version historisée.
-        """
         self._require_connection()
-
         self.con.execute(
             """
             INSERT INTO listing_status_history (
@@ -490,11 +413,7 @@ class DuckDbListingHistoryRepository:
         updated_at: datetime | None,
         last_seen_at: datetime | None,
     ) -> None:
-        """
-        Ferme une version active existante.
-        """
         self._require_connection()
-
         self.con.execute(
             """
             UPDATE listing_status_history
@@ -526,11 +445,7 @@ class DuckDbListingHistoryRepository:
         last_seen_at: datetime | None,
         updated_at: datetime | None,
     ) -> None:
-        """
-        Met à jour le last_seen_at de la version active.
-        """
         self._require_connection()
-
         self.con.execute(
             """
             UPDATE listing_status_history
@@ -557,14 +472,8 @@ class DuckDbListingHistoryRepository:
     ) -> list[ListingVersion]:
         """
         Charge les versions actives qui n'ont pas été observées à la date donnée.
-
-        Cette méthode est utile pour les politiques de delisting.
-
-        Attention :
-        elle compare le snapshot du jour avec les versions actives.
         """
         self._require_connection()
-
         rows = self.con.execute(
             """
             WITH observed AS (
@@ -578,24 +487,10 @@ class DuckDbListingHistoryRepository:
                   AND TRIM(CAST(symbol AS VARCHAR)) <> ''
             )
             SELECT
-                h.listing_id,
-                h.company_id,
-                h.cik,
-                h.symbol,
-                h.company_name,
-                h.company_name_clean,
-                h.exchange,
-                h.security_type,
-                h.source_name,
-                h.listing_status,
-                h.status_reason,
-                h.first_seen_at,
-                h.last_seen_at,
-                h.effective_from,
-                h.effective_to,
-                h.is_active,
-                h.created_at,
-                h.updated_at
+                h.listing_id, h.company_id, h.cik, h.symbol, h.company_name, h.company_name_clean,
+                h.exchange, h.security_type, h.source_name, h.listing_status, h.status_reason,
+                h.first_seen_at, h.last_seen_at, h.effective_from, h.effective_to,
+                h.is_active, h.created_at, h.updated_at
             FROM listing_status_history h
             LEFT JOIN observed o
               ON UPPER(TRIM(CAST(h.symbol AS VARCHAR))) = o.symbol
@@ -608,7 +503,6 @@ class DuckDbListingHistoryRepository:
             """,
             [as_of_date],
         ).fetchall()
-
         return [self._row_to_listing_version(row) for row in rows]
 
     def count_consecutive_missing_snapshots(
@@ -621,14 +515,6 @@ class DuckDbListingHistoryRepository:
     ) -> int:
         """
         Compte le nombre de snapshots consécutifs manquants pour un listing.
-
-        Implémentation simple :
-        - on récupère les dates disponibles <= up_to_as_of_date
-        - on remonte à rebours
-        - on s'arrête dès qu'on retrouve une observation du listing
-
-        Ce n'est pas l'implémentation la plus optimale du monde,
-        mais elle est claire et correcte pour une première itération.
         """
         self._require_connection()
 
@@ -648,7 +534,6 @@ class DuckDbListingHistoryRepository:
         normalized_security_type = (security_type or "").strip().upper()
 
         missing_count = 0
-
         for (snapshot_date,) in available_dates:
             row = self.con.execute(
                 """
@@ -667,10 +552,8 @@ class DuckDbListingHistoryRepository:
                     normalized_security_type,
                 ],
             ).fetchone()
-
             if row is not None:
                 break
-
             missing_count += 1
 
         return missing_count
