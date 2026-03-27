@@ -3,99 +3,83 @@
 from __future__ import annotations
 
 # =============================================================================
-# Build research-grade price tables
+# Réparation ciblée du builder de prix "research".
 #
-# Réparation ciblée du repo:
-# - le CLI original importait BuildPricesResearchPipeline, qui n'existe plus
-# - plusieurs scripts downstream attendent pourtant price_bars_unadjusted,
-#   price_bars_adjusted et price_quality_flags
+# Constat:
+# - init_prices_research_foundation.py crée déjà les tables de fondation
+# - l'ancien build_prices_research.py réessayait de repasser par un manager
+#   de schéma cassé dans ce contexte
+# - résultat: crash avant même de charger les prix
 #
-# Cette version répare le chemin "foundation -> adjusted bars" de façon SQL-first.
-#
-# Principes:
-# - source canonique préférée: price_history
-# - fallback acceptable: price_source_daily_raw
-# - phase 1 d'ajustement: adj_* = raw_* ; adjustment_factor = 1.0
-# - génération de flags qualité simples pour aider l'audit downstream
-#
-# On évite volontairement de charger 27M+ lignes en pandas.
-# Toute la construction reste dans DuckDB pour rester mince côté Python.
+# Cette version:
+# - suppose que la fondation a déjà été initialisée
+# - vérifie la présence des tables attendues
+# - charge price_bars_unadjusted / price_bars_adjusted / price_quality_flags
+# - reste SQL-first, sans gros DataFrame Python
 # =============================================================================
 
 import argparse
 import json
 from pathlib import Path
 
+import duckdb
 from tqdm import tqdm
-
-from stock_quant.infrastructure.config.settings_loader import build_app_config
-from stock_quant.infrastructure.db.duckdb_session_factory import DuckDbSessionFactory
-from stock_quant.infrastructure.db.master_data_schema import MasterDataSchemaManager
-from stock_quant.infrastructure.db.prices_research_schema import PricesResearchSchemaManager
-from stock_quant.infrastructure.db.schema_manager import SchemaManager
-from stock_quant.infrastructure.db.unit_of_work import DuckDbUnitOfWork
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build research-grade price tables from canonical market data.")
-    parser.add_argument("--db-path", default=None, help="Path to DuckDB database file.")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
+    parser = argparse.ArgumentParser(description="Build research price tables from price_history or price_source_daily_raw.")
+    parser.add_argument("--db-path", required=True, help="Path to DuckDB database file.")
     parser.add_argument(
         "--prefer-source-table",
         default="price_history",
         choices=["price_history", "price_source_daily_raw"],
-        help="Preferred source table when multiple valid sources exist.",
+        help="Preferred source table when multiple valid tables exist.",
     )
+    parser.add_argument("--verbose", action="store_true", help="Print extra diagnostics.")
     return parser.parse_args()
 
 
-def table_exists(con, table_name: str) -> bool:
+def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     row = con.execute(
         """
         SELECT COUNT(*)
         FROM information_schema.tables
         WHERE table_name = ?
-        """
-        ,
+        """,
         [table_name],
     ).fetchone()
     return bool(row and row[0] > 0)
 
 
-def table_row_count(con, table_name: str) -> int:
+def table_count(con: duckdb.DuckDBPyConnection, table_name: str) -> int:
     return int(con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
 
 
-def choose_source_table(con, preferred: str) -> str:
-    """
-    Choisit la meilleure table source disponible.
-
-    Politique:
-    - si la table préférée existe et contient des lignes, on la prend
-    - sinon on prend l'autre source si elle existe et contient des lignes
-    - sinon on échoue clairement
-    """
+def choose_source_table(con: duckdb.DuckDBPyConnection, preferred: str) -> str:
     candidates = [preferred] + [t for t in ["price_history", "price_source_daily_raw"] if t != preferred]
-
-    for table_name in candidates:
-        if table_exists(con, table_name):
-            count = table_row_count(con, table_name)
-            if count > 0:
-                return table_name
-
-    raise RuntimeError(
-        "No usable source price table found. Expected one of: price_history, price_source_daily_raw"
-    )
+    for name in candidates:
+        if table_exists(con, name):
+            if table_count(con, name) > 0:
+                return name
+    raise RuntimeError("No usable source table found among: price_history, price_source_daily_raw")
 
 
-def source_select_sql(source_table: str) -> str:
-    """
-    Retourne le SELECT normalisé vers le contrat interne attendu.
+def ensure_foundation_tables(con: duckdb.DuckDBPyConnection) -> None:
+    required = [
+        "price_bars_unadjusted",
+        "price_bars_adjusted",
+        "price_quality_flags",
+        "instrument_master",
+    ]
+    missing = [t for t in required if not table_exists(con, t)]
+    if missing:
+        raise RuntimeError(
+            "Missing required foundation tables. Run cli/core/init_prices_research_foundation.py first. "
+            f"Missing: {missing}"
+        )
 
-    On unifie les noms de colonnes entre:
-    - price_history: price_date
-    - price_source_daily_raw: price_date également dans ce repo
-    """
+
+def source_sql(source_table: str) -> str:
     return f"""
     SELECT
         UPPER(TRIM(symbol)) AS symbol,
@@ -119,45 +103,38 @@ def source_select_sql(source_table: str) -> str:
     """
 
 
-def build_price_tables(con, source_table: str) -> dict:
-    """
-    Construit:
-    - price_bars_unadjusted
-    - price_bars_adjusted
-    - price_quality_flags
-
-    Le tout en SQL-first, directement dans DuckDB.
-    """
-
+def build_tables(con: duckdb.DuckDBPyConnection, source_table: str) -> dict:
     # -------------------------------------------------------------------------
-    # Étape A: base normalisée temporaire
+    # Base temporaire normalisée.
+    # On enrichit avec instrument_id quand instrument_master contient le symbole.
+    # Fallback: instrument_id = symbol.
     # -------------------------------------------------------------------------
     con.execute("DROP TABLE IF EXISTS tmp_prices_research_base")
     con.execute(
         f"""
         CREATE TEMP TABLE tmp_prices_research_base AS
-        WITH source_rows AS (
-            {source_select_sql(source_table)}
+        WITH src AS (
+            {source_sql(source_table)}
         )
         SELECT
-            COALESCE(im.instrument_id, s.symbol) AS instrument_id,
-            s.symbol,
-            s.bar_date,
-            s.open,
-            s.high,
-            s.low,
-            s.close,
-            s.volume,
-            s.source_name,
+            COALESCE(im.instrument_id, src.symbol) AS instrument_id,
+            src.symbol,
+            src.bar_date,
+            src.open,
+            src.high,
+            src.low,
+            src.close,
+            src.volume,
+            src.source_name,
             CURRENT_TIMESTAMP AS created_at
-        FROM source_rows s
+        FROM src
         LEFT JOIN instrument_master im
-            ON UPPER(TRIM(im.symbol)) = s.symbol
+            ON UPPER(TRIM(im.symbol)) = src.symbol
         """
     )
 
     # -------------------------------------------------------------------------
-    # Étape B: barres non ajustées
+    # Barres non ajustées
     # -------------------------------------------------------------------------
     con.execute("DELETE FROM price_bars_unadjusted")
     con.execute(
@@ -191,18 +168,15 @@ def build_price_tables(con, source_table: str) -> dict:
     )
 
     # -------------------------------------------------------------------------
-    # Étape C: barres ajustées
+    # Barres ajustées
     #
-    # Phase 1 volontairement simple et alignée avec le comportement historique
-    # repéré dans le repo:
-    # - adj_open  = open
-    # - adj_high  = high
-    # - adj_low   = low
-    # - adj_close = close
+    # Phase 1 volontairement simple:
+    # - adj_* = raw_*
     # - adjustment_factor = 1.0
     #
-    # Cela remet en route le pipeline sans prétendre résoudre encore la
-    # totalité des corporate actions.
+    # Cela remet en route tous les scripts downstream qui attendent
+    # price_bars_adjusted, sans prétendre résoudre déjà toutes les corporate
+    # actions.
     # -------------------------------------------------------------------------
     con.execute("DELETE FROM price_bars_adjusted")
     con.execute(
@@ -226,7 +200,7 @@ def build_price_tables(con, source_table: str) -> dict:
             bar_date,
             open AS adj_open,
             high AS adj_high,
-            low  AS adj_low,
+            low AS adj_low,
             close AS adj_close,
             volume,
             1.0 AS adjustment_factor,
@@ -238,16 +212,7 @@ def build_price_tables(con, source_table: str) -> dict:
     )
 
     # -------------------------------------------------------------------------
-    # Étape D: flags qualité simples
-    #
-    # Ces flags sont volontairement conservateurs et auditables.
-    # On marque notamment:
-    # - close <= 0
-    # - volume < 0
-    # - retour brut 1j > 80% en absolu
-    #
-    # Cela ne bloque pas forcément tout downstream, mais donne une couche
-    # d'observabilité à la qualité des données.
+    # Flags qualité simples et auditables
     # -------------------------------------------------------------------------
     con.execute("DELETE FROM price_quality_flags")
     con.execute(
@@ -323,87 +288,67 @@ def build_price_tables(con, source_table: str) -> dict:
         """
     )
 
-    # -------------------------------------------------------------------------
-    # Étape E: résumé
-    # -------------------------------------------------------------------------
-    summary_row = con.execute(
+    row = con.execute(
         """
         SELECT
-            (SELECT COUNT(*) FROM price_bars_unadjusted) AS price_bars_unadjusted_rows,
-            (SELECT COUNT(*) FROM price_bars_adjusted) AS price_bars_adjusted_rows,
-            (SELECT COUNT(*) FROM price_quality_flags) AS price_quality_flags_rows,
-            (SELECT COUNT(DISTINCT symbol) FROM price_bars_adjusted) AS adjusted_symbol_count,
-            (SELECT MIN(bar_date) FROM price_bars_adjusted) AS min_bar_date,
-            (SELECT MAX(bar_date) FROM price_bars_adjusted) AS max_bar_date
+            (SELECT COUNT(*) FROM price_bars_unadjusted) AS unadjusted_rows,
+            (SELECT COUNT(*) FROM price_bars_adjusted) AS adjusted_rows,
+            (SELECT COUNT(*) FROM price_quality_flags) AS quality_rows,
+            (SELECT COUNT(DISTINCT symbol) FROM price_bars_adjusted) AS symbols_total,
+            (SELECT MIN(bar_date) FROM price_bars_adjusted) AS min_date,
+            (SELECT MAX(bar_date) FROM price_bars_adjusted) AS max_date
         """
     ).fetchone()
 
     return {
-        "source_table": source_table,
-        "price_bars_unadjusted_rows": int(summary_row[0]),
-        "price_bars_adjusted_rows": int(summary_row[1]),
-        "price_quality_flags_rows": int(summary_row[2]),
-        "adjusted_symbol_count": int(summary_row[3]),
-        "min_bar_date": str(summary_row[4]) if summary_row[4] is not None else None,
-        "max_bar_date": str(summary_row[5]) if summary_row[5] is not None else None,
+        "price_bars_unadjusted_rows": int(row[0]),
+        "price_bars_adjusted_rows": int(row[1]),
+        "price_quality_flags_rows": int(row[2]),
+        "symbols_total": int(row[3]),
+        "min_date": str(row[4]) if row[4] is not None else None,
+        "max_date": str(row[5]) if row[5] is not None else None,
     }
 
 
 def main() -> int:
     args = parse_args()
-
-    config = build_app_config(db_path=args.db_path)
-    config.ensure_directories()
-
-    if args.verbose:
-        print(f"[build_prices_research] project_root={config.project_root}")
-        print(f"[build_prices_research] db_path={config.db_path}")
+    db_path = str(Path(args.db_path).expanduser().resolve())
 
     steps = tqdm(total=5, desc="build_prices_research", unit="step")
+    con = duckdb.connect(db_path)
 
-    session_factory = DuckDbSessionFactory(config.db_path)
-    with DuckDbUnitOfWork(session_factory) as uow:
-        con = uow.connection
-        if con is None:
-            raise RuntimeError("Active DuckDB connection is required")
-
-        steps.set_description("build_prices_research:init_schema")
-        SchemaManager(uow).validate()
-        MasterDataSchemaManager(uow).initialize()
-        PricesResearchSchemaManager(uow).initialize()
+    try:
+        steps.set_description("build_prices_research:check_foundation")
+        ensure_foundation_tables(con)
         steps.update(1)
 
         steps.set_description("build_prices_research:choose_source")
         source_table = choose_source_table(con, args.prefer_source_table)
-        source_rows = table_row_count(con, source_table)
+        source_rows = table_count(con, source_table)
         steps.update(1)
 
         steps.set_description("build_prices_research:build_tables")
-        build_summary = build_price_tables(con, source_table=source_table)
+        summary = build_tables(con, source_table)
         steps.update(1)
 
         steps.set_description("build_prices_research:post_checks")
-        post_checks = {
+        result = {
+            "status": "SUCCESS",
+            "db_path": db_path,
+            "source_table": source_table,
             "source_rows": source_rows,
-            "unadjusted_rows": table_row_count(con, "price_bars_unadjusted"),
-            "adjusted_rows": table_row_count(con, "price_bars_adjusted"),
-            "quality_flag_rows": table_row_count(con, "price_quality_flags"),
+            "summary": summary,
         }
         steps.update(1)
 
         steps.set_description("build_prices_research:done")
-        result = {
-            "status": "SUCCESS",
-            "db_path": str(config.db_path),
-            "source_table": source_table,
-            "summary": build_summary,
-            "post_checks": post_checks,
-        }
-        print(json.dumps(result, indent=2, sort_keys=True))
+        print(json.dumps(result, indent=2))
         steps.update(1)
+        steps.close()
+        return 0
 
-    steps.close()
-    return 0
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":
