@@ -146,14 +146,22 @@ class DuckDbListingHistoryRepository:
             else "''"
         )
         exchange_expr = (
-            "NULLIF(TRIM(CAST(exchange AS VARCHAR)), '')"
-            if has_col("exchange")
-            else "NULL"
+            "NULLIF(TRIM(CAST(exchange_raw AS VARCHAR)), '')"
+            if has_col("exchange_raw")
+            else (
+                "NULLIF(TRIM(CAST(exchange AS VARCHAR)), '')"
+                if has_col("exchange")
+                else "NULL"
+            )
         )
         security_type_expr = (
-            "NULLIF(TRIM(CAST(security_type AS VARCHAR)), '')"
-            if has_col("security_type")
-            else "NULL"
+            "NULLIF(TRIM(CAST(security_type_raw AS VARCHAR)), '')"
+            if has_col("security_type_raw")
+            else (
+                "NULLIF(TRIM(CAST(security_type AS VARCHAR)), '')"
+                if has_col("security_type")
+                else "NULL"
+            )
         )
         source_name_expr = (
             "COALESCE(TRIM(CAST(source_name AS VARCHAR)), '')"
@@ -178,10 +186,7 @@ class DuckDbListingHistoryRepository:
               AND symbol IS NOT NULL
               AND TRIM(CAST(symbol AS VARCHAR)) <> ''
             ORDER BY
-                TRIM(CAST(symbol AS VARCHAR)),
-                COALESCE(TRIM(CAST(exchange AS VARCHAR)), ''),
-                COALESCE(TRIM(CAST(security_type AS VARCHAR)), ''),
-                COALESCE(TRIM(CAST(source_name AS VARCHAR)), '')
+                1, 5, 6, 7
             """,
             [as_of_date],
         ).fetchall()
@@ -479,8 +484,8 @@ class DuckDbListingHistoryRepository:
             WITH observed AS (
                 SELECT DISTINCT
                     UPPER(TRIM(CAST(symbol AS VARCHAR))) AS symbol,
-                    UPPER(TRIM(COALESCE(CAST(exchange AS VARCHAR), ''))) AS exchange,
-                    UPPER(TRIM(COALESCE(CAST(security_type AS VARCHAR), ''))) AS security_type
+                    UPPER(TRIM(COALESCE(CAST(exchange_raw AS VARCHAR), ''))) AS exchange,
+                    UPPER(TRIM(COALESCE(CAST(security_type_raw AS VARCHAR), ''))) AS security_type
                 FROM symbol_reference_source_raw
                 WHERE as_of_date = ?
                   AND symbol IS NOT NULL
@@ -541,8 +546,8 @@ class DuckDbListingHistoryRepository:
                 FROM symbol_reference_source_raw
                 WHERE as_of_date = ?
                   AND UPPER(TRIM(CAST(symbol AS VARCHAR))) = ?
-                  AND UPPER(TRIM(COALESCE(CAST(exchange AS VARCHAR), ''))) = ?
-                  AND UPPER(TRIM(COALESCE(CAST(security_type AS VARCHAR), ''))) = ?
+                  AND UPPER(TRIM(COALESCE(CAST(exchange_raw AS VARCHAR), ''))) = ?
+                  AND UPPER(TRIM(COALESCE(CAST(security_type_raw AS VARCHAR), ''))) = ?
                 LIMIT 1
                 """,
                 [
