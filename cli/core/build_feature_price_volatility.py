@@ -21,9 +21,9 @@ def build_table(con):
             i.instrument_id,
             i.company_id,
             p.bar_date AS as_of_date,
-            p.open,
-            p.high,
-            p.low,
+            p.adj_open,
+            p.adj_high,
+            p.adj_low,
             p.adj_close AS close,
             p.volume
         FROM price_bars_adjusted p
@@ -31,11 +31,11 @@ def build_table(con):
         WHERE p.symbol IS NOT NULL
           AND p.bar_date IS NOT NULL
           AND p.adj_close IS NOT NULL
-          AND p.open IS NOT NULL
-          AND p.high IS NOT NULL
-          AND p.low IS NOT NULL
-          AND p.high > 0
-          AND p.low > 0
+          AND p.adj_open IS NOT NULL
+          AND p.adj_high IS NOT NULL
+          AND p.adj_low IS NOT NULL
+          AND p.adj_high > 0
+          AND p.adj_low > 0
     ),
 
     lagged AS (

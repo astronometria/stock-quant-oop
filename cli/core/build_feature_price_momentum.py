@@ -21,9 +21,9 @@ def build_table(con):
             i.instrument_id,
             i.company_id,
             p.bar_date AS as_of_date,
-            p.open,
-            p.high,
-            p.low,
+            p.adj_open,
+            p.adj_high,
+            p.adj_low,
             p.adj_close AS close,
             p.volume
         FROM price_bars_adjusted p

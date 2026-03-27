@@ -22,9 +22,9 @@ def build_table(con):
             i.company_id,
             p.bar_date AS as_of_date,
             p.adj_close AS close,
-            p.open,
-            p.high,
-            p.low,
+            p.adj_open,
+            p.adj_high,
+            p.adj_low,
             p.volume
         FROM price_bars_adjusted p
         LEFT JOIN instrument_master i USING (symbol)
