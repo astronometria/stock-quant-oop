@@ -4,7 +4,60 @@ from __future__ import annotations
 """
 apply_listing_events_from_nasdaq_daily_list.py
 
-Script prudent / SQL-first / non destructif.
+Correctif de compatibilité pour le schéma historique legacy actuellement
+présent dans la DB runtime.
+
+Constat issu du probe
+---------------------
+La table listing_event_history actuelle a les colonnes suivantes :
+- event_id
+- listing_id
+- symbol
+- company_id
+- cik
+- event_type
+- event_date
+- old_value
+- new_value
+- source_name
+- evidence_type
+- confidence_level
+- notes
+- created_at
+
+La table history_reconstruction_audit actuelle a les colonnes suivantes :
+- audit_id
+- entity_type
+- entity_key
+- action_type
+- source_name
+- evidence_type
+- confidence_level
+- old_value
+- new_value
+- notes
+- created_at
+
+Objectif de ce script
+---------------------
+- rester non destructif
+- rester SQL-first
+- ne pas modifier listing_status_history directement
+- parser prudemment des fichiers Nasdaq Daily List locaux
+- écrire uniquement dans :
+  * listing_event_history
+  * history_reconstruction_audit
+
+Convention legacy utilisée ici
+------------------------------
+Pour un changement de ticker :
+- symbol = nouveau symbole si disponible, sinon symbole principal
+- old_value = ancien symbole
+- new_value = nouveau symbole
+
+Pour les autres événements :
+- symbol = symbole principal
+- old_value / new_value restent optionnels selon les colonnes source trouvées
 """
 
 import argparse
@@ -17,9 +70,13 @@ import duckdb
 from tqdm import tqdm
 
 
+# ============================================================================
+# Détection prudente des événements depuis le texte brut.
+# ============================================================================
 EVENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("LISTING_ADDED", re.compile(r"\b(new listing|listed|addition|added)\b", re.IGNORECASE)),
-    ("DELISTED", re.compile(r"\b(delist|delisting|deleted|removal|removed)\b", re.IGNORECASE)),
+    ("LISTING_REMOVED", re.compile(r"\b(removal|removed|deleted)\b", re.IGNORECASE)),
+    ("DELISTED", re.compile(r"\b(delist|delisting)\b", re.IGNORECASE)),
     ("RENAMED", re.compile(r"\b(name change|rename|renamed)\b", re.IGNORECASE)),
     ("TICKER_CHANGED", re.compile(r"\b(symbol change|ticker change|change symbol)\b", re.IGNORECASE)),
     ("REACTIVATED", re.compile(r"\b(reactivat|reinstated)\b", re.IGNORECASE)),
@@ -28,8 +85,13 @@ EVENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse les arguments CLI.
+
+    On garde une interface simple pour l'orchestration.
+    """
     parser = argparse.ArgumentParser(
-        description="Apply listing events from local Nasdaq Daily List files into listing_event_history."
+        description="Apply listing events from local Nasdaq Daily List files into legacy listing_event_history."
     )
     parser.add_argument("--db-path", required=True, help="Path to the DuckDB database.")
     parser.add_argument(
@@ -41,6 +103,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    """
+    Vérifie si une table existe.
+    """
     row = con.execute(
         """
         SELECT COUNT(*)
@@ -52,7 +117,44 @@ def table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
     return bool(row and row[0] > 0)
 
 
+def require_tables(con: duckdb.DuckDBPyConnection, required: list[str]) -> None:
+    """
+    Valide la présence des tables requises.
+    """
+    missing = [table_name for table_name in required if not table_exists(con, table_name)]
+    if missing:
+        raise RuntimeError(f"Missing required tables: {missing}")
+
+
+def normalize_symbol(value: str | None) -> str | None:
+    """
+    Nettoie un ticker.
+    """
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    return normalized or None
+
+
+def parse_date_string(raw_value: str | None) -> str | None:
+    """
+    Nettoie une date texte.
+
+    La conversion réelle vers DATE est laissée à DuckDB via TRY_CAST
+    pour garder la logique SQL-first.
+    """
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    return value or None
+
+
 def infer_event_type(text_blob: str) -> str | None:
+    """
+    Déduit un type d'événement depuis un blob texte.
+
+    Si rien n'est crédible, on retourne None.
+    """
     normalized = (text_blob or "").strip()
     if not normalized:
         return None
@@ -64,14 +166,14 @@ def infer_event_type(text_blob: str) -> str | None:
     return None
 
 
-def normalize_symbol(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip().upper()
-    return normalized or None
-
-
 def extract_first_symbol(text: str) -> str | None:
+    """
+    Extrait un ticker plausible d'une ligne de texte libre.
+
+    Heuristique prudente :
+    - commence par une lettre
+    - jusqu'à 10 caractères alnum / . / -
+    """
     match = re.search(r"\b([A-Z][A-Z0-9\.\-]{0,9})\b", text)
     if not match:
         return None
@@ -79,6 +181,9 @@ def extract_first_symbol(text: str) -> str | None:
 
 
 def iter_candidate_files(root: Path) -> list[Path]:
+    """
+    Liste récursivement les fichiers candidats.
+    """
     patterns = ["**/*.txt", "**/*.csv", "**/*.tsv"]
     files: list[Path] = []
     for pattern in patterns:
@@ -86,19 +191,20 @@ def iter_candidate_files(root: Path) -> list[Path]:
     return sorted([p.resolve() for p in files if p.is_file()])
 
 
-def parse_date_string(raw_value: str | None) -> str | None:
-    if raw_value is None:
-        return None
-    value = raw_value.strip()
-    return value or None
-
-
 def build_row_from_csv_record(path: Path, normalized: dict[str, str]) -> dict | None:
+    """
+    Construit une ligne standardisée depuis un enregistrement CSV/TSV.
+
+    Cette fonction mappe le contenu source vers le contrat legacy actuel.
+    """
     notes_blob = " | ".join(value for value in normalized.values() if value)
     event_type = infer_event_type(notes_blob)
     if event_type is None:
         return None
 
+    # ------------------------------------------------------------------------
+    # Extraction prudente des différents symboles potentiels.
+    # ------------------------------------------------------------------------
     old_symbol = normalize_symbol(
         normalized.get("old symbol")
         or normalized.get("old_symbol")
@@ -118,12 +224,19 @@ def build_row_from_csv_record(path: Path, normalized: dict[str, str]) -> dict | 
         or normalized.get("issue_symbol")
     )
 
+    # ------------------------------------------------------------------------
+    # Convention :
+    # - pour TICKER_CHANGED, symbol = nouveau symbole quand disponible
+    # - old_value/new_value conservent l'information brute de transition
+    # ------------------------------------------------------------------------
     if event_type == "TICKER_CHANGED":
-        symbol = new_symbol or primary_symbol
-        related_symbol = old_symbol
+        symbol = new_symbol or primary_symbol or old_symbol
+        old_value = old_symbol
+        new_value = new_symbol or symbol
     else:
         symbol = primary_symbol or new_symbol or old_symbol
-        related_symbol = old_symbol if symbol != old_symbol else new_symbol
+        old_value = old_symbol
+        new_value = new_symbol
 
     if not symbol:
         return None
@@ -135,7 +248,6 @@ def build_row_from_csv_record(path: Path, normalized: dict[str, str]) -> dict | 
         or normalized.get("event date")
         or normalized.get("event_date")
     )
-
     if event_date_raw is None:
         return None
 
@@ -146,26 +258,37 @@ def build_row_from_csv_record(path: Path, normalized: dict[str, str]) -> dict | 
     }
 
     return {
+        "listing_id": None,
         "symbol": symbol,
-        "related_symbol": related_symbol,
+        "company_id": None,
+        "cik": None,
         "event_type": event_type,
         "event_date_raw": event_date_raw,
-        "effective_date_raw": event_date_raw,
-        "event_label": (
-            normalized.get("description")
-            or normalized.get("event")
-            or normalized.get("action")
-            or event_type
-        ),
-        "notes": notes_blob,
+        "old_value": old_value,
+        "new_value": new_value,
         "source_name": "nasdaq_daily_list",
-        "source_table": "local_daily_list_file",
-        "source_ref": f"{path.name}",
-        "raw_payload_json": json.dumps(payload, ensure_ascii=False),
+        "evidence_type": "DIRECT_SOURCE_FILE",
+        "confidence_level": "MEDIUM",
+        "notes": json.dumps(
+            {
+                "event_label": (
+                    normalized.get("description")
+                    or normalized.get("event")
+                    or normalized.get("action")
+                    or event_type
+                ),
+                "notes_blob": notes_blob,
+                "raw_payload": payload,
+            },
+            ensure_ascii=False,
+        ),
     }
 
 
 def parse_csv_file(path: Path) -> list[dict]:
+    """
+    Parse un CSV/TSV de manière simple et robuste.
+    """
     rows: list[dict] = []
 
     with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
@@ -191,6 +314,14 @@ def parse_csv_file(path: Path) -> list[dict]:
 
 
 def parse_text_line(path: Path, line: str) -> dict | None:
+    """
+    Parse une ligne texte libre.
+
+    On reste très prudent :
+    - il faut un type d'événement détecté
+    - il faut une date parseable
+    - il faut un symbole plausible
+    """
     text = line.strip()
     if not text:
         return None
@@ -218,21 +349,32 @@ def parse_text_line(path: Path, line: str) -> dict | None:
     }
 
     return {
+        "listing_id": None,
         "symbol": symbol,
-        "related_symbol": None,
+        "company_id": None,
+        "cik": None,
         "event_type": event_type,
         "event_date_raw": event_date_raw,
-        "effective_date_raw": event_date_raw,
-        "event_label": event_type,
-        "notes": text,
+        "old_value": None,
+        "new_value": None,
         "source_name": "nasdaq_daily_list",
-        "source_table": "local_daily_list_file",
-        "source_ref": f"{path.name}",
-        "raw_payload_json": json.dumps(payload, ensure_ascii=False),
+        "evidence_type": "DIRECT_SOURCE_FILE",
+        "confidence_level": "LOW",
+        "notes": json.dumps(
+            {
+                "event_label": event_type,
+                "notes_blob": text,
+                "raw_payload": payload,
+            },
+            ensure_ascii=False,
+        ),
     }
 
 
 def parse_text_file(path: Path) -> list[dict]:
+    """
+    Parse un fichier texte libre ligne par ligne.
+    """
     rows: list[dict] = []
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
@@ -242,13 +384,19 @@ def parse_text_file(path: Path) -> list[dict]:
     return rows
 
 
-def require_tables(con: duckdb.DuckDBPyConnection, required: list[str]) -> None:
-    missing = [table_name for table_name in required if not table_exists(con, table_name)]
-    if missing:
-        raise RuntimeError(f"Missing required tables: {missing}")
-
-
 def main() -> int:
+    """
+    Pipeline principal.
+
+    Étapes :
+    1. validate
+    2. discover files
+    3. parse
+    4. stage
+    5. insert events
+    6. insert audit
+    7. metrics
+    """
     args = parse_args()
     db_path = Path(args.db_path).expanduser().resolve()
     daily_root = Path(args.daily_list_root).expanduser().resolve()
@@ -257,6 +405,9 @@ def main() -> int:
     steps = tqdm(total=7, desc="apply_listing_events_from_nasdaq_daily_list", unit="step")
 
     try:
+        # --------------------------------------------------------------------
+        # 1) Validation du schéma runtime existant
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:validate")
         require_tables(
             con,
@@ -267,10 +418,16 @@ def main() -> int:
         )
         steps.update(1)
 
+        # --------------------------------------------------------------------
+        # 2) Découverte des fichiers locaux
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:discover_files")
         files = iter_candidate_files(daily_root) if daily_root.exists() else []
         steps.update(1)
 
+        # --------------------------------------------------------------------
+        # 3) Parsing local
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:parse")
         parsed_rows: list[dict] = []
         for file_path in files:
@@ -281,22 +438,26 @@ def main() -> int:
                 parsed_rows.extend(parse_text_file(file_path))
         steps.update(1)
 
+        # --------------------------------------------------------------------
+        # 4) Staging temporaire
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:stage")
         con.execute("DROP TABLE IF EXISTS tmp_nasdaq_daily_list_events")
         con.execute(
             """
             CREATE TEMP TABLE tmp_nasdaq_daily_list_events (
+                listing_id VARCHAR,
                 symbol VARCHAR,
-                related_symbol VARCHAR,
+                company_id VARCHAR,
+                cik VARCHAR,
                 event_type VARCHAR,
                 event_date_raw VARCHAR,
-                effective_date_raw VARCHAR,
-                event_label VARCHAR,
-                notes VARCHAR,
+                old_value VARCHAR,
+                new_value VARCHAR,
                 source_name VARCHAR,
-                source_table VARCHAR,
-                source_ref VARCHAR,
-                raw_payload_json VARCHAR
+                evidence_type VARCHAR,
+                confidence_level VARCHAR,
+                notes VARCHAR
             )
             """
         )
@@ -305,59 +466,60 @@ def main() -> int:
             con.executemany(
                 """
                 INSERT INTO tmp_nasdaq_daily_list_events (
+                    listing_id,
                     symbol,
-                    related_symbol,
+                    company_id,
+                    cik,
                     event_type,
                     event_date_raw,
-                    effective_date_raw,
-                    event_label,
-                    notes,
+                    old_value,
+                    new_value,
                     source_name,
-                    source_table,
-                    source_ref,
-                    raw_payload_json
+                    evidence_type,
+                    confidence_level,
+                    notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
+                        row.get("listing_id"),
                         row.get("symbol"),
-                        row.get("related_symbol"),
+                        row.get("company_id"),
+                        row.get("cik"),
                         row.get("event_type"),
                         row.get("event_date_raw"),
-                        row.get("effective_date_raw"),
-                        row.get("event_label"),
-                        row.get("notes"),
+                        row.get("old_value"),
+                        row.get("new_value"),
                         row.get("source_name"),
-                        row.get("source_table"),
-                        row.get("source_ref"),
-                        row.get("raw_payload_json"),
+                        row.get("evidence_type"),
+                        row.get("confidence_level"),
+                        row.get("notes"),
                     )
                     for row in parsed_rows
                 ],
             )
         steps.update(1)
 
+        # --------------------------------------------------------------------
+        # 5) Insertion append-only dans la table legacy
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:apply_events")
         con.execute(
             """
             INSERT INTO listing_event_history (
                 event_id,
+                listing_id,
                 symbol,
-                related_symbol,
                 company_id,
                 cik,
                 event_type,
                 event_date,
-                effective_date,
+                old_value,
+                new_value,
                 source_name,
-                source_table,
-                source_ref,
-                event_label,
+                evidence_type,
                 confidence_level,
-                is_observed,
-                is_inferred,
-                raw_payload,
                 notes,
                 created_at
             )
@@ -366,29 +528,24 @@ def main() -> int:
                     'NASDAQ_DAILY_LIST:',
                     md5(
                         COALESCE(symbol, '') || '|' ||
-                        COALESCE(related_symbol, '') || '|' ||
                         COALESCE(event_type, '') || '|' ||
                         COALESCE(event_date_raw, '') || '|' ||
-                        COALESCE(effective_date_raw, '') || '|' ||
-                        COALESCE(source_name, '') || '|' ||
-                        COALESCE(source_ref, '')
+                        COALESCE(old_value, '') || '|' ||
+                        COALESCE(new_value, '') || '|' ||
+                        COALESCE(source_name, '')
                     )
                 ) AS event_id,
+                listing_id,
                 symbol,
-                related_symbol,
-                NULL AS company_id,
-                NULL AS cik,
+                company_id,
+                cik,
                 event_type,
                 TRY_CAST(event_date_raw AS DATE) AS event_date,
-                TRY_CAST(effective_date_raw AS DATE) AS effective_date,
+                old_value,
+                new_value,
                 source_name,
-                source_table,
-                source_ref,
-                event_label,
-                'MEDIUM' AS confidence_level,
-                TRUE AS is_observed,
-                FALSE AS is_inferred,
-                TRY_CAST(raw_payload_json AS JSON) AS raw_payload,
+                evidence_type,
+                confidence_level,
                 notes,
                 CURRENT_TIMESTAMP AS created_at
             FROM (
@@ -400,41 +557,34 @@ def main() -> int:
                 AND NOT EXISTS (
                     SELECT 1
                     FROM listing_event_history t
-                    WHERE t.symbol = s.symbol
-                      AND COALESCE(t.related_symbol, '') = COALESCE(s.related_symbol, '')
-                      AND t.event_type = s.event_type
+                    WHERE COALESCE(t.symbol, '') = COALESCE(s.symbol, '')
+                      AND COALESCE(t.event_type, '') = COALESCE(s.event_type, '')
                       AND t.event_date = TRY_CAST(s.event_date_raw AS DATE)
-                      AND COALESCE(t.effective_date, t.event_date) = COALESCE(
-                          TRY_CAST(s.effective_date_raw AS DATE),
-                          TRY_CAST(s.event_date_raw AS DATE)
-                      )
-                      AND t.source_name = s.source_name
-                      AND COALESCE(t.source_ref, '') = COALESCE(s.source_ref, '')
+                      AND COALESCE(t.old_value, '') = COALESCE(s.old_value, '')
+                      AND COALESCE(t.new_value, '') = COALESCE(s.new_value, '')
+                      AND COALESCE(t.source_name, '') = COALESCE(s.source_name, '')
                 )
             """
         )
         steps.update(1)
 
+        # --------------------------------------------------------------------
+        # 6) Audit legacy append-only
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:apply_audit")
-        run_id = con.execute(
-            "SELECT CONCAT('nasdaq_daily_list_', md5(CAST(current_timestamp AS VARCHAR)))"
-        ).fetchone()[0]
-
         con.execute(
             """
             INSERT INTO history_reconstruction_audit (
-                audit_row_id,
-                run_id,
-                target_table,
-                target_key,
+                audit_id,
+                entity_type,
+                entity_key,
                 action_type,
-                reason_code,
-                rule_name,
-                input_source_summary,
-                input_row_refs,
-                old_values,
-                new_values,
+                source_name,
+                evidence_type,
                 confidence_level,
+                old_value,
+                new_value,
+                notes,
                 created_at
             )
             SELECT
@@ -442,63 +592,58 @@ def main() -> int:
                     'AUDIT:',
                     md5(
                         COALESCE(symbol, '') || '|' ||
-                        COALESCE(related_symbol, '') || '|' ||
                         COALESCE(event_type, '') || '|' ||
                         COALESCE(event_date_raw, '') || '|' ||
-                        COALESCE(source_name, '') || '|' ||
-                        COALESCE(source_ref, '') || '|' ||
-                        ?
+                        COALESCE(old_value, '') || '|' ||
+                        COALESCE(new_value, '') || '|' ||
+                        COALESCE(source_name, '')
                     )
-                ) AS audit_row_id,
-                ? AS run_id,
-                'listing_event_history' AS target_table,
+                ) AS audit_id,
+                'listing_event_history' AS entity_type,
                 CONCAT(
                     COALESCE(symbol, ''),
-                    '|',
-                    COALESCE(related_symbol, ''),
                     '|',
                     COALESCE(event_type, ''),
                     '|',
                     COALESCE(event_date_raw, '')
-                ) AS target_key,
+                ) AS entity_key,
                 'INSERT' AS action_type,
-                'OBSERVED_SNAPSHOT' AS reason_code,
-                'apply_listing_events_from_nasdaq_daily_list' AS rule_name,
-                CONCAT(
-                    COALESCE(source_name, ''),
-                    ':',
-                    COALESCE(source_ref, '')
-                ) AS input_source_summary,
-                TRY_CAST(
-                    json_object(
-                        'source_name', source_name,
-                        'source_ref', source_ref,
-                        'event_label', event_label
-                    ) AS JSON
-                ) AS input_row_refs,
-                NULL AS old_values,
-                TRY_CAST(
-                    json_object(
-                        'symbol', symbol,
-                        'related_symbol', related_symbol,
-                        'event_type', event_type,
-                        'event_date_raw', event_date_raw,
-                        'effective_date_raw', effective_date_raw,
-                        'event_label', event_label
-                    ) AS JSON
-                ) AS new_values,
-                'MEDIUM' AS confidence_level,
+                source_name,
+                evidence_type,
+                confidence_level,
+                old_value,
+                new_value,
+                notes,
                 CURRENT_TIMESTAMP AS created_at
             FROM (
                 SELECT DISTINCT *
                 FROM tmp_nasdaq_daily_list_events
             ) s
-            WHERE TRY_CAST(event_date_raw AS DATE) IS NOT NULL
-            """,
-            [run_id, run_id],
+            WHERE
+                TRY_CAST(event_date_raw AS DATE) IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM history_reconstruction_audit a
+                    WHERE COALESCE(a.entity_type, '') = 'listing_event_history'
+                      AND COALESCE(a.entity_key, '') = CONCAT(
+                          COALESCE(s.symbol, ''),
+                          '|',
+                          COALESCE(s.event_type, ''),
+                          '|',
+                          COALESCE(s.event_date_raw, '')
+                      )
+                      AND COALESCE(a.action_type, '') = 'INSERT'
+                      AND COALESCE(a.source_name, '') = COALESCE(s.source_name, '')
+                      AND COALESCE(a.old_value, '') = COALESCE(s.old_value, '')
+                      AND COALESCE(a.new_value, '') = COALESCE(s.new_value, '')
+                )
+            """
         )
         steps.update(1)
 
+        # --------------------------------------------------------------------
+        # 7) Métriques finales
+        # --------------------------------------------------------------------
         steps.set_description("apply_listing_events_from_nasdaq_daily_list:metrics")
         file_count = len(files)
         parsed_count = len(parsed_rows)
@@ -515,8 +660,7 @@ def main() -> int:
             """
             SELECT COUNT(*)
             FROM history_reconstruction_audit
-            WHERE target_table = 'listing_event_history'
-              AND rule_name = 'apply_listing_events_from_nasdaq_daily_list'
+            WHERE source_name = 'nasdaq_daily_list'
             """
         ).fetchone()[0]
 
@@ -540,7 +684,7 @@ def main() -> int:
                     "event_rows_total_for_nasdaq_daily_list": int(event_rows_total),
                     "audit_rows_total_for_nasdaq_daily_list": int(audit_rows_total),
                     "distinct_symbols_for_nasdaq_daily_list": int(distinct_symbols),
-                    "mode": "event_only_non_destructive_local_source_sql_first",
+                    "mode": "legacy_schema_compatible_non_destructive_sql_first",
                 },
                 indent=2,
             )
